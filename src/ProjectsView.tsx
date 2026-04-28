@@ -1,5 +1,18 @@
 'use client';
 
+/**
+ * ProjectsView — RichGrid + Zero conversion (2026-04-26).
+ *
+ * Reads from `harness_shared.projects` via Zero (live updates over
+ * WebSocket; no polling). Writes go through `/api/org/projects`, which
+ * dual-writes JSON ledger (`~/.restart-org/projects.json`) + Postgres
+ * (`harness_shared.projects`). New projects appear in the grid live.
+ *
+ * `slug`, `cost_cap_cents`, `earned_cents` are first-class columns on
+ * the PG table (promoted from metadata jsonb in commit ee9fdf1b) and
+ * exposed on the Zero schema, so the legacy "fields lost" caveat no
+ * longer applies.
+ */
 import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { toast, Toaster } from 'sonner';
