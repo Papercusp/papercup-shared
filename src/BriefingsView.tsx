@@ -1,6 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useQuery } from '@rocicorp/zero/react';
+import { queries, type BriefingRow } from '@restart/zero-harness';
 
 type BriefingStatus =
   | 'draft' | 'rendering' | 'rendered' | 'uploading' | 'uploaded' | 'failed';
@@ -53,12 +55,52 @@ function pendingText(status: BriefingStatus): string {
   return 'published';
 }
 
+function rowToBriefing(r: BriefingRow): Briefing {
+  return {
+    id: r.id,
+    title: r.title,
+    quarter: r.quarter ?? '',
+    status: r.status as BriefingStatus,
+    created_at: typeof r.createdAt === 'number'
+      ? new Date(r.createdAt).toISOString()
+      : new Date(Date.parse(String(r.createdAt))).toISOString(),
+    duration_seconds: r.durationSeconds ?? null,
+    youtube_url: r.youtubeUrl ?? null,
+    youtube_video_id: r.youtubeVideoId ?? null,
+    thumbnail_url: r.thumbnailUrl ?? null,
+    summary: r.summary ?? null,
+    error: r.error ?? null,
+  };
+}
+
 export interface BriefingsViewProps {
   initialData?: { briefings?: Briefing[] };
   readOnly?: boolean;
+  /**
+   * When true, subscribe via Zero (`@rocicorp/zero/react#useQuery`) — caller
+   * must mount inside a ZeroProvider. When false (default), fall back to the
+   * legacy `/api/briefings` fetch + 15s polling, suitable for SSR / public
+   * surfaces that don't run Zero.
+   */
+  live?: boolean;
 }
 
-export default function BriefingsView({ initialData, readOnly = false }: BriefingsViewProps = {}) {
+export default function BriefingsView({ initialData, readOnly = false, live = false }: BriefingsViewProps = {}) {
+  return live
+    ? <BriefingsViewLive readOnly={readOnly} initialData={initialData} />
+    : <BriefingsViewLegacy initialData={initialData} readOnly={readOnly} />;
+}
+
+function BriefingsViewLive({ readOnly, initialData }: { readOnly: boolean; initialData?: { briefings?: Briefing[] } }) {
+  const [rows] = useQuery(queries.briefings.all());
+  const list = useMemo<Briefing[] | null>(() => {
+    if (initialData?.briefings && rows.length === 0) return initialData.briefings;
+    return rows.map(rowToBriefing);
+  }, [rows, initialData]);
+  return <BriefingsViewBody list={list} error={null} onRefresh={() => { /* zero updates live */ }} readOnly={readOnly} />;
+}
+
+function BriefingsViewLegacy({ initialData, readOnly }: { initialData?: { briefings?: Briefing[] }; readOnly: boolean }) {
   const [list, setList] = useState<Briefing[] | null>(initialData?.briefings ?? null);
   const [error, setError] = useState<string | null>(null);
 
@@ -85,6 +127,18 @@ export default function BriefingsView({ initialData, readOnly = false }: Briefin
     const id = setInterval(guarded, 15_000);
     return () => { cancelled = true; clearInterval(id); };
   }, [load, initialData, readOnly]);
+
+  return <BriefingsViewBody list={list} error={error} onRefresh={load} readOnly={readOnly} />;
+}
+
+function BriefingsViewBody({
+  list, error, onRefresh, readOnly,
+}: {
+  list: Briefing[] | null;
+  error: string | null;
+  onRefresh: () => void;
+  readOnly: boolean;
+}) {
 
   const metrics = useMemo(() => {
     const items = list ?? [];
@@ -122,7 +176,7 @@ export default function BriefingsView({ initialData, readOnly = false }: Briefin
             from script through render and YouTube upload.
           </p>
           <div className="pc-hero-actions">
-            <button className="pc-action primary" onClick={load}>Refresh briefings</button>
+            <button className="pc-action primary" onClick={onRefresh}>Refresh briefings</button>
             <span className="pc-action">npm run briefings:produce</span>
           </div>
         </div>
