@@ -239,13 +239,14 @@ function NewProjectModal({ onClose, onCreated }: { onClose: () => void; onCreate
   const [slug, setSlug] = useState('');
   const [vertical, setVertical] = useState('apps');
   const [budget, setBudget] = useState('');
+  const [costCap, setCostCap] = useState('');
   const [saving, setSaving] = useState(false);
 
   function autoSlug(n: string) {
     return n.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
   }
 
-  async function create() {
+  const create = useCallback(async () => {
     if (!name.trim() || !vertical.trim()) {
       toast.error('name and vertical required');
       return;
@@ -254,20 +255,23 @@ function NewProjectModal({ onClose, onCreated }: { onClose: () => void; onCreate
     try {
       const finalSlug = slug.trim() || autoSlug(name);
       const budgetCents = budget.trim() ? Math.round(parseFloat(budget) * 100) : 0;
+      const costCapCents = costCap.trim() ? Math.round(parseFloat(costCap) * 100) : undefined;
+      const body: Record<string, unknown> = { slug: finalSlug, name, vertical, budget_cents: budgetCents };
+      if (costCapCents !== undefined) body.cost_cap_cents = costCapCents;
       const res = await fetch(orgPath('projects'), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ slug: finalSlug, name, vertical, budget_cents: budgetCents }),
+        body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error((await res.json()).error ?? 'create failed');
-      toast.success('project created · ProjectKickoff broadcast');
+      toast.success('project created · ProjectKickoff broadcast · live in Zero');
       onCreated();
     } catch (e) {
       toast.error(`${e}`);
     } finally {
       setSaving(false);
     }
-  }
+  }, [name, slug, vertical, budget, costCap, onCreated]);
 
   return (
     <div className="pc-modal-backdrop" onClick={onClose}>
@@ -299,6 +303,17 @@ function NewProjectModal({ onClose, onCreated }: { onClose: () => void; onCreate
             <label>Budget ($)</label>
             <input className="pc-input" type="number" value={budget} onChange={(e) => setBudget(e.target.value)} placeholder="optional" />
           </div>
+        </div>
+
+        <div className="pc-field">
+          <label>Cost cap ($)</label>
+          <input
+            className="pc-input"
+            type="number"
+            value={costCap}
+            onChange={(e) => setCostCap(e.target.value)}
+            placeholder="optional — hard ceiling on agent spend"
+          />
         </div>
 
         <footer className="pc-modal-actions end">
