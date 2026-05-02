@@ -59,3 +59,5 @@ export { default as BriefingsView } from './BriefingsView';
 export type { BriefingsViewProps } from './BriefingsView';
 
 export { default as DocumentationFrame } from './DocumentationFrame';
+
+export { default as PiTerminalsDock, openFeatureChat } from './PiTerminalsDock';

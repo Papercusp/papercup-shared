@@ -16,10 +16,8 @@ const TABS_DEF = [
   { slug: '/documentation', label: 'Documentation', short: 'Docs',     eyebrow: 'Harness reference',  icon: '📖' },
   { slug: '/harnesses',     label: 'Harnesses',     short: 'Ops',      eyebrow: 'Live ops cockpit',   icon: '↯' },
   { slug: '/organization',  label: 'Organization',  short: 'Org',      eyebrow: 'Directors',          icon: '◇' },
-  { slug: '/directives',    label: 'Directives',    short: 'Direct',   eyebrow: 'Direction',          icon: '◆' },
   { slug: '/projects',      label: 'Projects',      short: 'Projects', eyebrow: 'Portfolio',          icon: '▦' },
   { slug: '/timeline',      label: 'Timeline',      short: 'Activity', eyebrow: 'Activity',           icon: '⌁' },
-  { slug: '/briefings',     label: 'Briefings',     short: 'Briefs',   eyebrow: 'Investor relations', icon: '▶' },
 ] as const;
 
 export default function PapercupTabs({ basePath }: PapercupTabsProps) {
