@@ -10,6 +10,8 @@
 export { default as PapercupTabs } from './PapercupTabs';
 export type { PapercupTabsProps } from './PapercupTabs';
 
+export { useAgentRoles } from './useAgentRoles';
+
 
 
 export { default as OrganizationView } from './OrganizationView';
@@ -60,4 +62,10 @@ export type { BriefingsViewProps } from './BriefingsView';
 
 export { default as DocumentationFrame } from './DocumentationFrame';
 
-export { default as PiTerminalsDock, openFeatureChat } from './PiTerminalsDock';
+// PiTerminalsDock and PiPanel used to live here too. The canonical
+// implementations now live in apps/operator/app/harness/* — the lib
+// copies were ~half the size and missed the WS/Tauri/flow-control work.
+// Only the small openFeatureChat helper is consumed externally
+// (FeatureList → dock), and it's retained as its own file so callers
+// don't have to pull the dock's entire xterm/dockview graph.
+export { openFeatureChat, OPEN_CHAT_EVENT, type OpenChatEventDetail } from './openFeatureChat';
