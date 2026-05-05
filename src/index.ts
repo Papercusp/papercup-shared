@@ -69,3 +69,7 @@ export { default as DocumentationFrame } from './DocumentationFrame';
 // (FeatureList → dock), and it's retained as its own file so callers
 // don't have to pull the dock's entire xterm/dockview graph.
 export { openFeatureChat, OPEN_CHAT_EVENT, type OpenChatEventDetail } from './openFeatureChat';
+
+// Backend-aware agent CLI runner lives at `@restart/papercup-shared/agent`
+// — server-only entry point so client chunks don't try to bundle
+// node:child_process. Don't re-export from this main index.
