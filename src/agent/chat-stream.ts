@@ -41,10 +41,10 @@ export type AgentBackend = 'claude-code' | 'omp';
  * one-shot scripts) can leave this unset — they read env vars
  * directly and skip the disk-config concept entirely.
  */
-let bootstrapHook: (() => void) | null = null;
+let bootstrapHook: (() => void | Promise<void>) | null = null;
 let bootstrapped = false;
 
-export function setAgentConfigBootstrap(hook: () => void): void {
+export function setAgentConfigBootstrap(hook: () => void | Promise<void>): void {
   bootstrapHook = hook;
 }
 
@@ -52,7 +52,16 @@ function maybeBootstrap(): void {
   if (bootstrapped) return;
   bootstrapped = true;
   if (bootstrapHook) {
-    try { bootstrapHook(); } catch { /* best-effort */ }
+    // The hook may be async (the operator now reads agent config from PG).
+    // Fire-and-forget: callers that depend on env being set immediately
+    // already pre-warm via /api/agent-config GET on bootstrap; this hook
+    // just keeps env in sync after a settings save.
+    try {
+      const r = bootstrapHook();
+      if (r && typeof (r as Promise<void>).catch === 'function') {
+        (r as Promise<void>).catch(() => { /* best-effort */ });
+      }
+    } catch { /* best-effort */ }
   }
 }
 
