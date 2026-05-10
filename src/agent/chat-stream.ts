@@ -232,10 +232,15 @@ export async function* runClaudeChat(
         ?? join(homedir(), '.omp', 'agent');
       ompAgentDir = mkdtempSync(join(tmpdir(), 'omp-chat-'));
       // Copy the small per-agent metadata files (auth, config, bridge,
-      // model-roles yaml). NOT agent.db / blobs (session DB is per-
-      // instance scratch; blobs is a large file cache irrelevant to a
-      // one-shot spawn). Use cpSync with errorOnExist:false so a
-      // missing source file just no-ops rather than throwing.
+      // model-roles yaml). Also includes agent.db so the MCP tool
+      // cache (mcp_tools:* rows) carries over — without it, omp's
+      // 250ms STARTUP_TIMEOUT_MS expires before our HTTP MCP server
+      // can return tools/list (especially for papercusp-su which
+      // serves 100+ tools). Cached tools are surfaced as
+      // DeferredMCPTool while the real connection finishes in the
+      // background, so the model sees the full surface immediately.
+      // Threads/jobs in agent.db are session-keyed and don't pollute
+      // a fresh spawn. NOT blobs (large file cache).
       //
       // config.yml is the most important: it carries `modelRoles`
       // which selects the Anthropic-via-Meridian provider. Without it,
@@ -252,6 +257,7 @@ export async function* runClaudeChat(
         'models.json',        // **provider config: baseUrl=http://127.0.0.1:3456 (Meridian)**
         'models.yml',         // models.json's yaml twin
         'claude-bridge.json', // claude-bridge tool config (askClaude etc.)
+        'agent.db',           // cache table holds mcp_tools:* — needed for fast cold-start MCP surface
       ]) {
         const src = join(realAgentDir, f);
         if (existsSync(src)) {
