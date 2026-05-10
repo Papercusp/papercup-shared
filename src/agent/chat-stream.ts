@@ -27,8 +27,8 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 export type AgentBackend = 'claude-code' | 'omp';
@@ -67,17 +67,18 @@ function maybeBootstrap(): void {
 
 /**
  * Resolve which backend to drive. Explicit opt > AGENT_BACKEND env >
- * inferred from the binary name.
+ * inferred from the binary name. Default fallback: omp (Meridian-routed).
  */
 function resolveBackend(opts: RunClaudeChatOptions): AgentBackend {
   if (opts.backend) return opts.backend;
   const env = (process.env.AGENT_BACKEND ?? '').trim().toLowerCase();
   if (env === 'omp' || env === 'pi') return 'omp';
   if (env === 'claude-code' || env === 'claude') return 'claude-code';
-  const cmd = opts.claudeCmd ?? process.env.AGENT_CMD ?? process.env.CLAUDE_CMD ?? 'claude';
+  const cmd = opts.claudeCmd ?? process.env.AGENT_CMD ?? process.env.CLAUDE_CMD ?? '';
   const first = cmd.split(/\s+/).filter(Boolean)[0] ?? '';
   if (/(?:^|\/)(omp|pi)$/.test(first)) return 'omp';
-  return 'claude-code';
+  if (/(?:^|\/)claude$/.test(first)) return 'claude-code';
+  return 'omp';
 }
 
 /**
@@ -212,12 +213,69 @@ export async function* runClaudeChat(
 
     if (opts.mcpConfig) {
       // Translate claude-shape mcp-config into a per-spawn omp agent dir.
-      // omp loads ~/.omp/agent/mcp.json on startup; PI_CODING_AGENT_DIR
-      // overrides the directory to a tmpdir we control.
+      // omp loads PI_CODING_AGENT_DIR/mcp.json on startup; PI_CODING_AGENT_DIR
+      // is the FULL agent state directory, NOT just an mcp.json holder
+      // (it also contains auth.json — Meridian/Anthropic OAuth — plus
+      // config.json, claude-bridge.json, the session DB, and blobs).
+      //
+      // Earlier versions of this code pointed PI_CODING_AGENT_DIR at a
+      // fresh tmpdir with ONLY mcp.json, which silently broke every omp
+      // invocation that passed mcpConfig: auth.json was missing → omp
+      // could not authenticate to Meridian → produced zero output and
+      // exited 0 (silent failure). Symptom: oracle "thinking" then
+      // empty response; operator-scan returns done event with 0 deltas.
+      //
+      // The fix: copy the user's existing agent dir into our tmpdir
+      // (so auth + config carry over), then OVERWRITE mcp.json with
+      // the union of the user's existing servers plus the caller's.
+      const realAgentDir = process.env.PI_CODING_AGENT_DIR
+        ?? join(homedir(), '.omp', 'agent');
       ompAgentDir = mkdtempSync(join(tmpdir(), 'omp-chat-'));
+      // Copy the small per-agent metadata files (auth, config, bridge,
+      // model-roles yaml). NOT agent.db / blobs (session DB is per-
+      // instance scratch; blobs is a large file cache irrelevant to a
+      // one-shot spawn). Use cpSync with errorOnExist:false so a
+      // missing source file just no-ops rather than throwing.
+      //
+      // config.yml is the most important: it carries `modelRoles`
+      // which selects the Anthropic-via-Meridian provider. Without it,
+      // omp falls back to the claude-bridge provider, which fails with
+      // "Claude Code native binary not found" if @anthropic-ai/
+      // claude-agent-sdk-linux-x64-musl isn't installed at the path
+      // omp expects (and on this workspace it isn't). Symptom: omp
+      // exits 0 but message_start carries an errorMessage, no deltas,
+      // empty finalText.
+      for (const f of [
+        'auth.json',          // Meridian/Anthropic OAuth tokens
+        'config.json',        // user prefs
+        'config.yml',         // modelRoles → selects anthropic provider
+        'models.json',        // **provider config: baseUrl=http://127.0.0.1:3456 (Meridian)**
+        'models.yml',         // models.json's yaml twin
+        'claude-bridge.json', // claude-bridge tool config (askClaude etc.)
+      ]) {
+        const src = join(realAgentDir, f);
+        if (existsSync(src)) {
+          try { cpSync(src, join(ompAgentDir, f)); } catch { /* best-effort */ }
+        }
+      }
+      // Merge the user's existing mcp.json with the caller-provided
+      // servers. Caller's entries win on key collision so e2e tests can
+      // override; user's other servers (voice-mode, hindsight, etc.)
+      // are preserved.
+      let baseServers: Record<string, unknown> = {};
+      const baseMcpPath = join(realAgentDir, 'mcp.json');
+      if (existsSync(baseMcpPath)) {
+        try {
+          const parsed = JSON.parse(readFileSync(baseMcpPath, 'utf8'));
+          if (parsed?.mcpServers && typeof parsed.mcpServers === 'object') {
+            baseServers = parsed.mcpServers;
+          }
+        } catch { /* invalid JSON in user dir — start with empty */ }
+      }
+      const mergedServers = { ...baseServers, ...(opts.mcpConfig.mcpServers ?? {}) };
       writeFileSync(
         join(ompAgentDir, 'mcp.json'),
-        JSON.stringify(opts.mcpConfig),
+        JSON.stringify({ mcpServers: mergedServers }),
         'utf8',
       );
       spawnEnv = { ...process.env, PI_CODING_AGENT_DIR: ompAgentDir };
@@ -261,11 +319,19 @@ export async function* runClaudeChat(
     finalArgs.push(`@${ompPromptFile}`);
   }
 
+  // omp's MCP discovery uses os.homedir() for the user-scope mcp.json
+  // and spawn-cwd for the project-scope mcp.json — it does NOT honor
+  // PI_CODING_AGENT_DIR for MCP loading (that env var is only for
+  // sessions/prompts/etc). To make our merged mcp.json visible we run
+  // omp with cwd = ompAgentDir, so its project-level scan
+  // ($cwd/mcp.json) lands on the file we just wrote.
+  const spawnCwd = ompAgentDir ?? opts.cwd;
+
   let child: ChildProcess;
   try {
     child = spawn(command, finalArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: opts.cwd,
+      cwd: spawnCwd,
       env: spawnEnv,
     });
   } catch (e) {
