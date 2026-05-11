@@ -7,11 +7,19 @@
  * sub-export boundary alone keeps it out of the client graph.)
  */
 export {
-  runClaudeChat,
+  runAgentChat,
   setAgentConfigBootstrap,
   resolveBackend,
   resolveAgentBin,
   type AgentBackend,
   type ChatEvent,
-  type RunClaudeChatOptions,
+  type RunAgentChatOptions,
 } from './chat-stream';
+
+// Backwards-compatible aliases for the pre-rename identifiers. The
+// `claude`-prefixed names were legacy from when claude-code was the
+// only backend; the abstraction is backend-agnostic now (omp by
+// default). Kept as deprecated re-exports so external consumers don't
+// have to update in lockstep. Remove after one release cycle.
+export { runAgentChat as runClaudeChat } from './chat-stream';
+export type { RunAgentChatOptions as RunClaudeChatOptions } from './chat-stream';

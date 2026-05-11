@@ -21,7 +21,7 @@
  *   - Transcript persistence (agent-chats writes to per-harness DB;
  *     Oracle currently doesn't persist server-side)
  *   - Additional out-of-band events (tutorial_end, ui_command) — emit
- *     these from the route directly before/after iterating runClaudeChat
+ *     these from the route directly before/after iterating runAgentChat
  *
  * Cancellation: pass a signal; spawn is killed on abort.
  */
@@ -69,22 +69,22 @@ function maybeBootstrap(): void {
  * Resolve which backend to drive. Explicit opt > AGENT_BACKEND env >
  * inferred from the binary name. Default fallback: omp (Meridian-routed).
  *
- * Exported so non-runClaudeChat callers (e.g. pm-dispatch which has
+ * Exported so non-runAgentChat callers (e.g. pm-dispatch which has
  * its own bespoke stream parser) can resolve the backend identically.
  */
 /**
  * Resolve which backend to drive. Explicit opt > AGENT_BACKEND env >
  * inferred from the binary name. Default fallback: omp.
  *
- * Exported so non-runClaudeChat callers (e.g. pm-dispatch which has
+ * Exported so non-runAgentChat callers (e.g. pm-dispatch which has
  * its own bespoke stream parser) can resolve the backend identically.
  */
-export function resolveBackend(opts: RunClaudeChatOptions): AgentBackend {
+export function resolveBackend(opts: RunAgentChatOptions): AgentBackend {
   if (opts.backend) return opts.backend;
   const env = (process.env.AGENT_BACKEND ?? '').trim().toLowerCase();
   if (env === 'omp' || env === 'pi') return 'omp';
   if (env === 'claude-code' || env === 'claude') return 'claude-code';
-  const cmd = opts.claudeCmd ?? process.env.AGENT_CMD ?? process.env.CLAUDE_CMD ?? '';
+  const cmd = opts.agentCmd ?? process.env.AGENT_CMD ?? process.env.CLAUDE_CMD ?? '';
   const first = cmd.split(/\s+/).filter(Boolean)[0] ?? '';
   if (/(?:^|\/)(omp|pi)$/.test(first)) return 'omp';
   if (/(?:^|\/)claude$/.test(first)) return 'claude-code';
@@ -95,14 +95,14 @@ export function resolveBackend(opts: RunClaudeChatOptions): AgentBackend {
  * Resolve the agent binary. AGENT_CMD wins over the legacy CLAUDE_CMD;
  * default tracks the resolved backend.
  */
-export function resolveAgentBin(opts: RunClaudeChatOptions, backend: AgentBackend): string {
-  if (opts.claudeCmd) return opts.claudeCmd;
+export function resolveAgentBin(opts: RunAgentChatOptions, backend: AgentBackend): string {
+  if (opts.agentCmd) return opts.agentCmd;
   const fromEnv = process.env.AGENT_CMD ?? process.env.CLAUDE_CMD;
   if (fromEnv && fromEnv.trim()) return fromEnv;
   return backend === 'omp' ? 'omp' : 'claude';
 }
 
-export interface RunClaudeChatOptions {
+export interface RunAgentChatOptions {
   /** The full assembled prompt sent to claude on stdin. */
   promptText: string;
   /** cwd for the spawned process. Required so claude's session-scoped
@@ -124,7 +124,7 @@ export interface RunClaudeChatOptions {
   permissionMode?: 'bypassPermissions' | 'default' | 'ask';
   /** Override the agent binary. Defaults to AGENT_CMD/CLAUDE_CMD env or
       'claude'/'omp' depending on backend. */
-  claudeCmd?: string;
+  agentCmd?: string;
   /**
    * Which agent backend to drive. Default: env AGENT_BACKEND, else
    * inferred from the binary name. Selects flag set + stream parser.
@@ -173,13 +173,13 @@ export type ChatEvent =
  * one terminal event (`result` on success, `error` on failure) before
  * returning so consumers can rely on it for transcript writing.
  */
-export async function* runClaudeChat(
-  opts: RunClaudeChatOptions,
+export async function* runAgentChat(
+  opts: RunAgentChatOptions,
 ): AsyncGenerator<ChatEvent, void, void> {
   maybeBootstrap();
   const backend: AgentBackend = resolveBackend(opts);
-  const claudeCmd = resolveAgentBin(opts, backend);
-  const argv = claudeCmd.split(/\s+/).filter(Boolean);
+  const agentCmd = resolveAgentBin(opts, backend);
+  const argv = agentCmd.split(/\s+/).filter(Boolean);
   const command = argv[0];
   const baseArgs = argv.slice(1);
 
@@ -354,7 +354,7 @@ export async function* runClaudeChat(
     if (ompAgentDir) {
       try { rmSync(ompAgentDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
-    yield { type: 'error', message: `failed to spawn ${claudeCmd}: ${(e as Error).message}` };
+    yield { type: 'error', message: `failed to spawn ${agentCmd}: ${(e as Error).message}` };
     return;
   }
 
