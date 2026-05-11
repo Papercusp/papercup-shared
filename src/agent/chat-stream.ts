@@ -68,8 +68,18 @@ function maybeBootstrap(): void {
 /**
  * Resolve which backend to drive. Explicit opt > AGENT_BACKEND env >
  * inferred from the binary name. Default fallback: omp (Meridian-routed).
+ *
+ * Exported so non-runClaudeChat callers (e.g. pm-dispatch which has
+ * its own bespoke stream parser) can resolve the backend identically.
  */
-function resolveBackend(opts: RunClaudeChatOptions): AgentBackend {
+/**
+ * Resolve which backend to drive. Explicit opt > AGENT_BACKEND env >
+ * inferred from the binary name. Default fallback: omp.
+ *
+ * Exported so non-runClaudeChat callers (e.g. pm-dispatch which has
+ * its own bespoke stream parser) can resolve the backend identically.
+ */
+export function resolveBackend(opts: RunClaudeChatOptions): AgentBackend {
   if (opts.backend) return opts.backend;
   const env = (process.env.AGENT_BACKEND ?? '').trim().toLowerCase();
   if (env === 'omp' || env === 'pi') return 'omp';
@@ -85,7 +95,7 @@ function resolveBackend(opts: RunClaudeChatOptions): AgentBackend {
  * Resolve the agent binary. AGENT_CMD wins over the legacy CLAUDE_CMD;
  * default tracks the resolved backend.
  */
-function resolveAgentBin(opts: RunClaudeChatOptions, backend: AgentBackend): string {
+export function resolveAgentBin(opts: RunClaudeChatOptions, backend: AgentBackend): string {
   if (opts.claudeCmd) return opts.claudeCmd;
   const fromEnv = process.env.AGENT_CMD ?? process.env.CLAUDE_CMD;
   if (fromEnv && fromEnv.trim()) return fromEnv;

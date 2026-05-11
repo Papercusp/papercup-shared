@@ -9,6 +9,8 @@
 export {
   runClaudeChat,
   setAgentConfigBootstrap,
+  resolveBackend,
+  resolveAgentBin,
   type AgentBackend,
   type ChatEvent,
   type RunClaudeChatOptions,
