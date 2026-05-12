@@ -328,15 +328,15 @@ export async function* runAgentChat(
 
     if (opts.allowedTools && opts.allowedTools.length > 0) {
       // omp `--tools` allow-lists built-in tool names. MCP tools are
-      // surfaced regardless; the prompt is responsible for steering.
-      // We pass any matching built-in names through and skip the rest.
-      const builtins = new Set([
-        'read', 'bash', 'edit', 'write', 'grep', 'find', 'lsp', 'python',
-        'notebook', 'inspect_image', 'browser', 'task', 'todo_write',
-        'web_search', 'fetch', 'ask',
-      ]);
-      const matched = opts.allowedTools.filter((t) => builtins.has(t));
-      if (matched.length > 0) args.push('--tools', matched.join(','));
+      // surfaced through the mcp.json path (see PI_CODING_AGENT_DIR
+      // and mcp.discoveryDefaultServers above), not via --tools.
+      //
+      // Strictly safer than a hardcoded built-in name Set: passes through
+      // every non-MCP name to omp. omp ignores unknown names so this is
+      // forward-compatible with new built-ins (e.g. future `web_search`)
+      // without requiring a sync edit here.
+      const ompTools = opts.allowedTools.filter((t) => !t.startsWith('mcp__'));
+      if (ompTools.length > 0) args.push('--tools', ompTools.join(','));
     }
 
     if (opts.sessionId) {
