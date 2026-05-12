@@ -294,6 +294,35 @@ export async function* runAgentChat(
         JSON.stringify({ mcpServers: mergedServers }),
         'utf8',
       );
+
+      // Override mcp.discoveryDefaultServers to include 'agentmcp' so the
+      // operator brain sees its full MCP surface even when the user has
+      // tools.discoveryMode=mcp-only globally for coding sessions. The
+      // override is PER-SPAWN — the user's real ~/.omp/agent/config.yml
+      // is unchanged. Without this, omp's discovery filter (sdk.ts:1480)
+      // hides ALL agentmcp tools from the brain's tools=[...] parameter,
+      // and the brain falls back to emitting XML pseudo-tags it can't
+      // dispatch. See operator/content/docs/agents/prompt-assembly.mdx
+      // and the chat:ask_choice flow walkthrough.
+      try {
+        const configPath = join(ompAgentDir, 'config.yml');
+        if (existsSync(configPath)) {
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          const yaml = require('yaml') as typeof import('yaml');
+          const parsed = (yaml.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown> | null) ?? {};
+          const mcp = (parsed.mcp ??= {} as Record<string, unknown>) as Record<string, unknown>;
+          const existing = Array.isArray(mcp.discoveryDefaultServers) ? mcp.discoveryDefaultServers as string[] : [];
+          if (!existing.includes('agentmcp')) {
+            mcp.discoveryDefaultServers = [...existing, 'agentmcp'];
+            writeFileSync(configPath, yaml.stringify(parsed), 'utf8');
+          }
+        }
+      } catch (err) {
+        // Non-fatal: if yaml parsing fails, we still have a working config.
+        // The brain just won't see MCP tools. Log so we notice in dev.
+        console.warn('[chat-stream] failed to inject mcp.discoveryDefaultServers:', err);
+      }
+
       spawnEnv = { ...process.env, PI_CODING_AGENT_DIR: ompAgentDir };
     }
 
