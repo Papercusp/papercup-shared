@@ -14,7 +14,11 @@ export interface HarnessDetailPayload {
   outbox: InboxPayload;
 }
 
-export type HarnessKind = 'department' | 'coding';
+// Canonical HarnessKind: matches the orchestrator's
+// libs/papercusp/packages/orchestrator/src/types.ts declaration.
+// '' = legacy/unset, 'coding' = solo coding harness, 'org' = parent
+// company harness, 'department' = sub-harness inside an org.
+export type HarnessKind = '' | 'coding' | 'org' | 'department';
 
 export interface HarnessDetailViewProps {
   data: HarnessDetailPayload | null;

@@ -15,21 +15,25 @@ const QUICK_LINKS = [
   { label: 'Operating', path: '/operating/config/' },
 ];
 
-// Map a harness slug to a starting docs path. Department harnesses share
-// /org/charter/ (one page covers all 5); coding harnesses land in /architecture/.
-const DEPARTMENT_SLUGS = ['org-business', 'org-rd', 'org-technology', 'org-management', 'org-marketing'];
+// Map a harness slug to a starting docs path. Department harnesses (anything
+// matching `*-org-<dept>` or `org-<dept>`) share /org/charter/; everything
+// else lands in /architecture/. The slug pattern itself is the indicator —
+// no compile-time list of departments.
 function harnessDocsPath(slug: string): string {
-  if (DEPARTMENT_SLUGS.includes(slug)) return '/org/charter/';
+  if (/(?:^|-)(?:org)-[a-z0-9_-]+$/.test(slug)) return '/org/charter/';
   return '/architecture/';
 }
 
-const DEPT_LABEL: Record<string, string> = {
-  'org-business': 'Business',
-  'org-rd': 'R&D',
-  'org-technology': 'Technology',
-  'org-management': 'Management',
-  'org-marketing': 'Marketing',
-};
+// Best-effort label for the department portion of a slug. The dept name
+// is the suffix after the final `-org-` segment (or after `org-` for the
+// plain `org-<dept>` form).
+function deptLabelFromSlug(slug: string): string | null {
+  const m = slug.match(/(?:^|-)org-([a-z0-9_-]+)$/);
+  if (!m) return null;
+  const raw = m[1];
+  if (raw === 'rd') return 'R&D';
+  return raw.charAt(0).toUpperCase() + raw.slice(1);
+}
 
 export default function DocumentationFrame({ src, harnessSlug }: Props) {
   const [isUp, setIsUp] = useState<boolean | null>(null);
@@ -73,8 +77,8 @@ export default function DocumentationFrame({ src, harnessSlug }: Props) {
     <div className="pc-page pc-docs-page">
       <section className="pc-docs-hero" aria-label="Papercup documentation overview">
         <div>
-          <div className="pc-eyebrow"><span className="pc-eyebrow-dot" /> Harness reference{harnessSlug ? ` · ${DEPT_LABEL[harnessSlug] ?? harnessSlug}` : ''}</div>
-          <h1>{harnessSlug ? `Documentation for ${DEPT_LABEL[harnessSlug] ?? harnessSlug}.` : 'Documentation stays docked beside the live operating console.'}</h1>
+          <div className="pc-eyebrow"><span className="pc-eyebrow-dot" /> Harness reference{harnessSlug ? ` · ${deptLabelFromSlug(harnessSlug) ?? harnessSlug}` : ''}</div>
+          <h1>{harnessSlug ? `Documentation for ${deptLabelFromSlug(harnessSlug) ?? harnessSlug}.` : 'Documentation stays docked beside the live operating console.'}</h1>
           <p className="pc-lede">{harnessSlug ? `Showing the docs section most relevant to this harness. Use the shortcuts to navigate.` : 'Read the framework notes, runtime decisions, and comparison material without leaving Papercup.'}</p>
         </div>
         <div className="pc-docs-actions">
