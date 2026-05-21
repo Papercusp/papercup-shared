@@ -230,6 +230,16 @@ export async function* runAgentChat(
     // Skills + project rules are unrelated to chat surfaces — turn off
     // for predictable, fast spawns.
     args.push('--no-skills', '--no-rules');
+    // --allow-home: when mcpConfig is set, the omp branch below points
+    // BOTH `HOME` and the spawn `cwd` at ompAgentDir — HOME for CLAUDE.md
+    // suppression, cwd so omp's project-scope `$cwd/mcp.json` scan finds
+    // our merged config. But omp, started in a dir that *equals* `~`,
+    // auto-switches cwd to a throwaway temp dir — which silently defeats
+    // the `$cwd/mcp.json` scan, so agentmcp never loads and the brain
+    // runs with zero MCP tools (2026-05-21 P5 root cause; verified with
+    // a logging MCP proxy — 0 requests without this flag, full
+    // initialize + tools/list handshake with it). Harmless when cwd != ~.
+    args.push('--allow-home');
 
     if (opts.mcpConfig) {
       // Translate claude-shape mcp-config into a per-spawn omp agent dir.
