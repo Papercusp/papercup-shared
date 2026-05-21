@@ -332,6 +332,17 @@ export async function* runAgentChat(
           tools.discoveryMode = 'off';
           const mcp = (parsed.mcp ??= {} as Record<string, unknown>) as Record<string, unknown>;
           mcp.discoveryMode = false;
+          // Disable omp's local memory backend for brain spawns.
+          // chat-stream copies the engineer's agent.db (for auth/model
+          // config); with memories enabled omp injects the ENGINEER's
+          // accumulated omp memories into the brain's system prompt, and
+          // the operator brain recites that stale papercup state
+          // (feature ids, escalations, server names like papercusp-su)
+          // as if it were live data it had retrieved — the 2026-05-21 P5
+          // confabulation. The brain must read live state through
+          // agentmcp tools and nothing else.
+          const memories = (parsed.memories ??= {} as Record<string, unknown>) as Record<string, unknown>;
+          memories.enabled = false;
           writeFileSync(configPath, yaml.stringify(parsed), 'utf8');
         }
       } catch (err) {
