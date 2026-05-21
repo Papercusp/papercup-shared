@@ -105,6 +105,16 @@ export function resolveAgentBin(opts: RunAgentChatOptions, backend: AgentBackend
 export interface RunAgentChatOptions {
   /** The full assembled prompt sent to claude on stdin. */
   promptText: string;
+  /**
+   * When set, sent as the agent's SYSTEM prompt (omp `--system-prompt
+   * @file`, claude default-prompt replacement) and `promptText` is sent
+   * as the USER message. Without this, `promptText` becomes the user
+   * message and the agent treats persona+playbook content as
+   * something *the user handed it*, producing meta-commentary instead
+   * of acting on the persona. Required for operator/oracle/architect
+   * brains whose "prompt" is actually a persona spec.
+   */
+  systemPromptText?: string;
   /** cwd for the spawned process. Required so claude's session-scoped
       path restriction can read files referenced in the prompt. */
   cwd?: string;
@@ -323,7 +333,19 @@ export async function* runAgentChat(
         console.warn('[chat-stream] failed to inject mcp.discoveryDefaultServers:', err);
       }
 
-      spawnEnv = { ...process.env, PI_CODING_AGENT_DIR: ompAgentDir };
+      // Redirect HOME to the scoped agent dir. Otherwise omp's `claude`
+      // discovery provider (node_modules/@oh-my-pi/pi-coding-agent/src/
+      // discovery/claude.ts) scans `$HOME/.claude/` and pulls in the
+      // user's CLAUDE.md as system context — on engineer workstations
+      // that file says "you are the engineer-collaborator working with
+      // Papercusp engineers," which makes the operator brain refuse to
+      // roleplay as the Operator and emit a coherent role-refusal
+      // instead of operator output (2026-05-21 P5 root cause). PI_CODING_AGENT_DIR
+      // continues to point at the same scoped dir, so omp's own
+      // ~/.omp/agent state discovery still resolves correctly.
+      // ompAgentDir has no `.claude/` subdir → omp's claude provider
+      // finds nothing → brain runs with only the supplied prompt.
+      spawnEnv = { ...process.env, HOME: ompAgentDir, PI_CODING_AGENT_DIR: ompAgentDir };
     }
 
     if (opts.allowedTools && opts.allowedTools.length > 0) {
@@ -355,10 +377,22 @@ export async function* runAgentChat(
   // For omp, materialise the prompt to a tmpfile and pass `@<path>` as
   // the positional message arg. Avoids both ARG_MAX overflow and the
   // stdin-not-read footgun.
+  //
+  // When `systemPromptText` is provided, write it to a separate file
+  // and pass `--system-prompt @file` so omp uses it as the system
+  // prompt (replacing omp's default coding-assistant prompt). Without
+  // this split, persona+playbook content lands in the user-message
+  // slot and the model meta-comments on it instead of acting on it.
   const finalArgs = [...args];
+  let ompSystemPromptFile: string | undefined;
   if (backend === 'omp') {
     const promptDir = ompAgentDir ?? mkdtempSync(join(tmpdir(), 'omp-prompt-'));
     if (!ompAgentDir) ompAgentDir = promptDir; // reuse cleanup
+    if (opts.systemPromptText !== undefined) {
+      ompSystemPromptFile = join(promptDir, 'system.md');
+      writeFileSync(ompSystemPromptFile, opts.systemPromptText, 'utf8');
+      finalArgs.push('--system-prompt', `@${ompSystemPromptFile}`);
+    }
     ompPromptFile = join(promptDir, 'prompt.md');
     writeFileSync(ompPromptFile, opts.promptText, 'utf8');
     finalArgs.push(`@${ompPromptFile}`);
@@ -561,8 +595,25 @@ export async function* runAgentChat(
 
   if (opts.signal) opts.signal.removeEventListener('abort', onAbort);
 
+  // Silent-failure surfacing: an agent that exits 0 with no text is
+  // almost always a misconfigured per-spawn agent dir (missing auth or
+  // provider config — see the omp branch above). Log the command +
+  // stderr so it is diagnosable, instead of bubbling up to the caller
+  // as a blank turn.
+  if (exitCode === 0 && finalText.trim() === '') {
+    console.error(
+      `[chat-stream] ${backend} exited 0 with EMPTY output. ` +
+        `cmd: ${command} ${finalArgs.join(' ')} | cwd: ${spawnCwd ?? '(default)'} | ` +
+        `stderr: ${stderrBuf.slice(-1500) || '(none)'}`,
+    );
+  }
+
   if (ompAgentDir) {
-    try { rmSync(ompAgentDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    if (process.env.PAPERCUSP_AGENT_DEBUG) {
+      console.error(`[chat-stream] PAPERCUSP_AGENT_DEBUG — preserving agent dir: ${ompAgentDir}`);
+    } else {
+      try { rmSync(ompAgentDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
   }
 
   if (exitCode !== 0) {
