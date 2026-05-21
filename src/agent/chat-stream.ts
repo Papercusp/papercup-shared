@@ -294,53 +294,49 @@ export async function* runAgentChat(
           try { cpSync(src, join(ompAgentDir, f)); } catch { /* best-effort */ }
         }
       }
-      // Merge the user's existing mcp.json with the caller-provided
-      // servers. Caller's entries win on key collision so e2e tests can
-      // override; user's other servers (voice-mode, hindsight, etc.)
-      // are preserved.
-      let baseServers: Record<string, unknown> = {};
-      const baseMcpPath = join(realAgentDir, 'mcp.json');
-      if (existsSync(baseMcpPath)) {
-        try {
-          const parsed = JSON.parse(readFileSync(baseMcpPath, 'utf8'));
-          if (parsed?.mcpServers && typeof parsed.mcpServers === 'object') {
-            baseServers = parsed.mcpServers;
-          }
-        } catch { /* invalid JSON in user dir — start with empty */ }
-      }
-      const mergedServers = { ...baseServers, ...(opts.mcpConfig.mcpServers ?? {}) };
+      // mcp.json: ONLY the caller-provided servers (e.g. agentmcp).
+      // Deliberately NOT merged with the engineer's personal
+      // ~/.omp/agent/mcp.json. A papercusp brain (operator / oracle /
+      // agent-chat) works entirely through agentmcp; it has no use for
+      // playwright / voice-mode / hindsight / plur, which are stdio
+      // servers. omp connects to EVERY configured server at startup and
+      // blocks on uncached ones until their handshake settles — cold-
+      // spawning the engineer's npx-based stdio MCP fleet on every brain
+      // turn pushed operator:converse past its 600s timeout once
+      // --allow-home made mcp.json actually load (2026-05-21 P5).
       writeFileSync(
         join(ompAgentDir, 'mcp.json'),
-        JSON.stringify({ mcpServers: mergedServers }),
+        JSON.stringify({ mcpServers: opts.mcpConfig.mcpServers ?? {} }),
         'utf8',
       );
 
-      // Override mcp.discoveryDefaultServers to include 'agentmcp' so the
-      // operator brain sees its full MCP surface even when the user has
-      // tools.discoveryMode=mcp-only globally for coding sessions. The
-      // override is PER-SPAWN — the user's real ~/.omp/agent/config.yml
-      // is unchanged. Without this, omp's discovery filter (sdk.ts:1480)
-      // hides ALL agentmcp tools from the brain's tools=[...] parameter,
-      // and the brain falls back to emitting XML pseudo-tags it can't
-      // dispatch. See operator/content/docs/agents/prompt-assembly.mdx
-      // and the chat:ask_choice flow walkthrough.
+      // Disable omp's MCP tool-discovery mode for papercusp brain
+      // spawns. The user's global config carries tools.discoveryMode=
+      // mcp-only for their own coding sessions; for a brain spawn that
+      // is wrong twice over: (a) discovery gates agentmcp's tools behind
+      // a search_tool_bm25 step the model does not reliably take — it
+      // concludes "no tools" and confabulates; and (b) — observed
+      // 2026-05-21 P5 — an omp run with discovery on does not exit after
+      // the turn completes, hanging operator:converse until its 600s
+      // timeout (diag: discovery-on omp exit=124, discovery-off exit=0,
+      // all else identical). mcp.json holds only agentmcp now, so there
+      // is nothing to "discover" — load every tool directly. PER-SPAWN;
+      // the user's real ~/.omp/agent/config.yml is untouched.
       try {
         const configPath = join(ompAgentDir, 'config.yml');
         if (existsSync(configPath)) {
           // eslint-disable-next-line @typescript-eslint/no-require-imports
           const yaml = require('yaml') as typeof import('yaml');
           const parsed = (yaml.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown> | null) ?? {};
+          const tools = (parsed.tools ??= {} as Record<string, unknown>) as Record<string, unknown>;
+          tools.discoveryMode = 'off';
           const mcp = (parsed.mcp ??= {} as Record<string, unknown>) as Record<string, unknown>;
-          const existing = Array.isArray(mcp.discoveryDefaultServers) ? mcp.discoveryDefaultServers as string[] : [];
-          if (!existing.includes('agentmcp')) {
-            mcp.discoveryDefaultServers = [...existing, 'agentmcp'];
-            writeFileSync(configPath, yaml.stringify(parsed), 'utf8');
-          }
+          mcp.discoveryMode = false;
+          writeFileSync(configPath, yaml.stringify(parsed), 'utf8');
         }
       } catch (err) {
         // Non-fatal: if yaml parsing fails, we still have a working config.
-        // The brain just won't see MCP tools. Log so we notice in dev.
-        console.warn('[chat-stream] failed to inject mcp.discoveryDefaultServers:', err);
+        console.warn('[chat-stream] failed to disable omp discovery mode:', err);
       }
 
       // Redirect HOME to the scoped agent dir. Otherwise omp's `claude`
