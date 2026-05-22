@@ -31,7 +31,7 @@ import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } 
 import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
-export type AgentBackend = 'claude-code' | 'omp';
+export type AgentBackend = 'claude-code' | 'omp' | 'meridian';
 
 /**
  * Optional bootstrap hook for callers that persist agent config to
@@ -84,6 +84,7 @@ export function resolveBackend(opts: RunAgentChatOptions): AgentBackend {
   const env = (process.env.AGENT_BACKEND ?? '').trim().toLowerCase();
   if (env === 'omp' || env === 'pi') return 'omp';
   if (env === 'claude-code' || env === 'claude') return 'claude-code';
+  if (env === 'meridian') return 'meridian';
   const cmd = opts.agentCmd ?? process.env.AGENT_CMD ?? process.env.CLAUDE_CMD ?? '';
   const first = cmd.split(/\s+/).filter(Boolean)[0] ?? '';
   if (/(?:^|\/)(omp|pi)$/.test(first)) return 'omp';
@@ -164,6 +165,31 @@ export interface RunAgentChatOptions {
    * we manage the session id ourselves.
    */
   sessionMode?: 'resume' | 'force';
+  /**
+   * Multi-turn message history. For stateless backends (`meridian`) this
+   * is the entire conversation sent to the model each turn — caller
+   * manages history. For subprocess backends (`omp` / `claude-code`),
+   * `promptText` is the only user message; this field is ignored
+   * (the agent loop manages its own conversation state).
+   */
+  messages?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  /**
+   * Max output tokens. `meridian` honors this; `omp` / `claude-code`
+   * have their own internal limits.
+   */
+  maxTokens?: number;
+  /**
+   * Sampling temperature (0–1). `meridian` honors when the model
+   * accepts it (skipped for `opus*` per the Anthropic API constraint).
+   * `omp` / `claude-code` ignore.
+   */
+  temperature?: number;
+  /**
+   * Thinking budget (tokens). Maps to Anthropic's `thinking: {type:
+   * 'enabled', budget_tokens: N}`. Meridian translates per-provider
+   * (e.g. OpenAI `reasoning_effort`). `meridian` only.
+   */
+  thinkingBudgetTokens?: number;
 }
 
 export type ChatEvent =
@@ -178,6 +204,160 @@ export type ChatEvent =
     }
   | { type: 'error'; message: string; stderr?: string };
 
+// ===========================================================================
+// `meridian` backend — stateless HTTP call to the user's local Meridian
+// router (the same Anthropic-format API every omp brain spawn talks to).
+// No subprocess; ~100-300ms overhead vs. ~1-2s for an omp spawn.
+//
+// Use when a caller needs an LLM round-trip but NOT a full agent loop
+// (no MCP tools, no multi-step tool use). Examples: llm-testing judge +
+// sim-user, oracle one-shot Q&A, summarisers. The shared pricing /
+// retry / auth surface lives here so every caller benefits from one
+// hardened path.
+// ===========================================================================
+
+let _meridianTokenCache: string | null | undefined; // undefined = not loaded; null = no token
+
+function readMeridianToken(): string | null {
+  if (_meridianTokenCache !== undefined) return _meridianTokenCache;
+  try {
+    const raw = readFileSync(join(homedir(), '.omp', 'agent', 'auth.json'), 'utf8');
+    const parsed = JSON.parse(raw) as { anthropic?: { token?: { access?: string } } };
+    _meridianTokenCache = parsed.anthropic?.token?.access ?? null;
+  } catch {
+    _meridianTokenCache = null;
+  }
+  return _meridianTokenCache;
+}
+
+interface ModelPrice { in: number; out: number }
+const MERIDIAN_PRICES: Record<string, ModelPrice> = {
+  // Anthropic family (per 1M tokens, USD)
+  'claude-haiku-4-5':  { in: 0.80, out: 4.00 },
+  'claude-sonnet-4-6': { in: 3.00, out: 15.00 },
+  'claude-opus-4-7':   { in: 15.00, out: 75.00 },
+  // OpenAI codex models routed via Meridian (approximate 2026-05 reference)
+  'openai-codex/gpt-5':           { in: 1.25, out: 10.00 },
+  'openai-codex/gpt-5.5':         { in: 2.50, out: 20.00 },
+  'openai-codex/gpt-5.5:xhigh':   { in: 2.50, out: 20.00 },
+};
+function meridianPriceFor(model: string): ModelPrice {
+  if (MERIDIAN_PRICES[model]) return MERIDIAN_PRICES[model];
+  const prefix = Object.keys(MERIDIAN_PRICES).find((m) => model.startsWith(m));
+  return prefix ? MERIDIAN_PRICES[prefix] : { in: 0, out: 0 };
+}
+
+function isMeridianTransient(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // Anthropic SDK APIError surfaces as `<status> <body>` in .message.
+  // Retry on 529 overloaded, 429 rate-limit, 5xx, and network blips.
+  return /(\b529\b|overloaded|rate.?limit|service unavailable|\b50[02-4]\b|ETIMEDOUT|ECONNRESET|ECONNREFUSED|socket hang up)/i.test(msg);
+}
+
+async function* meridianAgentChat(
+  opts: RunAgentChatOptions,
+): AsyncGenerator<ChatEvent, void, void> {
+  if (opts.mcpConfig) {
+    yield { type: 'error', message: 'meridian backend does not support mcpConfig — use omp/claude-code for MCP-bearing turns' };
+    return;
+  }
+  if (!opts.model) {
+    yield { type: 'error', message: 'meridian backend requires opts.model (resolve via modelRoles or pass explicitly)' };
+    return;
+  }
+  const token = readMeridianToken();
+  if (!token) {
+    yield { type: 'error', message: 'meridian backend requires Claude OAuth token at ~/.omp/agent/auth.json — run `omp` once to authenticate' };
+    return;
+  }
+
+  // Lazy-load the SDK so consumers that never use the meridian backend
+  // don't pay the import cost.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const sdkMod = require('@anthropic-ai/sdk') as { default?: unknown } | unknown;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const Anthropic: any = (sdkMod as { default?: unknown }).default ?? sdkMod;
+
+  const baseURL = process.env.PAPERCUSP_MERIDIAN_URL ?? 'http://127.0.0.1:3456';
+  // Per-call unique agent id so Meridian doesn't fold this request into
+  // a shared agent context (the same lesson as the operator-brain fix:
+  // shared `x-meridian-agent: pi` cross-contaminates).
+  const agentId = `papercup-llm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const client = new Anthropic({
+    baseURL,
+    authToken: token,
+    defaultHeaders: { 'x-meridian-agent': agentId },
+    maxRetries: 2,
+  });
+
+  // Build request params. messages overrides promptText for multi-turn.
+  const messages = opts.messages && opts.messages.length > 0
+    ? opts.messages
+    : [{ role: 'user' as const, content: opts.promptText }];
+  // opus models reject the temperature parameter (Anthropic API
+  // constraint as of 2026-05); skip pre-emptively.
+  const sendsTemperature = !/opus/i.test(opts.model);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const params: Record<string, any> = {
+    model: opts.model,
+    max_tokens: opts.maxTokens ?? 4096,
+    messages,
+  };
+  if (opts.systemPromptText) params.system = opts.systemPromptText;
+  if (sendsTemperature && opts.temperature !== undefined) params.temperature = opts.temperature;
+  if (opts.thinkingBudgetTokens && opts.thinkingBudgetTokens > 0) {
+    params.thinking = { type: 'enabled', budget_tokens: opts.thinkingBudgetTokens };
+  }
+
+  // Patient retry on transient errors (sustained 529 overload). 8
+  // attempts, backoff 2/4/8/16/32/60/60/60s + SDK's own retries.
+  const RETRY_MAX = 8;
+  const RETRY_CAP_MS = 60_000;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= RETRY_MAX; attempt++) {
+    if (opts.signal?.aborted) {
+      yield { type: 'error', message: 'meridian: aborted' };
+      return;
+    }
+    try {
+      const resp = await client.messages.create(
+        params,
+        opts.signal ? { signal: opts.signal } : {},
+      );
+      let finalText = '';
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      for (const block of (resp.content ?? []) as Array<any>) {
+        if (block?.type === 'text' && typeof block.text === 'string') finalText += block.text;
+      }
+      const inputTokens = resp.usage?.input_tokens ?? 0;
+      const outputTokens = resp.usage?.output_tokens ?? 0;
+      const p = meridianPriceFor(opts.model);
+      const costUsd = (inputTokens * p.in + outputTokens * p.out) / 1_000_000;
+      if (finalText) yield { type: 'delta', text: finalText };
+      yield { type: 'result', costUsd, tokensIn: inputTokens, tokensOut: outputTokens, finalText };
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (!isMeridianTransient(err) || attempt === RETRY_MAX) {
+        yield {
+          type: 'error',
+          message: `meridian error: ${err instanceof Error ? err.message : String(err)}`,
+        };
+        return;
+      }
+      const backoffMs = Math.min(RETRY_CAP_MS, 1000 * 2 ** attempt) + Math.random() * 500;
+      console.warn(
+        `[meridian] transient (attempt ${attempt}/${RETRY_MAX}), retrying in ${Math.round(backoffMs)}ms: ${err instanceof Error ? err.message.slice(0, 140) : String(err)}`,
+      );
+      await new Promise((r) => setTimeout(r, backoffMs));
+    }
+  }
+  yield {
+    type: 'error',
+    message: `meridian: exhausted ${RETRY_MAX} retries: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`,
+  };
+}
+
 /**
  * Spawn claude and yield events as they arrive. Always yields exactly
  * one terminal event (`result` on success, `error` on failure) before
@@ -188,6 +368,10 @@ export async function* runAgentChat(
 ): AsyncGenerator<ChatEvent, void, void> {
   maybeBootstrap();
   const backend: AgentBackend = resolveBackend(opts);
+  if (backend === 'meridian') {
+    yield* meridianAgentChat(opts);
+    return;
+  }
   const agentCmd = resolveAgentBin(opts, backend);
   const argv = agentCmd.split(/\s+/).filter(Boolean);
   const command = argv[0];
