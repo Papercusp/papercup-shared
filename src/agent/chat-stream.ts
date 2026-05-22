@@ -29,7 +29,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 export type AgentBackend = 'claude-code' | 'omp';
 
@@ -294,6 +294,55 @@ export async function* runAgentChat(
           try { cpSync(src, join(ompAgentDir, f)); } catch { /* best-effort */ }
         }
       }
+
+      // Per-spawn-unique Meridian agent identity (2026-05-21 P5 bug #5
+      // core root cause). The engineer's models.json/models.yml set
+      // `providers.*.headers.x-meridian-agent: pi` — `pi` is the SHARED
+      // omp identity every omp process on the box uses. Meridian keys
+      // context (system prompt + tool set + prompt cache) by that name,
+      // so all `pi` traffic is folded into ONE shared context. A brain
+      // spawn that inherits `pi` has its request's `system` + `tools`
+      // OVERRIDDEN by whatever other `pi` agent is live — e.g. the
+      // engineer's Claude Code session — so the model never sees its 228
+      // agentmcp tools, reports "no such tool", and confabulates. (The
+      // engineer's normal omp agents are unaffected: they all expect the
+      // same shared fleet, so sharing is harmless for them; only a brain
+      // that uniquely needs `agentmcp` breaks.) Verified by direct
+      // Meridian probe: identical request with `x-meridian-agent: pi`
+      // ignores the request's tools and returns a foreign session's
+      // toolset; with a fresh unique name the tools pass through and the
+      // model calls them. Rewrite to a per-spawn-unique value so Meridian
+      // gives this brain an isolated context. Per-spawn (not per-role)
+      // so concurrent brain spawns never cross-contaminate each other.
+      const meridianAgent = `papercup-brain-${basename(ompAgentDir)}`;
+      for (const modelFile of ['models.json', 'models.yml']) {
+        const modelPath = join(ompAgentDir, modelFile);
+        if (!existsSync(modelPath)) continue;
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          const yaml = require('yaml') as typeof import('yaml');
+          const isJson = modelFile.endsWith('.json');
+          const raw = readFileSync(modelPath, 'utf8');
+          const parsed = (isJson ? JSON.parse(raw) : yaml.parse(raw)) as
+            | { providers?: Record<string, { headers?: Record<string, string> }> }
+            | null;
+          if (parsed && parsed.providers && typeof parsed.providers === 'object') {
+            for (const provider of Object.values(parsed.providers)) {
+              if (!provider || typeof provider !== 'object') continue;
+              const headers = (provider.headers ??= {} as Record<string, string>);
+              headers['x-meridian-agent'] = meridianAgent;
+            }
+            writeFileSync(
+              modelPath,
+              isJson ? JSON.stringify(parsed, null, 2) : yaml.stringify(parsed),
+              'utf8',
+            );
+          }
+        } catch (err) {
+          console.warn(`[chat-stream] failed to rewrite ${modelFile} x-meridian-agent:`, err);
+        }
+      }
+
       // mcp.json: ONLY the caller-provided servers (e.g. agentmcp).
       // Deliberately NOT merged with the engineer's personal
       // ~/.omp/agent/mcp.json. A papercusp brain (operator / oracle /
