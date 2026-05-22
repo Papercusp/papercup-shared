@@ -106,13 +106,13 @@ export interface RunAgentChatOptions {
   /** The full assembled prompt sent to claude on stdin. */
   promptText: string;
   /**
-   * When set, sent as the agent's SYSTEM prompt (omp `--system-prompt
-   * @file`, claude default-prompt replacement) and `promptText` is sent
-   * as the USER message. Without this, `promptText` becomes the user
-   * message and the agent treats persona+playbook content as
-   * something *the user handed it*, producing meta-commentary instead
-   * of acting on the persona. Required for operator/oracle/architect
-   * brains whose "prompt" is actually a persona spec.
+   * When set, sent as the agent's SYSTEM prompt (omp
+   * `--append-system-prompt`, claude default-prompt replacement) and
+   * `promptText` is sent as the USER message. Without this, `promptText`
+   * becomes the user message and the agent treats persona+playbook
+   * content as something *the user handed it*, producing meta-commentary
+   * instead of acting on the persona. Required for operator/oracle/
+   * architect brains whose "prompt" is actually a persona spec.
    */
   systemPromptText?: string;
   /** cwd for the spawned process. Required so claude's session-scoped
@@ -396,10 +396,10 @@ export async function* runAgentChat(
   // stdin-not-read footgun.
   //
   // When `systemPromptText` is provided, write it to a separate file
-  // and pass `--system-prompt @file` so omp uses it as the system
-  // prompt (replacing omp's default coding-assistant prompt). Without
-  // this split, persona+playbook content lands in the user-message
-  // slot and the model meta-comments on it instead of acting on it.
+  // and pass it via `--append-system-prompt` so the operator/oracle
+  // persona is ADDED to omp's default prompt. Without the system/user
+  // split, persona+playbook content lands in the user-message slot and
+  // the model meta-comments on it instead of acting on it.
   const finalArgs = [...args];
   let ompSystemPromptFile: string | undefined;
   if (backend === 'omp') {
@@ -408,7 +408,32 @@ export async function* runAgentChat(
     if (opts.systemPromptText !== undefined) {
       ompSystemPromptFile = join(promptDir, 'system.md');
       writeFileSync(ompSystemPromptFile, opts.systemPromptText, 'utf8');
-      finalArgs.push('--system-prompt', `@${ompSystemPromptFile}`);
+      // Two things this line gets right, both 2026-05-21 P5 bug #5:
+      //
+      // 1. `--append-system-prompt`, NOT `--system-prompt`. omp's
+      //    `--system-prompt` REPLACES omp's default prompt; that default
+      //    is what grounds the model as an omp agent ("you have these
+      //    tools, use them to complete the task"). Stripped of it the
+      //    brain reverts to its training prior — claude-opus-4-7's prior
+      //    is Claude Code — and opens the turn with the Claude-Code
+      //    `WaitForMcpServers` startup reflex. omp has no such tool, the
+      //    call fails, and the brain concludes MCP is unavailable and
+      //    confabulates instead of calling its (real, connected) tools.
+      //    `--append-system-prompt` keeps omp's grounding and layers the
+      //    persona AFTER it (persona wins on any conflict). Verified:
+      //    `--system-prompt` → 5x WaitForMcpServers / 0 real tool calls;
+      //    `--append-system-prompt` → 0 WaitForMcpServers.
+      //
+      // 2. BARE FILE PATH, not `@file`. omp's resolvePromptInput() does
+      //    `Bun.file(value).text()` directly; a leading `@` makes the
+      //    path nonexistent, the ENOENT is silently swallowed, and omp
+      //    falls back to the literal string `@/tmp/.../system.md` as the
+      //    prompt — persona never reaches the model (model-API proxy:
+      //    systemChars 1370 with `@`, ~73k as a bare path appended to
+      //    omp's default). The `@` IS correct for the positional message
+      //    arg below — that path goes through omp's file-processor which
+      //    does expand `@file`. Only the prompt flags differ.
+      finalArgs.push('--append-system-prompt', ompSystemPromptFile);
     }
     ompPromptFile = join(promptDir, 'prompt.md');
     writeFileSync(ompPromptFile, opts.promptText, 'utf8');
