@@ -103,6 +103,21 @@ export function resolveAgentBin(opts: RunAgentChatOptions, backend: AgentBackend
   return backend === 'omp' ? 'omp' : 'claude';
 }
 
+/**
+ * claude's `--model` wants a bare id (`claude-opus-4-7`) or an alias
+ * (`opus`/`sonnet`/`haiku`); it rejects omp/Meridian's `provider/model`
+ * form (e.g. `anthropic/claude-opus-4-7`), which is what callers like the
+ * operator brain default pass. Strip a single leading `provider/` segment
+ * for the claude-code backend; an already-bare id passes through. (omp
+ * does its own fuzzy resolution and must keep the prefix, so only the
+ * claude branch calls this.)
+ */
+export function normalizeModelForClaude(model: string): string {
+  if (!model) return model;
+  const slash = model.indexOf('/');
+  return slash > 0 ? model.slice(slash + 1) : model;
+}
+
 export interface RunAgentChatOptions {
   /** The full assembled prompt sent to claude on stdin. */
   promptText: string;
@@ -387,7 +402,7 @@ export async function* runAgentChat(
 
   if (backend === 'claude-code') {
     args.push('-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages');
-    if (opts.model) args.push('--model', opts.model);
+    if (opts.model) args.push('--model', normalizeModelForClaude(opts.model));
     if (opts.mcpConfig) {
       args.push('--mcp-config', JSON.stringify(opts.mcpConfig));
     }
