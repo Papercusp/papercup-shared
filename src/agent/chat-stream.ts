@@ -220,15 +220,16 @@ export type ChatEvent =
   | { type: 'error'; message: string; stderr?: string };
 
 // ===========================================================================
-// `meridian` backend — stateless HTTP call to the user's local Meridian
-// router (the same Anthropic-format API every omp brain spawn talks to).
-// No subprocess; ~100-300ms overhead vs. ~1-2s for an omp spawn.
+// Stateless `meridian` backend — a single Anthropic-format HTTP round-trip,
+// NO subprocess (~100-300ms vs. ~1-2s for an agent spawn). Use when a caller
+// needs an LLM round-trip but NOT a full agent loop (no MCP, no multi-step
+// tool use): llm-testing judge + sim-user, summarisers, one-shot Q&A.
 //
-// Use when a caller needs an LLM round-trip but NOT a full agent loop
-// (no MCP tools, no multi-step tool use). Examples: llm-testing judge +
-// sim-user, oracle one-shot Q&A, summarisers. The shared pricing /
-// retry / auth surface lives here so every caller benefits from one
-// hardened path.
+// Transport is resolved per call (resolveStatelessTransport): a claude-code
+// user goes DIRECT to api.anthropic.com with their Claude OAuth session —
+// Meridian, the multi-provider router, is only needed for non-claude backends
+// — while an omp user routes through the local Meridian router. The shared
+// pricing / retry / streaming surface below serves both.
 // ===========================================================================
 
 let _meridianTokenCache: string | null | undefined; // undefined = not loaded; null = no token
@@ -243,6 +244,70 @@ function readMeridianToken(): string | null {
     _meridianTokenCache = null;
   }
   return _meridianTokenCache;
+}
+
+/**
+ * Claude Code's own OAuth session token (`~/.claude/.credentials.json`).
+ * It's the same Claude-Max OAuth credential Meridian forwards, and works
+ * directly against api.anthropic.com with the `anthropic-beta:
+ * oauth-2025-04-20` header (verified) — no Meridian router needed. Cached.
+ */
+let _claudeTokenCache: string | null | undefined;
+function readClaudeOauthToken(): string | null {
+  if (_claudeTokenCache !== undefined) return _claudeTokenCache;
+  try {
+    const raw = readFileSync(join(homedir(), '.claude', '.credentials.json'), 'utf8');
+    const parsed = JSON.parse(raw) as { claudeAiOauth?: { accessToken?: string } };
+    _claudeTokenCache = parsed.claudeAiOauth?.accessToken ?? null;
+  } catch {
+    _claudeTokenCache = null;
+  }
+  return _claudeTokenCache;
+}
+
+interface StatelessTransport {
+  baseURL: string;
+  token: string;
+  headers: Record<string, string>;
+  label: 'anthropic-direct' | 'meridian';
+}
+
+/**
+ * Resolve the transport for a stateless Anthropic-format call.
+ *
+ *  - claude-code backend (or no Meridian token but a Claude session present)
+ *    → DIRECT to api.anthropic.com with the Claude OAuth session. Meridian is
+ *    the multi-provider router; a claude user doesn't need it.
+ *  - otherwise → the local Meridian router with omp's OAuth token, carrying a
+ *    per-call-unique `x-meridian-agent` so requests don't fold into a shared
+ *    agent context.
+ *
+ * Returns `{ error }` when neither credential is present.
+ */
+function resolveStatelessTransport(): StatelessTransport | { error: string } {
+  const backend = resolveBackend({}); // env-driven effective agent backend
+  const claudeTok = readClaudeOauthToken();
+  const meridianTok = readMeridianToken();
+  const direct = (): StatelessTransport => ({
+    baseURL: process.env.PAPERCUSP_ANTHROPIC_URL ?? 'https://api.anthropic.com',
+    token: claudeTok!,
+    headers: { 'anthropic-beta': 'oauth-2025-04-20' },
+    label: 'anthropic-direct',
+  });
+  const viaMeridian = (): StatelessTransport => ({
+    baseURL: process.env.PAPERCUSP_MERIDIAN_URL ?? 'http://127.0.0.1:3456',
+    token: meridianTok!,
+    headers: { 'x-meridian-agent': `papercup-llm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}` },
+    label: 'meridian',
+  });
+  if (backend === 'claude-code' && claudeTok) return direct();
+  if (meridianTok) return viaMeridian();
+  if (claudeTok) return direct();
+  return {
+    error:
+      'stateless LLM path needs a Claude session (~/.claude/.credentials.json) ' +
+      'or omp/Meridian auth (~/.omp/agent/auth.json)',
+  };
 }
 
 interface ModelPrice { in: number; out: number }
@@ -280,28 +345,25 @@ async function* meridianAgentChat(
     yield { type: 'error', message: 'meridian backend requires opts.model (resolve via modelRoles or pass explicitly)' };
     return;
   }
-  const token = readMeridianToken();
-  if (!token) {
-    yield { type: 'error', message: 'meridian backend requires Claude OAuth token at ~/.omp/agent/auth.json — run `omp` once to authenticate' };
+  // Resolve transport: direct-to-Anthropic for claude-code users, else the
+  // local Meridian router (see resolveStatelessTransport).
+  const transport = resolveStatelessTransport();
+  if ('error' in transport) {
+    yield { type: 'error', message: transport.error };
     return;
   }
 
-  // Lazy-load the SDK so consumers that never use the meridian backend
-  // don't pay the import cost.
+  // Lazy-load the SDK so consumers that never use this path don't pay the
+  // import cost.
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const sdkMod = require('@anthropic-ai/sdk') as { default?: unknown } | unknown;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const Anthropic: any = (sdkMod as { default?: unknown }).default ?? sdkMod;
 
-  const baseURL = process.env.PAPERCUSP_MERIDIAN_URL ?? 'http://127.0.0.1:3456';
-  // Per-call unique agent id so Meridian doesn't fold this request into
-  // a shared agent context (the same lesson as the operator-brain fix:
-  // shared `x-meridian-agent: pi` cross-contaminates).
-  const agentId = `papercup-llm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const client = new Anthropic({
-    baseURL,
-    authToken: token,
-    defaultHeaders: { 'x-meridian-agent': agentId },
+    baseURL: transport.baseURL,
+    authToken: transport.token,
+    defaultHeaders: transport.headers,
     maxRetries: 2,
   });
 
