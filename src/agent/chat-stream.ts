@@ -15,6 +15,13 @@
  *   - 'omp': @oh-my-pi/pi-coding-agent with `--mode json`. MCP servers
  *     passed via a per-spawn `PI_CODING_AGENT_DIR=<tmpdir>` whose
  *     `mcp.json` is written before spawn (omp loads it from disk).
+ *   - 'codex': codex-cli `exec --json` (JSONL events; prompt on stdin via
+ *     the trailing `-`). No --system-prompt / --mcp-config flags — both
+ *     are configured through a per-spawn `CODEX_HOME=<tmpdir>` holding
+ *     `AGENTS.md` (system prompt), `config.toml` (`[mcp_servers.*]`), and
+ *     a symlink to `~/.codex/auth.json` (shared ChatGPT OAuth login).
+ *   - 'meridian': stateless single Anthropic-format HTTP round-trip, no
+ *     subprocess. No MCP. For one-shot LLM turns (judges, summarisers).
  *
  * Caller responsibilities (intentionally NOT in here):
  *   - Prompt assembly (each surface loads its own prompt + memory)
@@ -31,7 +38,7 @@ import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } 
 import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
-export type AgentBackend = 'claude-code' | 'omp' | 'meridian';
+export type AgentBackend = 'claude-code' | 'omp' | 'meridian' | 'codex';
 
 /**
  * Optional bootstrap hook for callers that persist agent config to
@@ -85,10 +92,12 @@ export function resolveBackend(opts: RunAgentChatOptions): AgentBackend {
   if (env === 'omp' || env === 'pi') return 'omp';
   if (env === 'claude-code' || env === 'claude') return 'claude-code';
   if (env === 'meridian') return 'meridian';
+  if (env === 'codex') return 'codex';
   const cmd = opts.agentCmd ?? process.env.AGENT_CMD ?? process.env.CLAUDE_CMD ?? '';
   const first = cmd.split(/\s+/).filter(Boolean)[0] ?? '';
   if (/(?:^|\/)(omp|pi)$/.test(first)) return 'omp';
   if (/(?:^|\/)claude$/.test(first)) return 'claude-code';
+  if (/(?:^|\/)codex$/.test(first)) return 'codex';
   return 'omp';
 }
 
@@ -100,7 +109,9 @@ export function resolveAgentBin(opts: RunAgentChatOptions, backend: AgentBackend
   if (opts.agentCmd) return opts.agentCmd;
   const fromEnv = process.env.AGENT_CMD ?? process.env.CLAUDE_CMD;
   if (fromEnv && fromEnv.trim()) return fromEnv;
-  return backend === 'omp' ? 'omp' : 'claude';
+  if (backend === 'omp') return 'omp';
+  if (backend === 'codex') return 'codex';
+  return 'claude';
 }
 
 /**
@@ -116,6 +127,19 @@ export function normalizeModelForClaude(model: string): string {
   if (!model) return model;
   const slash = model.indexOf('/');
   return slash > 0 ? model.slice(slash + 1) : model;
+}
+
+/** Escape a string for a double-quoted TOML basic value. */
+function tomlStr(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+/**
+ * A TOML bare key may only contain [A-Za-z0-9_-]; codex MCP server names
+ * (e.g. `papercusp-su`) qualify, but anything with a `:` or `.` (like a
+ * tool-style name) must be quoted. Quote defensively.
+ */
+function tomlKey(s: string): string {
+  return /^[A-Za-z0-9_-]+$/.test(s) ? s : `"${tomlStr(s)}"`;
 }
 
 export interface RunAgentChatOptions {
@@ -336,6 +360,27 @@ function meridianPriceFor(model: string): ModelPrice {
   return prefix ? MERIDIAN_PRICES[prefix] : { in: 0, out: 0 };
 }
 
+// Codex (`codex exec`) emits NO cost field — only a token `usage` block on
+// `turn.completed`. We derive costUsd from this table the same way the
+// stateless meridian path does (model → in/out per 1M tokens, USD).
+// Codex runs OpenAI GPT-5 family models (logged in via ChatGPT OAuth);
+// keys are the BARE model id codex reports (`gpt-5.5`), plus the
+// `openai-codex/*` form for callers that pass the meridian-style prefix.
+// Approximate 2026-05 reference pricing — keep in sync with MERIDIAN_PRICES.
+const CODEX_PRICES: Record<string, ModelPrice> = {
+  'gpt-5':              { in: 1.25, out: 10.00 },
+  'gpt-5.5':            { in: 2.50, out: 20.00 },
+  'gpt-5.5:xhigh':      { in: 2.50, out: 20.00 },
+  'openai-codex/gpt-5':   { in: 1.25, out: 10.00 },
+  'openai-codex/gpt-5.5': { in: 2.50, out: 20.00 },
+};
+function codexPriceFor(model: string | undefined): ModelPrice {
+  if (!model) return CODEX_PRICES['gpt-5.5'];
+  if (CODEX_PRICES[model]) return CODEX_PRICES[model];
+  const prefix = Object.keys(CODEX_PRICES).find((m) => model.startsWith(m));
+  return prefix ? CODEX_PRICES[prefix] : { in: 0, out: 0 };
+}
+
 function isMeridianTransient(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   // Anthropic SDK APIError surfaces as `<status> <body>` in .message.
@@ -468,6 +513,14 @@ export async function* runAgentChat(
   // Cleaned up after the child exits.
   let ompAgentDir: string | undefined;
 
+  // Per-spawn CODEX_HOME (codex only) — holds AGENTS.md (codex's only
+  // system-prompt surface), config.toml (MCP servers), and a symlink to
+  // the user's ~/.codex/auth.json so the ChatGPT OAuth login carries
+  // over. Created only when systemPromptText or mcpConfig is set;
+  // otherwise codex runs against the user's real ~/.codex. Cleaned up
+  // after the child exits (alongside ompAgentDir).
+  let codexHome: string | undefined;
+
   const args: string[] = [...baseArgs];
   let spawnEnv: NodeJS.ProcessEnv = process.env;
 
@@ -490,6 +543,120 @@ export async function* runAgentChat(
         args.push('--session-id', opts.sessionId);
       }
     }
+  } else if (backend === 'codex') {
+    // codex (`codex exec`). Like claude, codex reads the prompt from
+    // STDIN via the `-` positional (handled in the stdin block below).
+    // `--json` emits JSONL events (one per line, NOT token-streamed);
+    // `--skip-git-repo-check` allows running outside a git repo;
+    // `--ephemeral` keeps no persistent session/rollout on disk.
+    args.push('exec', '--json', '--skip-git-repo-check', '--ephemeral');
+    // Sandbox / approval mode. Default read-only; bypassPermissions
+    // unlocks full access (lets MCP tool calls + shell run without an
+    // interactive approval gate — verified: `read-only` cancels MCP
+    // calls with "user cancelled MCP tool call").
+    if (opts.permissionMode === 'bypassPermissions') {
+      args.push('-s', 'danger-full-access', '--dangerously-bypass-approvals-and-sandbox');
+    } else {
+      args.push('-s', 'read-only');
+    }
+    // Model: codex wants a bare id (`gpt-5.5`); strip any `provider/`
+    // prefix the same way the claude branch normalizes.
+    if (opts.model) args.push('-m', normalizeModelForClaude(opts.model));
+
+    // codex has NO --system-prompt flag and NO inline --mcp-config flag.
+    // Both surfaces are configured through a per-spawn CODEX_HOME:
+    //   - AGENTS.md  ← systemPromptText (codex's only system-prompt surface)
+    //   - config.toml ← [mcp_servers.<name>] blocks (mirrors
+    //                    install-standalone-mcp.sh's codex-su TOML shape)
+    //   - auth.json  ← symlink to ~/.codex/auth.json (shared ChatGPT login)
+    // Created only when one of those is needed; otherwise codex uses the
+    // user's real ~/.codex (which already has auth + config).
+    if (opts.systemPromptText !== undefined || opts.mcpConfig) {
+      codexHome = mkdtempSync(join(tmpdir(), 'codex-chat-'));
+      // Share the ChatGPT OAuth login. codex resolves auth from
+      // $CODEX_HOME/auth.json; symlink the user's real one in so we
+      // don't need an API key (login is via ChatGPT OAuth).
+      try {
+        const realAuth = join(homedir(), '.codex', 'auth.json');
+        if (existsSync(realAuth)) {
+          // node:fs symlink — relative cleanup is fine since we rm the
+          // whole tmpdir. Use require to avoid widening the top imports.
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          const { symlinkSync } = require('node:fs') as typeof import('node:fs');
+          symlinkSync(realAuth, join(codexHome, 'auth.json'));
+        }
+      } catch (err) {
+        console.warn('[chat-stream] codex: failed to symlink auth.json:', err);
+      }
+
+      if (opts.systemPromptText !== undefined) {
+        // AGENTS.md is codex's only system-prompt surface (it has no
+        // --system-prompt / --append-system-prompt flag).
+        writeFileSync(join(codexHome, 'AGENTS.md'), opts.systemPromptText, 'utf8');
+      }
+
+      spawnEnv = { ...process.env, CODEX_HOME: codexHome };
+
+      if (opts.mcpConfig) {
+        // Translate the claude-shape mcpConfig ({ mcpServers: { <name>:
+        // { type:'http', url, headers:{Authorization:'Bearer <tok>'} } } })
+        // into codex's config.toml [mcp_servers.<name>] blocks. codex does
+        // NOT env-expand inside config.toml, so the bearer token is passed
+        // via an env var (bearer_token_env_var) and exported in spawnEnv —
+        // exactly the pattern install-standalone-mcp.sh uses for
+        // papercusp-su. We strip the `Bearer ` prefix for the env value.
+        const servers = (opts.mcpConfig as { mcpServers?: Record<string, unknown> }).mcpServers ?? {};
+        const tomlLines: string[] = [
+          '# Per-spawn codex MCP config (managed by chat-stream.ts).',
+        ];
+        let bearerIdx = 0;
+        for (const [name, raw] of Object.entries(servers)) {
+          const srv = raw as {
+            type?: string;
+            url?: string;
+            command?: string;
+            args?: string[];
+            headers?: Record<string, string>;
+            env?: Record<string, string>;
+          };
+          tomlLines.push('', `[mcp_servers.${tomlKey(name)}]`);
+          if (srv.url) {
+            // HTTP transport (our agentmcp server).
+            tomlLines.push(`url = "${tomlStr(srv.url)}"`);
+            const auth = srv.headers?.Authorization ?? srv.headers?.authorization;
+            if (auth) {
+              const tok = auth.replace(/^Bearer\s+/i, '');
+              const envName = `AGENTMCP_BEARER${bearerIdx === 0 ? '' : `_${bearerIdx}`}`;
+              bearerIdx += 1;
+              tomlLines.push(`bearer_token_env_var = "${envName}"`);
+              (spawnEnv as Record<string, string>)[envName] = tok;
+            }
+            // Any non-Authorization headers pass through verbatim.
+            const extra = Object.entries(srv.headers ?? {}).filter(
+              ([h]) => h.toLowerCase() !== 'authorization',
+            );
+            if (extra.length > 0) {
+              const hdrInline = extra
+                .map(([h, v]) => `"${tomlStr(h)}" = "${tomlStr(v)}"`)
+                .join(', ');
+              tomlLines.push(`http_headers = { ${hdrInline} }`);
+            }
+          } else if (srv.command) {
+            // stdio transport (forward-compat; agentmcp is HTTP).
+            tomlLines.push(`command = "${tomlStr(srv.command)}"`);
+            if (srv.args && srv.args.length > 0) {
+              tomlLines.push(
+                `args = [${srv.args.map((a) => `"${tomlStr(a)}"`).join(', ')}]`,
+              );
+            }
+          }
+        }
+        writeFileSync(join(codexHome, 'config.toml'), tomlLines.join('\n') + '\n', 'utf8');
+      }
+    }
+
+    // codex reads the prompt from stdin via the trailing `-` positional
+    // (added after finalArgs is built, so it's the last arg).
   } else {
     // omp / pi-coding-agent. omp's `-p` takes the message as a positional
     // arg (or `@file` to read from disk) — it does NOT read stdin like
@@ -762,6 +929,12 @@ export async function* runAgentChat(
     ompPromptFile = join(promptDir, 'prompt.md');
     writeFileSync(ompPromptFile, opts.promptText, 'utf8');
     finalArgs.push(`@${ompPromptFile}`);
+  } else if (backend === 'codex') {
+    // codex reads the prompt from STDIN via the trailing `-` positional —
+    // it must be the LAST arg (everything after it is treated as the
+    // positional prompt source). The prompt itself is written to
+    // child.stdin in the stdin block below, exactly like the claude branch.
+    finalArgs.push('-');
   }
 
   // omp's MCP discovery uses os.homedir() for the user-scope mcp.json
@@ -782,6 +955,9 @@ export async function* runAgentChat(
   } catch (e) {
     if (ompAgentDir) {
       try { rmSync(ompAgentDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+    if (codexHome) {
+      try { rmSync(codexHome, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
     yield { type: 'error', message: `failed to spawn ${agentCmd}: ${(e as Error).message}` };
     return;
@@ -914,7 +1090,92 @@ export async function* runAgentChat(
     }
   };
 
-  const handle = backend === 'omp' ? handleOmpEvent : handleClaudeEvent;
+  /**
+   * codex `exec --json` event handler. codex emits JSONL (one event per
+   * line), NOT token-streamed. Observed shapes (verified codex 0.135.0):
+   *   {type:'thread.started', thread_id}                       → ignore
+   *   {type:'turn.started'}                                    → ignore
+   *   {type:'item.started',  item:{...}}                       → ignore (we
+   *                                                              act on the
+   *                                                              matching
+   *                                                              item.completed)
+   *   {type:'item.completed', item:{type:'agent_message', text}}
+   *       → assistant text (WHOLE blob): emit one delta + accumulate finalText
+   *   {type:'item.completed', item:{type:'mcp_tool_call',
+   *       server, tool, arguments, status}}                    → tool_call
+   *   {type:'item.completed', item:{type:'command_execution',
+   *       command, exit_code, status}}                         → tool_call
+   *   {type:'turn.completed', usage:{input_tokens,
+   *       cached_input_tokens, output_tokens,
+   *       reasoning_output_tokens}}                            → terminal usage
+   *                                                              (cost derived
+   *                                                              from CODEX_PRICES;
+   *                                                              codex emits NO
+   *                                                              cost field)
+   *
+   * Tool items arrive twice — once as item.started (status 'in_progress')
+   * and once as item.completed (status 'completed'/'failed'). We emit the
+   * tool_call on the COMPLETED item only (full arguments present, no
+   * double-emit).
+   */
+  const handleCodexEvent = (ev: any) => {
+    if (!ev || typeof ev !== 'object') return;
+
+    if (ev.type === 'item.completed' && ev.item && typeof ev.item === 'object') {
+      const item = ev.item;
+      if (item.type === 'agent_message' && typeof item.text === 'string') {
+        // codex emits the assistant message as one whole blob (not token
+        // deltas). Emit it as a single delta and accumulate finalText.
+        finalText += item.text;
+        queue.push({ type: 'delta', text: item.text });
+        return;
+      }
+      if (item.type === 'mcp_tool_call') {
+        // MCP tool name lives on item.tool (NOT item.name); args on
+        // item.arguments. item.server names the configured server.
+        const rawName = typeof item.tool === 'string' ? item.tool : '';
+        if (!rawName) return;
+        const filtered = opts.toolEventFilter ? opts.toolEventFilter(rawName) : rawName;
+        if (filtered) {
+          queue.push({ type: 'tool_call', name: filtered, input: item.arguments ?? {} });
+        }
+        return;
+      }
+      if (item.type === 'command_execution') {
+        // codex's built-in shell tool. Surface it as a `shell` tool_call
+        // (subject to toolEventFilter like every other backend).
+        const filtered = opts.toolEventFilter ? opts.toolEventFilter('shell') : 'shell';
+        if (filtered) {
+          queue.push({
+            type: 'tool_call',
+            name: filtered,
+            input: { command: item.command ?? '', exit_code: item.exit_code ?? null },
+          });
+        }
+        return;
+      }
+      return;
+    }
+
+    if (ev.type === 'turn.completed' && ev.usage && typeof ev.usage === 'object') {
+      const u = ev.usage;
+      // input_tokens already includes cached_input_tokens in codex's
+      // accounting; keep the raw total for tokensIn.
+      tokensIn = (u.input_tokens ?? tokensIn);
+      tokensOut = (u.output_tokens ?? 0) + (u.reasoning_output_tokens ?? 0);
+      // codex emits NO cost field — derive from the price table.
+      const p = codexPriceFor(opts.model ? normalizeModelForClaude(opts.model) : undefined);
+      costUsd = (tokensIn * p.in + tokensOut * p.out) / 1_000_000;
+      return;
+    }
+  };
+
+  const handle =
+    backend === 'codex'
+      ? handleCodexEvent
+      : backend === 'omp'
+        ? handleOmpEvent
+        : handleClaudeEvent;
 
   child.stdout!.on('data', (chunk: Buffer) => {
     stdoutLineBuf += chunk.toString('utf8');
@@ -935,9 +1196,10 @@ export async function* runAgentChat(
     stderrBuf += chunk.toString('utf8');
   });
 
-  // claude reads the prompt on stdin; omp reads it from a `@file`
-  // positional arg (handled in finalArgs above). For omp we still close
-  // stdin so the child doesn't block waiting for input that won't come.
+  // claude AND codex read the prompt on stdin (codex via its trailing `-`
+  // positional); omp reads it from a `@file` positional arg (handled in
+  // finalArgs above). For omp we still close stdin so the child doesn't
+  // block waiting for input that won't come.
   if (backend === 'omp') {
     child.stdin!.end();
   } else {
@@ -981,11 +1243,18 @@ export async function* runAgentChat(
       try { rmSync(ompAgentDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
   }
+  if (codexHome) {
+    if (process.env.PAPERCUSP_AGENT_DEBUG) {
+      console.error(`[chat-stream] PAPERCUSP_AGENT_DEBUG — preserving CODEX_HOME: ${codexHome}`);
+    } else {
+      try { rmSync(codexHome, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  }
 
   if (exitCode !== 0) {
     yield {
       type: 'error',
-      message: `${backend === 'omp' ? 'omp' : 'claude'} exited ${exitCode ?? '?'}`,
+      message: `${backend} exited ${exitCode ?? '?'}`,
       stderr: stderrBuf.slice(-800),
     };
   } else {
