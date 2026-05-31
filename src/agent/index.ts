@@ -11,6 +11,8 @@ export {
   setAgentConfigBootstrap,
   resolveBackend,
   resolveAgentBin,
+  AGENT_BACKENDS,
+  SUBPROCESS_AGENT_BACKENDS,
   type AgentBackend,
   type ChatEvent,
   type RunAgentChatOptions,

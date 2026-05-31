@@ -38,7 +38,19 @@ import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } 
 import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
-export type AgentBackend = 'claude-code' | 'omp' | 'meridian' | 'codex';
+/**
+ * Backends the in-app brains can drive. The three subprocess backends
+ * (`claude-code`/`omp`/`codex`) are the canonical spawn set shared with
+ * `@papercusp/orchestrator` (`AGENT_BACKENDS`) and
+ * `apps/operator/lib/agent-config.ts` (`AGENT_BACKENDS`); `meridian` is an
+ * extra brains-only stateless HTTP round-trip (no subprocess, not
+ * spawnable by the orchestrator). The submodule boundary rules out a
+ * single literal import; `apps/operator/lib/__tests__/agent-backend-sync.test.ts`
+ * guards the subprocess subset against drift across the three. */
+export const AGENT_BACKENDS = ['claude-code', 'omp', 'meridian', 'codex'] as const;
+/** The subset that maps to a real subprocess (excludes `meridian`). */
+export const SUBPROCESS_AGENT_BACKENDS = ['claude-code', 'omp', 'codex'] as const;
+export type AgentBackend = (typeof AGENT_BACKENDS)[number];
 
 /**
  * Optional bootstrap hook for callers that persist agent config to
