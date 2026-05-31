@@ -95,7 +95,7 @@ export default function DocumentationFrame({ src, harnessSlug }: Props) {
       {isUp === false && (
         <div className="pc-empty pc-docs-warning">
           <strong>Docs site not reachable.</strong> The Starlight app should be running at <code>{src}</code>.
-          <span>Start it with: <code>npm run --workspace=@restart/papercup-docs dev</code></span>
+          <span>Start it with: <code>npm run --workspace=@papercusp/papercup-docs dev</code></span>
         </div>
       )}
       <section className="pc-docs-frame-shell" aria-label="Embedded Papercup documentation">

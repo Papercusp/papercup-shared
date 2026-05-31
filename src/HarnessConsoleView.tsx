@@ -5,11 +5,11 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check, AlertTriangle, Loader2, Clock, CircleSlash, Circle, Activity,
 } from 'lucide-react';
-import type { ColumnFormatter, GridConfig } from '@restart/grid-core';
+import type { ColumnFormatter, GridConfig } from '@papercusp/grid-core';
 
 // DataGridShell uses @glideapps/glide-data-grid's canvas renderer — not SSR-safe.
 const DataGridShell = dynamic(
-  () => import('@restart/grid-core').then((m) => m.DataGridShell),
+  () => import('@papercusp/grid-core').then((m) => m.DataGridShell),
   { ssr: false },
 );
 

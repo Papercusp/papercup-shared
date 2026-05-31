@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@rocicorp/zero/react';
-import { queries, type BriefingRow } from '@restart/zero-harness';
+import { queries, type BriefingRow } from '@papercusp/zero-harness';
 
 type BriefingStatus =
   | 'draft' | 'rendering' | 'rendered' | 'uploading' | 'uploaded' | 'failed';

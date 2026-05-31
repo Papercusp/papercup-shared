@@ -1,4 +1,4 @@
-// @restart/papercup-shared — single source of truth for the Papercup view tree.
+// @papercusp/papercup-shared — single source of truth for the Papercup view tree.
 // Both apps/web/app/papercup AND apps/public-site import from here, so any
 // edit to a view propagates to both renders.
 //
@@ -70,6 +70,6 @@ export { default as DocumentationFrame } from './DocumentationFrame';
 // don't have to pull the dock's entire xterm/dockview graph.
 export { openFeatureChat, OPEN_CHAT_EVENT, type OpenChatEventDetail } from './openFeatureChat';
 
-// Backend-aware agent CLI runner lives at `@restart/papercup-shared/agent`
+// Backend-aware agent CLI runner lives at `@papercusp/papercup-shared/agent`
 // — server-only entry point so client chunks don't try to bundle
 // node:child_process. Don't re-export from this main index.
