@@ -15,6 +15,9 @@ export interface OpenChatEventDetail {
   title?: string;
   role?: string;
   featureId?: string;
+  /** Conversation mode carried to the chat panel: 'discuss' reframes a
+   *  worker to talk the feature through first (vs the default 'chat'). */
+  mode?: 'chat' | 'discuss';
 }
 export const OPEN_CHAT_EVENT = 'papercusp:open-chat';
 
@@ -34,6 +37,10 @@ export async function openFeatureChat(opts: {
   role: string;
   featureId: string;
   title?: string;
+  /** 'discuss' opens the chat in discuss mode (worker talks it through
+   *  first, doesn't implement). Carried to the panel + sent per message;
+   *  the agent-chats stream handler reads it when assembling the prompt. */
+  mode?: 'chat' | 'discuss';
 }): Promise<{ chatId: string } | { error: string }> {
   try {
     const r = await fetch(`/api/harness/${encodeURIComponent(opts.slug)}/agent-chats`, {
@@ -56,6 +63,7 @@ export async function openFeatureChat(opts: {
       title: chat.title,
       role: chat.role,
       featureId: chat.feature_id ?? undefined,
+      ...(opts.mode ? { mode: opts.mode } : {}),
     };
     if (typeof window !== 'undefined') {
       const w = window as WindowWithQueue;
