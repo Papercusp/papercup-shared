@@ -145,6 +145,15 @@ export interface RunAgentChatOptions {
       strip a prefix (e.g. `mcp__oracle__navigate` → `navigate`).
       Returning null/undefined skips that tool. Default: emit all tools. */
   toolEventFilter?: (rawName: string) => string | null | undefined;
+  /**
+   * omp only: disable omp's built-in coding tools via `--no-tools
+   * --no-lsp --no-pty`. MCP tools (surfaced through mcp.json) are
+   * UNAFFECTED. Use for chat brains (operator/oracle) that orchestrate
+   * purely through MCP and never touch omp's bash/read/edit — this drops
+   * ~26k tokens of built-in tool descriptions from omp's base prompt
+   * (measured: 91k → 64k cacheWrite). Default: false.
+   */
+  disableBuiltinTools?: boolean;
   /** Permission mode flag. Default: not set (claude prompts). Most
       backends pass 'bypassPermissions' for unattended in-app tools. */
   permissionMode?: 'bypassPermissions' | 'default' | 'ask';
@@ -491,6 +500,11 @@ export async function* runAgentChat(
     // Skills + project rules are unrelated to chat surfaces — turn off
     // for predictable, fast spawns.
     args.push('--no-skills', '--no-rules');
+    // Chat brains (operator/oracle) work entirely through MCP and never
+    // use omp's built-in coding tools — dropping them removes ~26k tokens
+    // of tool descriptions from omp's base prompt. MCP tools (loaded via
+    // the per-spawn mcp.json) are unaffected by --no-tools.
+    if (opts.disableBuiltinTools) args.push('--no-tools', '--no-lsp', '--no-pty');
     // --allow-home: when mcpConfig is set, the omp branch below points
     // BOTH `HOME` and the spawn `cwd` at ompAgentDir — HOME for CLAUDE.md
     // suppression, cwd so omp's project-scope `$cwd/mcp.json` scan finds
@@ -675,7 +689,7 @@ export async function* runAgentChat(
       spawnEnv = { ...process.env, HOME: ompAgentDir, PI_CODING_AGENT_DIR: ompAgentDir };
     }
 
-    if (opts.allowedTools && opts.allowedTools.length > 0) {
+    if (!opts.disableBuiltinTools && opts.allowedTools && opts.allowedTools.length > 0) {
       // omp `--tools` allow-lists built-in tool names. MCP tools are
       // surfaced through the mcp.json path (see PI_CODING_AGENT_DIR
       // and mcp.discoveryDefaultServers above), not via --tools.
