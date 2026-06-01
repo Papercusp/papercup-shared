@@ -88,15 +88,15 @@ function maybeBootstrap(): void {
  * Resolve which backend to drive. Explicit opt > AGENT_BACKEND env >
  * inferred from the binary name. Default fallback: omp (Meridian-routed).
  *
- * Exported so non-runAgentChat callers (e.g. pm-dispatch which has
- * its own bespoke stream parser) can resolve the backend identically.
+ * Exported so non-runAgentChat callers with their own bespoke stream
+ * parser can resolve the backend identically.
  */
 /**
  * Resolve which backend to drive. Explicit opt > AGENT_BACKEND env >
  * inferred from the binary name. Default fallback: omp.
  *
- * Exported so non-runAgentChat callers (e.g. pm-dispatch which has
- * its own bespoke stream parser) can resolve the backend identically.
+ * Exported so non-runAgentChat callers with their own bespoke stream
+ * parser can resolve the backend identically.
  */
 export function resolveBackend(opts: RunAgentChatOptions): AgentBackend {
   if (opts.backend) return opts.backend;
