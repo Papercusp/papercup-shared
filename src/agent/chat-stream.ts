@@ -184,6 +184,23 @@ export interface RunAgentChatOptions {
   /** Permission mode flag. Default: not set (claude prompts). Most
       backends pass 'bypassPermissions' for unattended in-app tools. */
   permissionMode?: 'bypassPermissions' | 'default' | 'ask';
+  /**
+   * Isolate the spawn from the host's agent config (claude-code only).
+   * When set, the `claude` subprocess runs against a CLEAN per-spawn
+   * `CLAUDE_CONFIG_DIR` (a fresh tmpdir) instead of the developer's
+   * `~/.claude`, so it loads NONE of the host environment: no
+   * `~/.claude.json` MCP servers (`coord_*`/`harness_*`/`papercusp-su`/…),
+   * no SessionStart/PreToolUse hooks, no plugins/skills. The spawn sees
+   * ONLY its `--mcp-config` tools + persona system prompt. The Claude-Max
+   * OAuth credentials are symlinked into the clean dir so auth carries
+   * over (mirrors the codex `auth.json` symlink). The tmpdir is removed
+   * on child exit. REQUIRED for in-app brains (operator/oracle) that run
+   * with `bypassPermissions` on a developer box — without it the brain
+   * inherits the dev's full Claude Code agent surface and goes agentic
+   * (calls coord/harness tools, reads files) instead of emitting a clean
+   * persona turn. Not needed for stateless one-shot completions
+   * (sim/judge llm-client) which pass no mcpConfig and don't tool-call. */
+  isolateConfig?: boolean;
   /** Override the agent binary. Defaults to AGENT_CMD/CLAUDE_CMD env or
       'claude'/'omp' depending on backend. */
   agentCmd?: string;
@@ -352,6 +369,7 @@ const MERIDIAN_PRICES: Record<string, ModelPrice> = {
   'claude-haiku-4-5':  { in: 0.80, out: 4.00 },
   'claude-sonnet-4-6': { in: 3.00, out: 15.00 },
   'claude-opus-4-7':   { in: 15.00, out: 75.00 },
+  'claude-opus-4-8':   { in: 15.00, out: 75.00 },
   // OpenAI codex models routed via Meridian (approximate 2026-05 reference)
   'openai-codex/gpt-5':           { in: 1.25, out: 10.00 },
   'openai-codex/gpt-5.5':         { in: 2.50, out: 20.00 },
@@ -524,6 +542,18 @@ export async function* runAgentChat(
   // after the child exits (alongside ompAgentDir).
   let codexHome: string | undefined;
 
+  // Per-spawn clean CLAUDE_CONFIG_DIR (claude-code, opts.isolateConfig
+  // only) — isolates the brain spawn from the developer's ~/.claude.
+  // Holds only a symlink to the real ~/.claude/.credentials.json so the
+  // OAuth login carries over; nothing else, so no host MCP/hooks/plugins
+  // load. Cleaned up after the child exits (alongside codexHome).
+  let claudeConfigDir: string | undefined;
+
+  // Per-spawn dir holding the claude-code `--system-prompt-file` (the
+  // persona). Only allocated when claudeConfigDir is absent (the persona
+  // file is otherwise written INTO claudeConfigDir, sharing its cleanup).
+  let claudeSysDir: string | undefined;
+
   const args: string[] = [...baseArgs];
   let spawnEnv: NodeJS.ProcessEnv = process.env;
 
@@ -545,6 +575,27 @@ export async function* runAgentChat(
       } else {
         args.push('--session-id', opts.sessionId);
       }
+    }
+    if (opts.isolateConfig) {
+      // Run against a CLEAN CLAUDE_CONFIG_DIR so the spawn inherits NONE
+      // of the host ~/.claude (no `.claude.json` MCP servers, no
+      // settings.json/SessionStart hooks, no plugins/skills). Symlink the
+      // real OAuth credentials in so Claude-Max auth still works — exactly
+      // the codex `auth.json` symlink pattern below. (`--bare` would also
+      // isolate but forces ANTHROPIC_API_KEY auth, disabling the OAuth
+      // login this box runs on — see plan operator-brain-test-isolation.)
+      claudeConfigDir = mkdtempSync(join(tmpdir(), 'claude-chat-'));
+      try {
+        const realCreds = join(homedir(), '.claude', '.credentials.json');
+        if (existsSync(realCreds)) {
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          const { symlinkSync } = require('node:fs') as typeof import('node:fs');
+          symlinkSync(realCreds, join(claudeConfigDir, '.credentials.json'));
+        }
+      } catch (err) {
+        console.warn('[chat-stream] claude-code: failed to symlink credentials:', err);
+      }
+      spawnEnv = { ...process.env, CLAUDE_CONFIG_DIR: claudeConfigDir };
     }
   } else if (backend === 'codex') {
     // codex (`codex exec`). Like claude, codex reads the prompt from
@@ -933,6 +984,22 @@ export async function* runAgentChat(
     // positional prompt source). The prompt itself is written to
     // child.stdin in the stdin block below, exactly like the claude branch.
     finalArgs.push('-');
+  } else if (backend === 'claude-code' && opts.systemPromptText !== undefined) {
+    // claude-code's `-p` mode otherwise runs with its DEFAULT Claude Code
+    // coding-agent system prompt — so a persona caller (operator/oracle
+    // brain, sim-user, judge) that only sets `systemPromptText` would be
+    // ignored: the spawn behaves as a generic coding agent (reads the cwd
+    // CLAUDE.md, asks "what would you like to work on?") instead of BEING
+    // the persona, which breaks every persona turn. Pass the persona via
+    // `--system-prompt-file` (REPLACE — matches the meridian backend's
+    // `params.system = systemPromptText`, NOT omp's append-to-default).
+    // The persona is large (~70k chars), so a file, not an inline arg.
+    // Written into claudeConfigDir when isolated (shares its cleanup),
+    // else a dedicated tmpdir tracked via claudeSysDir.
+    const sysDir = claudeConfigDir ?? (claudeSysDir = mkdtempSync(join(tmpdir(), 'claude-sys-')));
+    const sysFile = join(sysDir, 'system.md');
+    writeFileSync(sysFile, opts.systemPromptText, 'utf8');
+    finalArgs.push('--system-prompt-file', sysFile);
   }
 
   // omp's MCP discovery uses os.homedir() for the user-scope mcp.json
@@ -940,8 +1007,10 @@ export async function* runAgentChat(
   // PI_CODING_AGENT_DIR for MCP loading (that env var is only for
   // sessions/prompts/etc). To make our merged mcp.json visible we run
   // omp with cwd = ompAgentDir, so its project-level scan
-  // ($cwd/mcp.json) lands on the file we just wrote.
-  const spawnCwd = ompAgentDir ?? opts.cwd;
+  // ($cwd/mcp.json) lands on the file we just wrote. For an isolated
+  // claude-code spawn, run in the clean config dir (no project CLAUDE.md)
+  // so the persona spawn doesn't inherit the repo's agent guide as context.
+  const spawnCwd = ompAgentDir ?? claudeConfigDir ?? opts.cwd;
 
   let child: ChildProcess;
   try {
@@ -956,6 +1025,12 @@ export async function* runAgentChat(
     }
     if (codexHome) {
       try { rmSync(codexHome, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+    if (claudeConfigDir) {
+      try { rmSync(claudeConfigDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+    if (claudeSysDir) {
+      try { rmSync(claudeSysDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
     yield { type: 'error', message: `failed to spawn ${agentCmd}: ${(e as Error).message}` };
     return;
@@ -1246,6 +1321,20 @@ export async function* runAgentChat(
       console.error(`[chat-stream] PAPERCUSP_AGENT_DEBUG — preserving CODEX_HOME: ${codexHome}`);
     } else {
       try { rmSync(codexHome, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  }
+  if (claudeConfigDir) {
+    if (process.env.PAPERCUSP_AGENT_DEBUG) {
+      console.error(`[chat-stream] PAPERCUSP_AGENT_DEBUG — preserving CLAUDE_CONFIG_DIR: ${claudeConfigDir}`);
+    } else {
+      try { rmSync(claudeConfigDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  }
+  if (claudeSysDir) {
+    if (process.env.PAPERCUSP_AGENT_DEBUG) {
+      console.error(`[chat-stream] PAPERCUSP_AGENT_DEBUG — preserving claude system-prompt dir: ${claudeSysDir}`);
+    } else {
+      try { rmSync(claudeSysDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
   }
 
