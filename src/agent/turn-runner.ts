@@ -15,7 +15,7 @@
  * error, never propagated.
  */
 import { classifyTurnError, type TurnBackend, type TurnError } from './turn-error';
-import type { RateLimitGovernor, TokenEstimate } from './governor';
+import type { RateLimitGovernor, TokenEstimate } from '../resilience/governor';
 
 /** What one backend invocation returns: success (+headers) or a raw failure to classify. */
 export type TurnOutcome<T> =

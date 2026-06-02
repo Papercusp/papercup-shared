@@ -13,7 +13,7 @@
  * them up from the provider's `*-ratelimit-*-limit` headers when available (API-key paths).
  */
 import type { TurnBackend, TurnProvider } from './turn-error';
-import { RateLimitGovernor, type GovernorLimits, type GovernorDeps } from './governor';
+import { RateLimitGovernor, type GovernorLimits, type GovernorDeps } from '../resilience/governor';
 
 export interface BackendProfile {
   provider: TurnProvider;

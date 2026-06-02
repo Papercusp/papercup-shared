@@ -4,7 +4,7 @@
  */
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { RateLimitGovernor } from './governor';
+import { RateLimitGovernor } from '../resilience/governor';
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
 
 function fakeGovernor() {

@@ -1,17 +1,19 @@
 /**
- * RateLimitGovernor (agent-turn-robustness P-002).
+ * RateLimitGovernor — generic, domain-independent rate-limit pacing (resilience lib).
  *
- * The shared choke point every agent request passes through so we PROACTIVELY stay under
- * the provider's limits instead of bursting past them. Two limit models in one:
- *   - header-driven (API-key providers / in-process meridian): RPM + ITPM + OTPM
- *     token budgets, synced from the response headers, plus honor retry-after/reset.
- *   - coarse (subscriptions: no per-minute headroom visible): concurrency cap + react to
- *     429 penalties only.
- * The concurrency cap is the lever for SUBPROCESS backends (claude/omp/codex), whose
- * internal LLM calls are opaque — capping how many we spawn at once is the real burst fix.
+ * A shared choke point callers pass requests through to PROACTIVELY stay under a provider's
+ * limits instead of bursting past them — usable by ANY rate-limited/flaky I/O (LLM calls,
+ * external APIs, sync, …), not just agents. Two limit models in one:
+ *   - header-driven (provider returns rate-limit headers): RPM + ITPM + OTPM budgets synced
+ *     from the response, plus honor retry-after/reset.
+ *   - coarse (no per-minute headroom visible, e.g. a subscription): concurrency cap + react
+ *     to 429 penalties only.
+ * The concurrency cap is also the lever for OPAQUE callers (e.g. subprocesses whose internal
+ * calls we can't see) — capping how many run at once is the real burst fix.
  *
- * The decision logic is a PURE core (testable with a fake clock); the async `acquire()`
- * is a thin loop over it using injected `now`/`sleep`.
+ * `recordHeaders` understands the common Anthropic (`anthropic-ratelimit-*`) and OpenAI
+ * (`x-ratelimit-*`) header conventions. The decision logic is a PURE core (testable with a
+ * fake clock); the async `acquire()` is a thin loop over it using injected `now`/`sleep`.
  */
 
 export interface GovernorLimits {
