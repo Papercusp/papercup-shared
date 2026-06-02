@@ -142,3 +142,36 @@ test('RateLimitGovernor.acquire — caps PEAK concurrency under many concurrent 
   assert.ok(peak >= 2, `expected real contention (peak ${peak})`); // sanity: parallelism happened
   assert.equal(active, 0); // all permits released
 });
+
+// --- onPause observability (RB-009) ---
+test('RateLimitGovernor — onPause fires only when a pause is newly set or extended', () => {
+  const evs: Array<{ pausedUntil: number; source: string }> = [];
+  let clock = 1000;
+  const g = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock, onPause: (e) => evs.push(e) });
+  g.penalize({ retryAfterMs: 30_000 }); // set → fires (pausedUntil 31_000)
+  g.penalize({ retryAfterMs: 1_000 }); // shorter → no extend → no fire
+  g.penalize({ retryAfterMs: 60_000 }); // extends → fires
+  assert.equal(evs.length, 2);
+  assert.equal(evs[0].source, 'penalty');
+  assert.equal(evs[0].pausedUntil, 31_000);
+  assert.equal(evs[1].pausedUntil, 61_000);
+});
+
+test('RateLimitGovernor — onPause fires on a header-driven exhaustion (remaining 0 + reset)', () => {
+  const evs: Array<{ source: string }> = [];
+  const base = Date.parse('2026-06-02T00:00:00Z');
+  const g = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => base, onPause: (e) => evs.push(e) });
+  g.recordResponse({ 'anthropic-ratelimit-output-tokens-remaining': '0', 'anthropic-ratelimit-output-tokens-reset': '2026-06-02T00:00:30Z' });
+  assert.equal(evs.length, 1);
+  assert.equal(evs[0].source, 'headers');
+});
+
+test('RateLimitGovernor.snapshot — returns an independent copy of the state', () => {
+  const g = new RateLimitGovernor({ maxConcurrent: 2, rpm: 10 }, { now: () => 0 });
+  g.penalize({ retryAfterMs: 5_000 });
+  const snap = g.snapshot();
+  assert.equal(snap.pausedUntil, 5_000);
+  assert.equal(snap.limits.rpm, 10);
+  snap.limits.rpm = 999; // mutating the copy must not affect the live state
+  assert.equal(g.state.limits.rpm, 10);
+});

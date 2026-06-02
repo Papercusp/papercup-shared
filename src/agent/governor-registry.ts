@@ -13,7 +13,7 @@
  * them up from the provider's `*-ratelimit-*-limit` headers when available (API-key paths).
  */
 import type { TurnBackend, TurnProvider } from './turn-error';
-import { RateLimitGovernor, type GovernorLimits, type GovernorDeps } from '../resilience/governor';
+import { RateLimitGovernor, type GovernorLimits, type GovernorDeps, type GovernorState, type GovernorPauseEvent } from '../resilience/governor';
 
 export interface BackendProfile {
   provider: TurnProvider;
@@ -57,15 +57,70 @@ export function governorKey(provider: TurnProvider, modelClass: string): string 
   return `${provider}:${modelClass}`;
 }
 
+// --- Pause observability (RB-009) -------------------------------------------------------
+// Every governor in the registry routes its onPause through ONE module-level emitter, keyed by
+// bucket, so a host (the operator) subscribes once and surfaces "rate-limited — paused until
+// <reset>" to coord/telemetry — without the domain-free governor knowing about any of that.
+export type GovernorPauseListener = (ev: GovernorPauseEvent & { key: string }) => void;
+const pauseListeners = new Set<GovernorPauseListener>();
+
+/** Subscribe to pause transitions across ALL buckets. Returns an unsubscribe fn. */
+export function onGovernorPause(cb: GovernorPauseListener): () => void {
+  pauseListeners.add(cb);
+  return () => pauseListeners.delete(cb);
+}
+
+function emitGovernorPause(ev: GovernorPauseEvent & { key: string }): void {
+  for (const cb of pauseListeners) {
+    try {
+      cb(ev);
+    } catch {
+      /* a listener must never break the limiter */
+    }
+  }
+}
+
 /** The singleton governor for a `(provider, modelClass)` bucket (created on first use). */
 export function getGovernor(provider: TurnProvider, modelClass: string, deps?: GovernorDeps): RateLimitGovernor {
   const key = governorKey(provider, modelClass);
   let g = registry.get(key);
   if (!g) {
-    g = new RateLimitGovernor({ ...DEFAULT_FLOORS[provider] }, deps);
+    g = new RateLimitGovernor(
+      { ...DEFAULT_FLOORS[provider] },
+      {
+        ...deps,
+        onPause: (ev) => {
+          emitGovernorPause({ ...ev, key });
+          deps?.onPause?.(ev);
+        },
+      },
+    );
     registry.set(key, g);
   }
   return g;
+}
+
+export interface GovernorSnapshot {
+  key: string;
+  provider: TurnProvider;
+  modelClass: string;
+  state: GovernorState;
+}
+
+/** Point-in-time snapshot of every live bucket — the headroom + pause status the read tool
+    (`dev:rate_governor_status`) surfaces (RB-009). */
+export function snapshotGovernors(): GovernorSnapshot[] {
+  const out: GovernorSnapshot[] = [];
+  for (const [key, g] of registry) {
+    const idx = key.indexOf(':');
+    out.push({
+      key,
+      provider: key.slice(0, idx) as TurnProvider,
+      modelClass: key.slice(idx + 1),
+      state: g.snapshot(),
+    });
+  }
+  return out;
 }
 
 /** Resolve the right shared governor for a backend + model: self-pacing backends (omp)

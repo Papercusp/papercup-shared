@@ -17,6 +17,7 @@ export {
   type GovernorLimits,
   type GovernorState,
   type GovernorDeps,
+  type GovernorPauseEvent,
   type AcquireOpts,
   type AcquireDecision,
   type TokenEstimate,

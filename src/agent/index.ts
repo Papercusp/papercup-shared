@@ -35,8 +35,14 @@ export {
   getGovernor,
   modelClassOf,
   BACKEND_PROFILES,
+  onGovernorPause,
+  snapshotGovernors,
+  resetGovernorRegistry,
   type BackendProfile,
+  type GovernorSnapshot,
+  type GovernorPauseListener,
 } from './governor-registry';
+export type { GovernorPauseEvent, GovernorState } from '../resilience/governor';
 export {
   runAgentTurn,
   type TurnOutcome,

@@ -153,9 +153,19 @@ export function recordHeaders(s: GovernorState, headers: Record<string, string |
   }
 }
 
+/** Fired when a pause is newly SET or EXTENDED (the 429/backpressure transition) — the hook a
+    host uses to surface "rate-limited — paused until <reset>" to telemetry/UI (RB-009). Stays
+    domain-free: the governor knows nothing about coord/PG/toasts; the host subscribes. */
+export interface GovernorPauseEvent {
+  pausedUntil: number;
+  source: 'penalty' | 'headers';
+}
+
 export interface GovernorDeps {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /** Called (best-effort, synchronously) only when `pausedUntil` increases. Must not throw. */
+  onPause?: (ev: GovernorPauseEvent) => void;
 }
 
 export interface AcquireOpts {
@@ -171,11 +181,31 @@ export class RateLimitGovernor {
   readonly state: GovernorState;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly onPause?: (ev: GovernorPauseEvent) => void;
 
   constructor(limits: GovernorLimits, deps: GovernorDeps = {}) {
     this.state = initGovernorState(limits);
     this.now = deps.now ?? (() => Date.now());
     this.sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.onPause = deps.onPause;
+  }
+
+  /** A point-in-time copy of the state (for observability — RB-009). */
+  snapshot(): GovernorState {
+    return { ...this.state, limits: { ...this.state.limits } };
+  }
+
+  /** Fire onPause iff the pause moved later (a real new/extended backpressure transition). */
+  private notifyPauseIfExtended(before: number, source: GovernorPauseEvent['source']): void {
+    if (!this.onPause) return;
+    const after = this.state.pausedUntil;
+    if (after > before && after > this.now()) {
+      try {
+        this.onPause({ pausedUntil: after, source });
+      } catch {
+        /* observability must never break the limiter */
+      }
+    }
   }
 
   /**
@@ -209,10 +239,14 @@ export class RateLimitGovernor {
   }
 
   recordResponse(headers: Record<string, string | undefined>): void {
+    const before = this.state.pausedUntil;
     recordHeaders(this.state, headers, this.now());
+    this.notifyPauseIfExtended(before, 'headers');
   }
 
   penalize(opts: { retryAfterMs?: number; resetAt?: number }): void {
+    const before = this.state.pausedUntil;
     recordPenalty(this.state, this.now(), opts);
+    this.notifyPauseIfExtended(before, 'penalty');
   }
 }

@@ -10,6 +10,8 @@ import {
   getGovernor,
   governorForBackend,
   resetGovernorRegistry,
+  onGovernorPause,
+  snapshotGovernors,
 } from './governor-registry';
 
 beforeEach(() => resetGovernorRegistry());
@@ -51,4 +53,40 @@ test('governorForBackend — claude (meridian + CLI) share the Anthropic bucket 
   const mer = governorForBackend('meridian', 'claude-opus-4-8');
   const cli = governorForBackend('claude-code', 'claude-opus-4-8');
   assert.equal(mer, cli); // same provider+class → one shared budget (don't co-burst the account)
+});
+
+// RB-009 observability ------------------------------------------------------------------
+test('onGovernorPause — fires (with the bucket key) when a governor is penalized', () => {
+  const events: Array<{ key: string; pausedUntil: number; source: string }> = [];
+  const off = onGovernorPause((ev) => events.push(ev));
+  const g = governorForBackend('claude-code', 'claude-opus-4-8');
+  g.penalize({ retryAfterMs: 30_000 });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].key, 'anthropic:opus');
+  assert.equal(events[0].source, 'penalty');
+  assert.ok(events[0].pausedUntil > 0);
+  off();
+  g.penalize({ retryAfterMs: 999_000 }); // after unsubscribe → no more events
+  assert.equal(events.length, 1);
+});
+
+test('onGovernorPause — does NOT fire when a penalty does not extend the pause', () => {
+  const events: unknown[] = [];
+  onGovernorPause((ev) => events.push(ev));
+  const g = getGovernor('anthropic', 'sonnet');
+  g.penalize({ resetAt: Date.now() + 60_000 });
+  g.penalize({ retryAfterMs: 1 }); // shorter → must NOT re-fire (no new backpressure)
+  assert.equal(events.length, 1);
+});
+
+test('snapshotGovernors — reports each live bucket with its pause + concurrency state', () => {
+  const g = governorForBackend('claude-code', 'claude-opus-4-8');
+  g.penalize({ retryAfterMs: 30_000 });
+  const snap = snapshotGovernors();
+  const opus = snap.find((s) => s.key === 'anthropic:opus');
+  assert.ok(opus);
+  assert.equal(opus!.provider, 'anthropic');
+  assert.equal(opus!.modelClass, 'opus');
+  assert.ok(opus!.state.pausedUntil > 0);
+  assert.equal(typeof opus!.state.inFlight, 'number');
 });
