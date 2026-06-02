@@ -118,3 +118,27 @@ test('RateLimitGovernor.acquire — returns null when the abort signal is alread
   const r = await g.acquire({}, { signal: ac.signal });
   assert.equal(r, null);
 });
+
+// --- RB-010: the "does pacing work" SLO — peak in-flight never exceeds maxConcurrent
+//     under many concurrent callers contending for permits (the burst lever). ---
+test('RateLimitGovernor.acquire — caps PEAK concurrency under many concurrent callers', async () => {
+  const g = new RateLimitGovernor({ maxConcurrent: 3 }); // real now/sleep
+  let active = 0;
+  let peak = 0;
+  let completed = 0;
+  const work = async () => {
+    const release = await g.acquire({});
+    assert.ok(release);
+    active++;
+    peak = Math.max(peak, active);
+    await new Promise((r) => setTimeout(r, 5)); // hold the permit briefly
+    active--;
+    completed++;
+    release!();
+  };
+  await Promise.all(Array.from({ length: 9 }, () => work()));
+  assert.equal(completed, 9); // every caller got through (none starved)
+  assert.ok(peak <= 3, `peak in-flight ${peak} exceeded cap 3`);
+  assert.ok(peak >= 2, `expected real contention (peak ${peak})`); // sanity: parallelism happened
+  assert.equal(active, 0); // all permits released
+});
