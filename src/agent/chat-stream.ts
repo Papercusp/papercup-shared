@@ -40,8 +40,8 @@ import { basename, join } from 'node:path';
 // Agent-turn robustness (opt-in via PAPERCUSP_AGENT_GOVERNOR=1). These modules are pure +
 // import nothing from this file, so there's no cycle and ~no load cost when the flag is off.
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
-import { governorForBackend } from './governor-registry';
-import { classifyTurnError, type TurnBackend } from './turn-error';
+import { governorForBackend, BACKEND_PROFILES } from './governor-registry';
+import { classifyTurnError, type TurnBackend, type TurnError } from './turn-error';
 
 /** Default cap on a CLI spawn's wait for a shared-governor permit (RB-012). Long enough to
     wait out a normal 429's retry-after, short enough that a multi-hour subscription lockout
@@ -324,7 +324,19 @@ export type ChatEvent =
       tokensOut: number;
       finalText: string;
     }
-  | { type: 'error'; message: string; stderr?: string };
+  | {
+      type: 'error';
+      message: string;
+      stderr?: string;
+      /**
+       * RB-006: the classified turn error, when known. Lets a consumer (e.g. the gym's
+       * `llmCall` → `runAbEvaluation`) distinguish a `rate_limited` failure (pause + resume)
+       * from a permanent one (skip) instead of re-parsing the message string. Populated on
+       * the governed meridian + CLI paths; absent on the legacy un-governed path (consumers
+       * fall back to message classification / treat as a generic error).
+       */
+      turn?: TurnError;
+    };
 
 // ===========================================================================
 // Stateless `meridian` backend — a single Anthropic-format HTTP round-trip,
@@ -681,7 +693,9 @@ async function* governedMeridian(
     if (result.value.finalText) yield { type: 'delta', text: result.value.finalText };
     yield { type: 'result', costUsd: result.value.costUsd, tokensIn: result.value.tokensIn, tokensOut: result.value.tokensOut, finalText: result.value.finalText };
   } else {
-    yield { type: 'error', message: `meridian error: ${result.error.message}` };
+    // result.error IS a TurnError — pass it through so the caller can pause/resume on a
+    // rate_limited class instead of re-parsing the message (RB-006).
+    yield { type: 'error', message: `meridian error: ${result.error.message}`, turn: result.error };
   }
 }
 
@@ -719,13 +733,26 @@ export async function* runAgentChat(
     if (!release) {
       // Bailed: the shared bucket is paused past our maxWait (a far-off reset) or aborted.
       // Surface as an error so the caller decides — interactive: escalate (D-002); the gym:
-      // pause/resume (RB-006) — instead of freezing here.
+      // pause/resume (RB-006) — instead of freezing here. Attach a structured `rate_limited`
+      // turn (carrying the reset) so the caller doesn't re-parse the message.
       const pausedUntil = gov.state.pausedUntil;
+      const aborted = opts.signal?.aborted;
       yield {
         type: 'error',
-        message: opts.signal?.aborted
+        message: aborted
           ? `${backend}: aborted`
           : `${backend}: rate-limited${pausedUntil ? ` — paused until ${new Date(pausedUntil).toISOString()}` : ''}`,
+        ...(aborted
+          ? {}
+          : {
+              turn: {
+                class: 'rate_limited' as const,
+                message: 'shared rate-limit pause exceeds maxWait',
+                provider: BACKEND_PROFILES[backend as TurnBackend].provider,
+                retryable: false,
+                ...(pausedUntil ? { resetAt: pausedUntil } : {}),
+              },
+            }),
       };
       return;
     }
@@ -1559,17 +1586,19 @@ export async function* runAgentChat(
 
   // RB-012/RB-005 — classify the subprocess TURN outcome and, on rate-limit/overload,
   // penalize the SHARED governor so concurrent callers back off (no re-spawn here). Only on
-  // the governed path; cheap + side-effect-free otherwise.
+  // the governed path; cheap + side-effect-free otherwise. The classified turn is also
+  // attached to the terminal error event so a consumer can pause/resume (RB-006).
+  let cliTurn: TurnError | undefined;
   if (governed) {
-    const te = classifyTurnError(
+    cliTurn = classifyTurnError(
       backend as TurnBackend,
       { exitCode, signal: exitSignal, stderr: stderrBuf, stdout: finalText },
       Date.now(),
     );
-    if (te.class === 'rate_limited' || te.class === 'overloaded') {
+    if (cliTurn.class === 'rate_limited' || cliTurn.class === 'overloaded') {
       governorForBackend(backend as TurnBackend, opts.model ?? '').penalize({
-        retryAfterMs: te.retryAfterMs,
-        resetAt: te.resetAt,
+        retryAfterMs: cliTurn.retryAfterMs,
+        resetAt: cliTurn.resetAt,
       });
     }
   }
@@ -1579,6 +1608,7 @@ export async function* runAgentChat(
       type: 'error',
       message: `${backend} exited ${exitCode ?? '?'}`,
       stderr: stderrBuf.slice(-800),
+      ...(cliTurn ? { turn: cliTurn } : {}),
     };
   } else {
     yield {
