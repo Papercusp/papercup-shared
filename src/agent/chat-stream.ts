@@ -472,10 +472,16 @@ async function* meridianAgentChat(
       return;
     }
     try {
-      const resp = await client.messages.create(
-        params,
-        opts.signal ? { signal: opts.signal } : {},
-      );
+      // Use the streaming transport (.stream().finalMessage()) rather than the
+      // non-streaming .create(): the Anthropic SDK REJECTS a non-streaming request
+      // whose max_tokens could exceed the 10-minute ceiling (e.g. the gym's frozen
+      // Opus judge runs 32k-token extended thinking → ~36k max_tokens, which trips
+      // "Streaming is required for operations that may take longer than 10 minutes").
+      // .stream() satisfies that guard; .finalMessage() resolves to the same full
+      // Message (content + usage), so the downstream extraction below is unchanged.
+      const resp = await client.messages
+        .stream(params, opts.signal ? { signal: opts.signal } : {})
+        .finalMessage();
       let finalText = '';
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       for (const block of (resp.content ?? []) as Array<any>) {
