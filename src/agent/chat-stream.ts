@@ -53,6 +53,23 @@ export const SUBPROCESS_AGENT_BACKENDS = ['claude-code', 'omp', 'codex'] as cons
 export type AgentBackend = (typeof AGENT_BACKENDS)[number];
 
 /**
+ * Every Claude Code built-in tool, for `disallowBuiltins` (claude-code).
+ * Captured from a `claude -p` init's `tools` (non-`mcp__` entries), v2.1.
+ * A persona brain gets ONLY its `--mcp-config` tools when these are denied.
+ */
+export const CLAUDE_BUILTIN_TOOLS = [
+  'Task', 'AskUserQuestion', 'Bash', 'CronCreate', 'CronDelete', 'CronList',
+  'Edit', 'EnterPlanMode', 'EnterWorktree', 'ExitPlanMode', 'ExitWorktree',
+  'Glob', 'Grep', 'Monitor', 'NotebookEdit', 'PushNotification', 'Read',
+  'RemoteTrigger', 'ScheduleWakeup', 'Skill', 'TaskCreate', 'TaskGet',
+  'TaskList', 'TaskOutput', 'TaskStop', 'TaskUpdate', 'ToolSearch',
+  'WebFetch', 'WebSearch', 'Workflow', 'Write',
+  // Surface only when --mcp-config is set (MCP resource access); the
+  // operator uses neither — leaves ONLY the agentmcp tools.
+  'ListMcpResourcesTool', 'ReadMcpResourceTool',
+] as const;
+
+/**
  * Optional bootstrap hook for callers that persist agent config to
  * disk (e.g. the operator's /settings/agent → ~/.papercusp/agent/
  * config.json). Called once per process before the first spawn so
@@ -201,6 +218,18 @@ export interface RunAgentChatOptions {
    * persona turn. Not needed for stateless one-shot completions
    * (sim/judge llm-client) which pass no mcpConfig and don't tool-call. */
   isolateConfig?: boolean;
+  /**
+   * Block ALL Claude Code built-in tools (claude-code only) via
+   * `--disallowed-tools`, leaving ONLY the `--mcp-config` tools. A
+   * persona brain (operator) reaches its world exclusively through its
+   * agentmcp tools and emits `<say>`/`<spawn>` as control-tag TEXT, so it
+   * needs none of `Bash`/`Read`/`Edit`/`Write`/`Glob`/`Grep`/`Task`/
+   * `ToolSearch`/`WebFetch`/… — and when they're present it MISUSES them
+   * (a no-op `Bash` "comment", `ToolSearch`-ing for tool names that are
+   * already loaded, occasionally looping until the 600 s wall-cap). With
+   * `bypassPermissions`, `--allowed-tools` does NOT restrict the surface,
+   * so this explicit deny-list is the lever. */
+  disallowBuiltins?: boolean;
   /** Override the agent binary. Defaults to AGENT_CMD/CLAUDE_CMD env or
       'claude'/'omp' depending on backend. */
   agentCmd?: string;
@@ -571,6 +600,12 @@ export async function* runAgentChat(
     }
     if (opts.allowedTools && opts.allowedTools.length > 0) {
       args.push('--allowed-tools', opts.allowedTools.join(' '));
+    }
+    if (opts.disallowBuiltins) {
+      // Deny every Claude Code built-in so a persona brain has ONLY its
+      // --mcp-config tools (under bypassPermissions, --allowed-tools does
+      // not restrict the surface — this deny-list does).
+      args.push('--disallowed-tools', CLAUDE_BUILTIN_TOOLS.join(' '));
     }
     if (opts.permissionMode) {
       args.push('--permission-mode', opts.permissionMode);
