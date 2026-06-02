@@ -41,6 +41,12 @@ import { basename, join } from 'node:path';
 // import nothing from this file, so there's no cycle and ~no load cost when the flag is off.
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
 import { governorForBackend } from './governor-registry';
+import { classifyTurnError, type TurnBackend } from './turn-error';
+
+/** Default cap on a CLI spawn's wait for a shared-governor permit (RB-012). Long enough to
+    wait out a normal 429's retry-after, short enough that a multi-hour subscription lockout
+    surfaces instead of freezing the caller for hours. */
+export const DEFAULT_CLI_GOVERNOR_MAX_WAIT_MS = 5 * 60_000;
 
 /**
  * Backends the in-app brains can drive. The three subprocess backends
@@ -297,6 +303,15 @@ export interface RunAgentChatOptions {
    * (e.g. OpenAI `reasoning_effort`). `meridian` only.
    */
   thinkingBudgetTokens?: number;
+  /**
+   * Cap (ms) on how long a CLI spawn will wait for a shared-governor permit before it
+   * surfaces a `rate_limited` error instead of blocking (RB-012). Only consulted when the
+   * `PAPERCUSP_AGENT_GOVERNOR` flag is on. Interactive callers (operator/oracle brains) pass
+   * a small value (or rely on `signal`) so they escalate rather than inherit a far-off shared
+   * pause (D-002); unattended callers (the gym) leave the default so a normal 429's
+   * retry-after is waited out. Default `DEFAULT_CLI_GOVERNOR_MAX_WAIT_MS`.
+   */
+  governorMaxWaitMs?: number;
 }
 
 export type ChatEvent =
@@ -448,6 +463,33 @@ function isMeridianTransient(err: unknown): boolean {
   return /(\b529\b|overloaded|rate.?limit|service unavailable|\b50[02-4]\b|ETIMEDOUT|ECONNRESET|ECONNREFUSED|socket hang up)/i.test(msg);
 }
 
+/** Prompt-caching is ON unless explicitly disabled (RB-008). Off-switch:
+    `PAPERCUSP_PROMPT_CACHE=0` (e.g. if a transport rejects `cache_control`). */
+export function promptCacheEnabled(): boolean {
+  return process.env.PAPERCUSP_PROMPT_CACHE !== '0';
+}
+
+/** A cached system text block. */
+type CachedSystemBlock = { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } };
+
+/**
+ * Build the meridian `system` request field (RB-008: prompt caching).
+ *
+ * When caching is enabled we send the system prompt as a single text block marked
+ * `cache_control: { type: 'ephemeral' }` instead of a bare string. The system prompt is the
+ * large STABLE prefix on our in-process meridian calls (the gym judge's frozen 32k-thinking
+ * rubric, the sim-user persona, the generators' instructions) while the user turn varies —
+ * so caching it makes the prefix a cache-READ on repeat calls, and cache-read input tokens
+ * don't count toward ITPM, raising effective throughput (the cheapest rate-limit pressure
+ * relief per the plan review). Anthropic ignores `cache_control` below the minimum cacheable
+ * size, so it's a safe no-op on short prompts; the off-switch covers a transport that rejects
+ * the field outright.
+ */
+export function buildSystemParam(systemPromptText: string, cache: boolean = promptCacheEnabled()): string | CachedSystemBlock[] {
+  if (!cache) return systemPromptText;
+  return [{ type: 'text', text: systemPromptText, cache_control: { type: 'ephemeral' } }];
+}
+
 async function* meridianAgentChat(
   opts: RunAgentChatOptions,
 ): AsyncGenerator<ChatEvent, void, void> {
@@ -494,7 +536,7 @@ async function* meridianAgentChat(
     max_tokens: opts.maxTokens ?? 4096,
     messages,
   };
-  if (opts.systemPromptText) params.system = opts.systemPromptText;
+  if (opts.systemPromptText) params.system = buildSystemParam(opts.systemPromptText);
   if (sendsTemperature && opts.temperature !== undefined) params.temperature = opts.temperature;
   if (opts.thinkingBudgetTokens && opts.thinkingBudgetTokens > 0) {
     params.thinking = { type: 'enabled', budget_tokens: opts.thinkingBudgetTokens };
@@ -657,6 +699,43 @@ export async function* runAgentChat(
     yield* meridianAgentChat(opts);
     return;
   }
+
+  // RB-012/RB-005 — govern the CLI spawn at the subprocess-turn granularity (flag-gated;
+  // default OFF = byte-identical legacy path). Acquire a SHARED concurrency permit BEFORE
+  // spawning (the real burst lever), and on a rate-limited / overloaded outcome penalize the
+  // shared governor with the server's retry-after so concurrent callers back off. We do NOT
+  // re-retry the spawn: the CLI self-retries internally and the orchestrator/director owns
+  // turn retries (re-spawning here would be our-retry × CLI-retry amplification — exactly
+  // what makes 429s worse). omp self-paces (fallback chaining) → concurrency-cap only. The
+  // permit is held for the whole subprocess and released in the `finally` below.
+  const governed = process.env.PAPERCUSP_AGENT_GOVERNOR === '1';
+  let releaseGovernor: (() => void) | null = null;
+  if (governed) {
+    const gov = governorForBackend(backend as TurnBackend, opts.model ?? '');
+    const release = await gov.acquire(
+      {},
+      { signal: opts.signal, maxWaitMs: opts.governorMaxWaitMs ?? DEFAULT_CLI_GOVERNOR_MAX_WAIT_MS },
+    );
+    if (!release) {
+      // Bailed: the shared bucket is paused past our maxWait (a far-off reset) or aborted.
+      // Surface as an error so the caller decides — interactive: escalate (D-002); the gym:
+      // pause/resume (RB-006) — instead of freezing here.
+      const pausedUntil = gov.state.pausedUntil;
+      yield {
+        type: 'error',
+        message: opts.signal?.aborted
+          ? `${backend}: aborted`
+          : `${backend}: rate-limited${pausedUntil ? ` — paused until ${new Date(pausedUntil).toISOString()}` : ''}`,
+      };
+      return;
+    }
+    releaseGovernor = release;
+  }
+
+  // try/finally exists only so the governor permit is released on EVERY exit path (normal,
+  // spawn-failure return, abort, or a consumer abandoning the generator). Body indentation is
+  // left unchanged to keep the diff readable.
+  try {
   const agentCmd = resolveAgentBin(opts, backend);
   const argv = agentCmd.split(/\s+/).filter(Boolean);
   const command = argv[0];
@@ -1420,8 +1499,9 @@ export async function* runAgentChat(
   }
 
   let exitCode: number | null = null;
+  let exitSignal: NodeJS.Signals | null = null;
   let exited = false;
-  child.on('exit', (code) => { exitCode = code; exited = true; tick(); });
+  child.on('exit', (code, signal) => { exitCode = code; exitSignal = signal; exited = true; tick(); });
   child.on('error', () => { exited = true; tick(); });
 
   // Drain loop.
@@ -1477,6 +1557,23 @@ export async function* runAgentChat(
     }
   }
 
+  // RB-012/RB-005 — classify the subprocess TURN outcome and, on rate-limit/overload,
+  // penalize the SHARED governor so concurrent callers back off (no re-spawn here). Only on
+  // the governed path; cheap + side-effect-free otherwise.
+  if (governed) {
+    const te = classifyTurnError(
+      backend as TurnBackend,
+      { exitCode, signal: exitSignal, stderr: stderrBuf, stdout: finalText },
+      Date.now(),
+    );
+    if (te.class === 'rate_limited' || te.class === 'overloaded') {
+      governorForBackend(backend as TurnBackend, opts.model ?? '').penalize({
+        retryAfterMs: te.retryAfterMs,
+        resetAt: te.resetAt,
+      });
+    }
+  }
+
   if (exitCode !== 0) {
     yield {
       type: 'error',
@@ -1491,5 +1588,10 @@ export async function* runAgentChat(
       tokensOut,
       finalText,
     };
+  }
+  } finally {
+    // Release the shared concurrency permit (no-op when ungoverned). Runs on normal exit, the
+    // spawn-failure early return, an abort, and a consumer that abandons the generator early.
+    releaseGovernor?.();
   }
 }

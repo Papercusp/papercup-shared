@@ -2,9 +2,9 @@
  * Tests for chat-stream pure helpers.
  * Run with: npx vitest run libs/papercup-shared/src/agent/chat-stream.test.ts
  */
-import { test } from 'vitest';
+import { test, afterEach } from 'vitest';
 import assert from 'node:assert/strict';
-import { normalizeModelForClaude, headersToRecord } from './chat-stream';
+import { normalizeModelForClaude, headersToRecord, buildSystemParam, promptCacheEnabled } from './chat-stream';
 
 // headersToRecord (P-004): SDK error `.headers` → a lowercased record so the TurnError
 // classifier can read retry-after / anthropic-ratelimit-* off it.
@@ -35,4 +35,32 @@ test('normalizeModelForClaude — leaves a bare id or alias untouched', () => {
 
 test('normalizeModelForClaude — empty in → empty out', () => {
   assert.equal(normalizeModelForClaude(''), '');
+});
+
+// buildSystemParam (RB-008): the stable system prefix is sent as a cache_control:ephemeral
+// block so repeat calls (gym judge / sim-user) cache-read it (cache-read input tokens don't
+// count toward ITPM). Off-switch returns the bare string (transport that rejects the field).
+afterEach(() => {
+  delete process.env.PAPERCUSP_PROMPT_CACHE;
+});
+test('buildSystemParam — caching on (default) → single ephemeral text block', () => {
+  const r = buildSystemParam('frozen rubric', true);
+  assert.deepEqual(r, [{ type: 'text', text: 'frozen rubric', cache_control: { type: 'ephemeral' } }]);
+});
+test('buildSystemParam — caching off → bare string (no cache_control)', () => {
+  assert.equal(buildSystemParam('frozen rubric', false), 'frozen rubric');
+});
+test('promptCacheEnabled — defaults ON, OFF only when PAPERCUSP_PROMPT_CACHE=0', () => {
+  delete process.env.PAPERCUSP_PROMPT_CACHE;
+  assert.equal(promptCacheEnabled(), true);
+  process.env.PAPERCUSP_PROMPT_CACHE = '0';
+  assert.equal(promptCacheEnabled(), false);
+  process.env.PAPERCUSP_PROMPT_CACHE = '1';
+  assert.equal(promptCacheEnabled(), true);
+});
+test('buildSystemParam — honors the env flag when no explicit arg', () => {
+  process.env.PAPERCUSP_PROMPT_CACHE = '0';
+  assert.equal(buildSystemParam('x'), 'x');
+  process.env.PAPERCUSP_PROMPT_CACHE = '1';
+  assert.deepEqual(buildSystemParam('x'), [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral' } }]);
 });
