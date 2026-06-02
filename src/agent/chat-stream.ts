@@ -53,20 +53,26 @@ export const SUBPROCESS_AGENT_BACKENDS = ['claude-code', 'omp', 'codex'] as cons
 export type AgentBackend = (typeof AGENT_BACKENDS)[number];
 
 /**
- * Every Claude Code built-in tool, for `disallowBuiltins` (claude-code).
- * Captured from a `claude -p` init's `tools` (non-`mcp__` entries), v2.1.
- * A persona brain gets ONLY its `--mcp-config` tools when these are denied.
+ * Claude Code built-ins denied by `disallowBuiltins` (claude-code) — the
+ * filesystem/web/subagent/scheduling tools a persona brain never needs and
+ * misuses (no-op `Bash` "comments", stray `Task`/`Write`). Captured from a
+ * `claude -p` init's non-`mcp__` `tools` (v2.1).
+ *
+ * DELIBERATELY KEPT (NOT denied): `ToolSearch` + `ListMcpResourcesTool`/
+ * `ReadMcpResourceTool`. A large `--mcp-config` surface (the 226 agentmcp
+ * tools) is presented DEFERRED — `ToolSearch` is how the model ACTIVATES a
+ * deferred tool before calling it. Denying it left the brain unable to call
+ * ANY agentmcp tool: it narrated "checking…" every turn with zero tool calls
+ * (verified regression, 2026-06-02). So we trim the dangerous built-ins but
+ * preserve the tool-loading path.
  */
 export const CLAUDE_BUILTIN_TOOLS = [
   'Task', 'AskUserQuestion', 'Bash', 'CronCreate', 'CronDelete', 'CronList',
   'Edit', 'EnterPlanMode', 'EnterWorktree', 'ExitPlanMode', 'ExitWorktree',
   'Glob', 'Grep', 'Monitor', 'NotebookEdit', 'PushNotification', 'Read',
   'RemoteTrigger', 'ScheduleWakeup', 'Skill', 'TaskCreate', 'TaskGet',
-  'TaskList', 'TaskOutput', 'TaskStop', 'TaskUpdate', 'ToolSearch',
+  'TaskList', 'TaskOutput', 'TaskStop', 'TaskUpdate',
   'WebFetch', 'WebSearch', 'Workflow', 'Write',
-  // Surface only when --mcp-config is set (MCP resource access); the
-  // operator uses neither — leaves ONLY the agentmcp tools.
-  'ListMcpResourcesTool', 'ReadMcpResourceTool',
 ] as const;
 
 /**
