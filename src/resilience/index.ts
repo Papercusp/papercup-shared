@@ -21,3 +21,11 @@ export {
   type AcquireDecision,
   type TokenEstimate,
 } from './governor';
+export {
+  runWithRetry,
+  type RetryVerdict,
+  type AttemptOutcome,
+  type RetryResult,
+  type RetryOptions,
+  type RetryDeps,
+} from './retry';
