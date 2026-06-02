@@ -17,3 +17,32 @@ export {
   type ChatEvent,
   type RunAgentChatOptions,
 } from './chat-stream';
+
+// Agent-turn robustness (RB-*): the turn-error taxonomy + classifier, the backend governor
+// registry, and the agent runAgentTurn wrapper — so server modules (e.g. the DBOS
+// orchestrator) can pace/classify agent spawns through the shared governor.
+export {
+  classifyTurnError,
+  classifySubprocessResult,
+  classifyHttpError,
+  type TurnError,
+  type TurnBackend,
+  type TurnProvider,
+  type TurnErrorClass,
+} from './turn-error';
+export {
+  governorForBackend,
+  getGovernor,
+  modelClassOf,
+  BACKEND_PROFILES,
+  type BackendProfile,
+} from './governor-registry';
+export {
+  runAgentTurn,
+  type TurnOutcome,
+  type TurnRunResult,
+  type RunAgentTurnSpec,
+  type RunAgentTurnDeps,
+} from './turn-runner';
+// Generic resilience primitives (domain-independent) — re-exported for convenience.
+export { RateLimitGovernor, runWithRetry } from '../resilience';
