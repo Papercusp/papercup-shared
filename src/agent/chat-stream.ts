@@ -600,7 +600,11 @@ async function* governedMeridian(
   const governor = governorForBackend('meridian', model);
   type V = { finalText: string; tokensIn: number; tokensOut: number; costUsd: number };
   const result = await runAgentTurn<V>(
-    { backend: 'meridian', maxAttempts: 8, estTokens: { outTok: params.max_tokens } },
+    // No estTokens: max_tokens does NOT count toward OTPM (only tokens actually produced),
+    // so estimating OTPM as max_tokens would massively over-charge the budget. Until we
+    // reconcile from real usage headers, pace on concurrency + RPM + 429-penalty only
+    // (token-budget dimensions stay inert on the subscription path anyway). [reviewer #4]
+    { backend: 'meridian', maxAttempts: 8 },
     {
       governor,
       runOnce: async (): Promise<TurnOutcome<V>> => {
