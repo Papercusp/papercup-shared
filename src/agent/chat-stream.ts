@@ -37,6 +37,10 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
+// Agent-turn robustness (opt-in via PAPERCUSP_AGENT_GOVERNOR=1). These modules are pure +
+// import nothing from this file, so there's no cycle and ~no load cost when the flag is off.
+import { runAgentTurn, type TurnOutcome } from './turn-runner';
+import { governorForBackend } from './governor-registry';
 
 /**
  * Backends the in-app brains can drive. The three subprocess backends
@@ -496,6 +500,16 @@ async function* meridianAgentChat(
     params.thinking = { type: 'enabled', budget_tokens: opts.thinkingBudgetTokens };
   }
 
+  // Robustness opt-in (agent-turn-robustness P-004): route through the shared
+  // RateLimitGovernor + runAgentTurn so concurrent callers pace under the provider's
+  // limit and a 429 honors the server's retry-after instead of a blind backoff. OFF by
+  // default → the proven retry loop below runs unchanged (zero behavior change for the
+  // live fleet until validated).
+  if (process.env.PAPERCUSP_AGENT_GOVERNOR === '1') {
+    yield* governedMeridian(client, params, opts);
+    return;
+  }
+
   // Patient retry on transient errors (sustained 529 overload). 8
   // attempts, backoff 2/4/8/16/32/60/60/60s + SDK's own retries.
   const RETRY_MAX = 8;
@@ -549,6 +563,80 @@ async function* meridianAgentChat(
     type: 'error',
     message: `meridian: exhausted ${RETRY_MAX} retries: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`,
   };
+}
+
+/** Convert an SDK error's `.headers` (a Headers object OR a plain object) to a record so
+    the TurnError classifier can read `retry-after` / `anthropic-ratelimit-*`. */
+export function headersToRecord(h: unknown): Record<string, string | undefined> | undefined {
+  if (!h || typeof h !== 'object') return undefined;
+  const anyH = h as { forEach?: (cb: (v: string, k: string) => void) => void };
+  if (typeof anyH.forEach === 'function') {
+    const o: Record<string, string> = {};
+    anyH.forEach((v, k) => {
+      o[k.toLowerCase()] = v;
+    });
+    return o;
+  }
+  const o: Record<string, string | undefined> = {};
+  for (const [k, v] of Object.entries(h as Record<string, unknown>)) o[k.toLowerCase()] = v == null ? undefined : String(v);
+  return o;
+}
+
+/**
+ * Governed meridian request (agent-turn-robustness P-004): the SAME single request as the
+ * loop above, but run through `runAgentTurn` + the shared `RateLimitGovernor` —
+ * concurrency-capped, paced under the provider RPM, and on a 429 it penalizes the governor
+ * with the server's `retry-after` (so the NEXT acquire waits exactly that long, across all
+ * callers) instead of a blind exponential backoff. Yields the same delta/result/error.
+ */
+async function* governedMeridian(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  client: any,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  params: Record<string, any>,
+  opts: RunAgentChatOptions,
+): AsyncGenerator<ChatEvent, void, void> {
+  const model = opts.model as string;
+  const governor = governorForBackend('meridian', model);
+  type V = { finalText: string; tokensIn: number; tokensOut: number; costUsd: number };
+  const result = await runAgentTurn<V>(
+    { backend: 'meridian', maxAttempts: 8, estTokens: { outTok: params.max_tokens } },
+    {
+      governor,
+      runOnce: async (): Promise<TurnOutcome<V>> => {
+        if (opts.signal?.aborted) return { ok: false, raw: { message: 'meridian: aborted' } };
+        try {
+          const resp = await client.messages.stream(params, opts.signal ? { signal: opts.signal } : {}).finalMessage();
+          let finalText = '';
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          for (const block of (resp.content ?? []) as Array<any>) {
+            if (block?.type === 'text' && typeof block.text === 'string') finalText += block.text;
+          }
+          const tokensIn = resp.usage?.input_tokens ?? 0;
+          const tokensOut = resp.usage?.output_tokens ?? 0;
+          const p = meridianPriceFor(model);
+          return { ok: true, value: { finalText, tokensIn, tokensOut, costUsd: (tokensIn * p.in + tokensOut * p.out) / 1_000_000 } };
+        } catch (err) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const e = err as any;
+          return {
+            ok: false,
+            raw: {
+              status: typeof e?.status === 'number' ? e.status : undefined,
+              headers: headersToRecord(e?.headers),
+              message: err instanceof Error ? err.message : String(err),
+            },
+          };
+        }
+      },
+    },
+  );
+  if (result.ok) {
+    if (result.value.finalText) yield { type: 'delta', text: result.value.finalText };
+    yield { type: 'result', costUsd: result.value.costUsd, tokensIn: result.value.tokensIn, tokensOut: result.value.tokensOut, finalText: result.value.finalText };
+  } else {
+    yield { type: 'error', message: `meridian error: ${result.error.message}` };
+  }
 }
 
 /**
