@@ -73,6 +73,46 @@ test('runAgentTurn — exhausts maxAttempts and returns the last classified erro
   if (!r.ok) assert.equal(r.error.class, 'rate_limited');
 });
 
+test('runAgentTurn — rate_limited with NO retry-after backs off via the governor (no hot-loop)', async () => {
+  // The exact subscription-429 case: bare rate_limit_error, no retry-after header. Must NOT
+  // burn all attempts instantly — it must penalize the governor with an exponential backoff.
+  let clock = 0;
+  const sleep = async (ms: number) => { clock += ms; };
+  const g = new RateLimitGovernor({ maxConcurrent: 4 }, { now: () => clock, sleep });
+  let calls = 0;
+  const r = await runAgentTurn<string>(
+    { backend: 'meridian', maxAttempts: 4, baseBackoffMs: 1000 },
+    {
+      governor: g,
+      now: () => clock,
+      sleep,
+      runOnce: async (): Promise<TurnOutcome<string>> => {
+        calls++;
+        if (calls < 3) return { ok: false, raw: { status: 429 } }; // no retry-after
+        return { ok: true, value: 'ok' };
+      },
+    },
+  );
+  assert.equal(r.ok, true);
+  assert.equal(calls, 3);
+  assert.ok(clock >= 1000, `expected real backoff between attempts, clock=${clock}`); // not an instant burn
+  assert.ok(g.state.pausedUntil > 0); // governor was paused (shared across callers)
+});
+
+test('runAgentTurn — overloaded (529) with no retry-after backs off (not penalize-0 hot-loop)', async () => {
+  let clock = 0;
+  const sleep = async (ms: number) => { clock += ms; };
+  const g = new RateLimitGovernor({ maxConcurrent: 4 }, { now: () => clock, sleep });
+  let calls = 0;
+  const r = await runAgentTurn<string>(
+    { backend: 'meridian', maxAttempts: 3, baseBackoffMs: 1000 },
+    { governor: g, now: () => clock, sleep, runOnce: async (): Promise<TurnOutcome<string>> => { calls++; return { ok: false, raw: { status: 529 } }; } },
+  );
+  assert.equal(r.ok, false);
+  assert.equal(calls, 3);
+  assert.ok(clock >= 1000, `expected backoff, clock=${clock}`);
+});
+
 test('runAgentTurn — never throws even if runOnce rejects (treated as transient_io, retried)', async () => {
   const { g } = fakeGovernor();
   let calls = 0;

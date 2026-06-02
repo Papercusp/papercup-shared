@@ -47,6 +47,7 @@ export async function runAgentTurn<T>(spec: RunAgentTurnSpec, deps: RunAgentTurn
   const maxAttempts = spec.maxAttempts ?? 6;
   const maxWaitMs = spec.maxWaitMs ?? 600_000;
   const baseBackoffMs = spec.baseBackoffMs ?? 1000;
+  const RETRY_CAP_MS = 60_000; // cap a single backoff (matches the legacy meridian loop)
   const now = deps.now ?? (() => Date.now());
   const sleep = deps.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
 
@@ -74,22 +75,29 @@ export async function runAgentTurn<T>(spec: RunAgentTurnSpec, deps: RunAgentTurn
       lastError = err;
       if (!err.retryable || attempt === maxAttempts) return { ok: false, error: err };
 
-      if (err.class === 'rate_limited' || err.class === 'overloaded') {
-        // Pause the governor — the NEXT acquire() blocks until the reset, so we don't
-        // also sleep here (the governor owns the wait, shared across all callers).
-        deps.governor.penalize({ retryAfterMs: err.retryAfterMs, resetAt: err.resetAt });
+      // Wait policy. rate_limited/overloaded are ACCOUNT-WIDE → pause the SHARED governor
+      // (the next acquire across ALL callers waits). Other transient classes are per-call →
+      // local backoff. CRITICAL: honor the server's hint when present, but fall back to
+      // exponential backoff when there is none — subscription 429s and bare 529s carry NO
+      // retry-after, so penalizing with an undefined hint would set pausedUntil=0 and
+      // hot-loop through every attempt instantly (a regression vs the old blind-backoff loop).
+      const accountWide = err.class === 'rate_limited' || err.class === 'overloaded';
+      const hintMs = accountWide
+        ? err.retryAfterMs ?? (err.resetAt !== undefined ? Math.max(0, err.resetAt - now()) : undefined)
+        : undefined;
+      const waitMs = hintMs ?? Math.min(RETRY_CAP_MS, baseBackoffMs * 2 ** (attempt - 1));
+      if (totalWaited + waitMs > maxWaitMs) return { ok: false, error: err };
+      totalWaited += waitMs;
+      if (accountWide) {
+        // Pause the shared governor; the wait happens on the next acquire() (no local sleep).
+        deps.governor.penalize({ retryAfterMs: waitMs });
       } else {
-        backoffMs = Math.min(maxWaitMs - totalWaited, baseBackoffMs * 2 ** (attempt - 1)) + Math.floor(baseBackoffMs / 2);
+        backoffMs = waitMs; // per-call → local sleep after releasing the permit
       }
     } finally {
       release();
     }
-    // Non-rate transient backoff happens AFTER releasing the permit.
-    if (backoffMs > 0) {
-      if (totalWaited + backoffMs > maxWaitMs) return { ok: false, error: err ?? lastError ?? fallbackError(spec.backend) };
-      totalWaited += backoffMs;
-      await sleep(backoffMs);
-    }
+    if (backoffMs > 0) await sleep(backoffMs);
   }
   return { ok: false, error: lastError ?? fallbackError(spec.backend) };
 }
