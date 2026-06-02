@@ -113,6 +113,27 @@ test('runAgentTurn — overloaded (529) with no retry-after backs off (not penal
   assert.ok(clock >= 1000, `expected backoff, clock=${clock}`);
 });
 
+test('runAgentTurn — bails with a structured error when a far-off governor pause exceeds maxWaitMs (no hang)', async () => {
+  // Interactive case: another caller penalized the shared governor for hours; a turn with a
+  // small maxWaitMs must NOT freeze — it returns a rate_limited TurnError (with resetAt) so
+  // the caller can surface/escalate (D-002).
+  let clock = 0;
+  const sleep = async (ms: number) => { clock += ms; };
+  const g = new RateLimitGovernor({ maxConcurrent: 1 }, { now: () => clock, sleep });
+  g.penalize({ retryAfterMs: 5 * 60 * 60 * 1000 });
+  let calls = 0;
+  const r = await runAgentTurn<string>(
+    { backend: 'meridian', maxWaitMs: 2000 },
+    { governor: g, now: () => clock, sleep, runOnce: async (): Promise<TurnOutcome<string>> => { calls++; return { ok: true, value: 'x' }; } },
+  );
+  assert.equal(r.ok, false);
+  assert.equal(calls, 0); // bailed at acquire — never ran the backend
+  if (!r.ok) {
+    assert.equal(r.error.class, 'rate_limited');
+    assert.ok(r.error.resetAt && r.error.resetAt > 0);
+  }
+});
+
 test('runAgentTurn — never throws even if runOnce rejects (treated as transient_io, retried)', async () => {
   const { g } = fakeGovernor();
   let calls = 0;

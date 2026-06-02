@@ -34,6 +34,8 @@ export interface RunAgentTurnSpec {
   maxWaitMs?: number;
   /** Base for exponential backoff on non-rate transient classes (ms). Default 1000. */
   baseBackoffMs?: number;
+  /** Abort the turn (interactive callers) — a pending governor wait bails to a TurnError. */
+  signal?: AbortSignal;
 }
 
 export interface RunAgentTurnDeps<T> {
@@ -55,7 +57,27 @@ export async function runAgentTurn<T>(spec: RunAgentTurnSpec, deps: RunAgentTurn
   let totalWaited = 0;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const release = await deps.governor.acquire(spec.estTokens);
+    // Abortable, bounded acquire: an interactive caller (signal, or a small maxWaitMs) bails
+    // to a structured TurnError instead of inheriting a far-off shared pause (reviewer #3 /
+    // D-002). Unattended callers pass a large maxWaitMs and just wait.
+    const release = await deps.governor.acquire(spec.estTokens, {
+      signal: spec.signal,
+      maxWaitMs: maxWaitMs - totalWaited,
+    });
+    if (!release) {
+      const provider = spec.backend === 'codex' ? 'openai' : spec.backend === 'omp' ? 'unknown' : 'anthropic';
+      const pausedUntil = deps.governor.state.pausedUntil;
+      return {
+        ok: false,
+        error: {
+          class: 'rate_limited',
+          message: spec.signal?.aborted ? 'aborted while rate-limited' : 'rate-limit pause exceeds maxWait',
+          provider,
+          retryable: false,
+          ...(pausedUntil > now() ? { resetAt: pausedUntil } : {}),
+        },
+      };
+    }
     let backoffMs = 0;
     let err: TurnError | undefined;
     try {

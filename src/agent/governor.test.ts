@@ -86,6 +86,7 @@ test('RateLimitGovernor.acquire — serializes under maxConcurrent:1 with a fake
   let clock = 0;
   const g = new RateLimitGovernor({ maxConcurrent: 1 }, { now: () => clock, sleep: async (ms) => { clock += ms; } });
   const release1 = await g.acquire({});
+  if (!release1) throw new Error('expected a permit');
   let secondAcquired = false;
   const p = g.acquire({}).then((r) => { secondAcquired = true; return r; });
   // give the microtask queue a tick; the 2nd acquire must still be blocked
@@ -94,5 +95,26 @@ test('RateLimitGovernor.acquire — serializes under maxConcurrent:1 with a fake
   release1();
   const release2 = await p;
   assert.equal(secondAcquired, true);
-  release2();
+  if (release2) release2();
+});
+
+// --- abortable / bounded acquire (reviewer #3 / D-002): an interactive caller bails
+//     instead of inheriting a far-off shared pause. ---
+test('RateLimitGovernor.acquire — returns null when the wait would exceed maxWaitMs', async () => {
+  let clock = 0;
+  const g = new RateLimitGovernor({ maxConcurrent: 1 }, { now: () => clock, sleep: async (ms) => { clock += ms; } });
+  const held = await g.acquire({}); // take the only permit
+  assert.ok(held);
+  // a far-off pause (e.g. a 5-hour-limit penalty) — the 2nd caller must NOT freeze for hours
+  g.penalize({ retryAfterMs: 5 * 60 * 60 * 1000 });
+  const r = await g.acquire({}, { maxWaitMs: 1000 });
+  assert.equal(r, null);
+});
+test('RateLimitGovernor.acquire — returns null when the abort signal is already aborted', async () => {
+  const g = new RateLimitGovernor({ maxConcurrent: 1 }, { now: () => 0, sleep: async () => {} });
+  await g.acquire({}); // exhaust concurrency so the next would wait
+  const ac = new AbortController();
+  ac.abort();
+  const r = await g.acquire({}, { signal: ac.signal });
+  assert.equal(r, null);
 });

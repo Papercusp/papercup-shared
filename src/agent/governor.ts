@@ -156,6 +156,13 @@ export interface GovernorDeps {
   sleep?: (ms: number) => Promise<void>;
 }
 
+export interface AcquireOpts {
+  /** Abort the wait (interactive callers) — acquire resolves to null. */
+  signal?: AbortSignal;
+  /** Give up (resolve null) rather than wait longer than this in total. */
+  maxWaitMs?: number;
+}
+
 /** Async façade over the pure core: `acquire()` blocks until allowed, then returns a
     release fn. `recordResponse(headers)` and `penalize(opts)` feed the limiter. */
 export class RateLimitGovernor {
@@ -169,8 +176,19 @@ export class RateLimitGovernor {
     this.sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   }
 
-  async acquire(est: TokenEstimate = {}): Promise<() => void> {
+  /**
+   * Acquire a permit, blocking until allowed. Returns a release fn, or `null` if it GAVE
+   * UP — the abort signal fired, or the cumulative wait would exceed `opts.maxWaitMs`. The
+   * null path is what lets an INTERACTIVE caller bail (surface "rate-limited until <reset>"
+   * + escalate) instead of inheriting a far-off shared pause (e.g. a 5-hour-limit penalty
+   * set by the gym) and freezing for hours (reviewer #3 / D-002). Unattended callers pass a
+   * large maxWaitMs (or none → Infinity) and just wait.
+   */
+  async acquire(est: TokenEstimate = {}, opts: AcquireOpts = {}): Promise<(() => void) | null> {
+    const maxWait = opts.maxWaitMs ?? Infinity;
+    let waited = 0;
     for (;;) {
+      if (opts.signal?.aborted) return null;
       const d = decideAcquire(this.state, this.now(), est);
       if (d.allowed) {
         recordAcquire(this.state, this.now(), est);
@@ -181,7 +199,10 @@ export class RateLimitGovernor {
           recordRelease(this.state);
         };
       }
-      await this.sleep(Math.max(1, d.waitMs));
+      const w = Math.max(1, d.waitMs);
+      if (waited + w > maxWait) return null; // would wait too long → give up, let the caller decide
+      waited += w;
+      await this.sleep(w);
     }
   }
 
