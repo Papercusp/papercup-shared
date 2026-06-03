@@ -12,6 +12,8 @@ import {
   recordPenalty,
   recordHeaders,
   RateLimitGovernor,
+  type GovernorState,
+  type GovernorLimits,
 } from './governor';
 
 const MIN = 60_000;
@@ -209,6 +211,58 @@ test('RateLimitGovernor — onPause fires on a header-driven exhaustion (remaini
   g.recordResponse({ 'anthropic-ratelimit-output-tokens-remaining': '0', 'anthropic-ratelimit-output-tokens-reset': '2026-06-02T00:00:30Z' });
   assert.equal(evs.length, 1);
   assert.equal(evs[0].source, 'headers');
+});
+
+// --- RB-007: cross-process store seam — two governors sharing ONE budget row -------------
+
+/** A trivial in-process GovernorStore that mimics PG: one shared state per key, mutated under a
+    (synchronous, single-threaded) transact — proves the seam wires correctly. */
+function makeMemStore() {
+  const rows = new Map<string, GovernorState>();
+  return {
+    rows,
+    async transact(key: string, floor: GovernorLimits, mutate: (s: GovernorState) => void): Promise<GovernorState> {
+      let s = rows.get(key);
+      if (!s) { s = initGovernorState(floor); rows.set(key, s); }
+      mutate(s);
+      return { ...s, limits: { ...s.limits } };
+    },
+  };
+}
+
+test('RateLimitGovernor[store] — a 429 penalty on ONE governor pauses the OTHER (shared budget)', async () => {
+  let clock = 1000;
+  const store = makeMemStore();
+  const deps = { now: () => clock, sleep: async (ms: number) => { clock += ms; }, store, storeKey: 'anthropic:opus' };
+  const a = new RateLimitGovernor({ maxConcurrent: 5 }, deps);
+  const b = new RateLimitGovernor({ maxConcurrent: 5 }, deps);
+  // A hits a 429 → penalizes the SHARED row.
+  a.penalize({ retryAfterMs: 30_000 });
+  await Promise.resolve(); // let the fire-and-forget store write settle
+  // B must now see the pause via the shared store: its acquire bails under a tight maxWait.
+  const r = await b.acquire({}, { maxWaitMs: 1000 });
+  assert.equal(r, null, 'B should inherit the shared pause set by A');
+  // past the reset, B proceeds again
+  clock += 30_001;
+  const r2 = await b.acquire({}, { maxWaitMs: 1000 });
+  assert.ok(r2);
+  r2!();
+});
+
+test('RateLimitGovernor[store] — the shared RPM window is enforced across both governors', async () => {
+  let clock = 0;
+  const store = makeMemStore();
+  const deps = { now: () => clock, sleep: async (ms: number) => { clock += ms; }, store, storeKey: 'anthropic:sonnet' };
+  const a = new RateLimitGovernor({ maxConcurrent: 5, rpm: 2 }, deps);
+  const b = new RateLimitGovernor({ maxConcurrent: 5, rpm: 2 }, deps);
+  // Two requests (one each) fill the shared rpm=2 window…
+  (await a.acquire({}))!();
+  (await b.acquire({}))!();
+  assert.equal(store.rows.get('anthropic:sonnet')!.reqInWindow, 2); // shared counter, not per-process
+  // …so the 3rd (from A) must wait for the window reset, not slip through on A's own fresh count.
+  const start = clock;
+  (await a.acquire({}))!();
+  assert.ok(clock - start >= MIN - 1, `expected to wait ~a window, waited ${clock - start}ms`);
 });
 
 test('RateLimitGovernor.snapshot — returns an independent copy of the state', () => {

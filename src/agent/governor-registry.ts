@@ -13,7 +13,7 @@
  * them up from the provider's `*-ratelimit-*-limit` headers when available (API-key paths).
  */
 import type { TurnBackend, TurnProvider } from './turn-error';
-import { RateLimitGovernor, type GovernorLimits, type GovernorDeps, type GovernorState, type GovernorPauseEvent } from '../resilience/governor';
+import { RateLimitGovernor, type GovernorLimits, type GovernorDeps, type GovernorState, type GovernorPauseEvent, type GovernorStore } from '../resilience/governor';
 
 export type LimitModel = 'subscription' | 'apiKey';
 
@@ -74,6 +74,18 @@ const DEFAULT_FLOORS: Record<TurnProvider, GovernorLimits> = {
 
 const registry = new Map<string, RateLimitGovernor>();
 
+// Cross-process shared-budget store (RB-007). When set (by the operator at boot, behind a flag),
+// every NEW governor routes its rate+pause budget through it so the whole fleet + gym + this dev
+// session share ONE account budget. Concurrency stays per-process. Default unset = in-memory.
+let sharedStore: GovernorStore | undefined;
+
+/** Install (or clear) the cross-process budget store. Resets the registry so subsequent
+    `getGovernor` calls bind the store. Call once at boot, before any agent turn. */
+export function setGovernorStore(store: GovernorStore | undefined): void {
+  sharedStore = store;
+  registry.clear();
+}
+
 export function governorKey(provider: TurnProvider, modelClass: string): string {
   return `${provider}:${modelClass}`;
 }
@@ -110,6 +122,8 @@ export function getGovernor(provider: TurnProvider, modelClass: string, deps?: G
       { ...DEFAULT_FLOORS[provider] },
       {
         ...deps,
+        // Bind the cross-process store (RB-007) unless the caller injected its own (tests do).
+        ...(deps?.store ? {} : sharedStore ? { store: sharedStore, storeKey: key } : {}),
         onPause: (ev) => {
           emitGovernorPause({ ...ev, key });
           deps?.onPause?.(ev);

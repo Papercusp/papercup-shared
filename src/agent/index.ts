@@ -40,12 +40,13 @@ export {
   onGovernorPause,
   snapshotGovernors,
   resetGovernorRegistry,
+  setGovernorStore,
   type BackendProfile,
   type LimitModel,
   type GovernorSnapshot,
   type GovernorPauseListener,
 } from './governor-registry';
-export type { GovernorPauseEvent, GovernorState } from '../resilience/governor';
+export type { GovernorPauseEvent, GovernorState, GovernorStore, GovernorLimits } from '../resilience/governor';
 export {
   runAgentTurn,
   type TurnOutcome,

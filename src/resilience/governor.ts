@@ -90,10 +90,18 @@ function windowUsage(s: GovernorState, now: number): { req: number; inTok: numbe
   return { req: s.reqInWindow, inTok: s.inTokInWindow, outTok: s.outTokInWindow };
 }
 
-/** PURE: may this turn proceed at `now`? If not, how long to wait before re-checking. */
-export function decideAcquire(s: GovernorState, now: number, est: TokenEstimate = {}): AcquireDecision {
-  if (now < s.pausedUntil) return { allowed: false, waitMs: s.pausedUntil - now, reason: 'paused' };
+/** PURE: the CONCURRENCY gate only (the per-process burst lever). Split out from `decideAcquire`
+    so the cross-process store (RB-007) can run the RATE gate against the shared row while keeping
+    concurrency local. */
+export function decideConcurrency(s: GovernorState): AcquireDecision {
   if (s.inFlight >= s.limits.maxConcurrent) return { allowed: false, waitMs: CONCURRENCY_POLL_MS, reason: 'concurrency' };
+  return { allowed: true, waitMs: 0 };
+}
+
+/** PURE: the RATE + PAUSE + pacing gate (everything except concurrency) — the account-wide
+    budget that RB-007 shares cross-process. */
+export function decideRate(s: GovernorState, now: number, est: TokenEstimate = {}): AcquireDecision {
+  if (now < s.pausedUntil) return { allowed: false, waitMs: s.pausedUntil - now, reason: 'paused' };
 
   const u = windowUsage(s, now);
   const msToWindowReset = now - s.windowStart >= WINDOW_MS ? 0 : s.windowStart + WINDOW_MS - now;
@@ -118,19 +126,33 @@ export function decideAcquire(s: GovernorState, now: number, est: TokenEstimate 
   return { allowed: true, waitMs: 0 };
 }
 
-/** Commit an acquisition: roll the window if stale, then charge concurrency + usage. */
-export function recordAcquire(s: GovernorState, now: number, est: TokenEstimate = {}): void {
+/** PURE: may this turn proceed at `now`? Concurrency first, then the rate/pause budget. If not,
+    how long to wait before re-checking. */
+export function decideAcquire(s: GovernorState, now: number, est: TokenEstimate = {}): AcquireDecision {
+  const c = decideConcurrency(s);
+  if (!c.allowed) return c;
+  return decideRate(s, now, est);
+}
+
+/** Commit the RATE side of an acquisition: roll the window if stale, then charge req/token usage
+    + stamp the pace anchor. (Concurrency is charged separately so the store can keep it local.) */
+export function recordRate(s: GovernorState, now: number, est: TokenEstimate = {}): void {
   if (now - s.windowStart >= WINDOW_MS) {
     s.windowStart = now;
     s.reqInWindow = 0;
     s.inTokInWindow = 0;
     s.outTokInWindow = 0;
   }
-  s.inFlight += 1;
   s.reqInWindow += 1;
   s.inTokInWindow += est.inTok ?? 0;
   s.outTokInWindow += est.outTok ?? 0;
   s.lastAcquireAt = now;
+}
+
+/** Commit a full acquisition: charge the rate budget + take a concurrency slot. */
+export function recordAcquire(s: GovernorState, now: number, est: TokenEstimate = {}): void {
+  recordRate(s, now, est);
+  s.inFlight += 1;
 }
 
 export function recordRelease(s: GovernorState): void {
@@ -202,11 +224,28 @@ export interface GovernorPauseEvent {
   source: 'penalty' | 'headers';
 }
 
+/**
+ * Cross-process store seam (RB-007). The RATE + PAUSE budget (the account-wide part that causes
+ * 429s when the fleet co-bursts) lives behind this so multiple processes share ONE budget;
+ * CONCURRENCY stays per-process (a per-runner burst lever — cross-process concurrency would need
+ * leasing, and the shared rate window already bounds aggregate request rate). `transact` does an
+ * ATOMIC load→mutate→persist on the bucket's shared row (e.g. PG `SELECT … FOR UPDATE`); the
+ * mutate runs the pure rate decision/record on the loaded state. Default = no store = pure
+ * in-memory (the fast path, byte-identical to before).
+ */
+export interface GovernorStore {
+  transact(key: string, floor: GovernorLimits, mutate: (s: GovernorState) => void): Promise<GovernorState>;
+}
+
 export interface GovernorDeps {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   /** Called (best-effort, synchronously) only when `pausedUntil` increases. Must not throw. */
   onPause?: (ev: GovernorPauseEvent) => void;
+  /** Cross-process shared-budget store (RB-007). Omit for in-memory (per-process) governance. */
+  store?: GovernorStore;
+  /** Bucket key for the store (e.g. "anthropic:opus"). Required when `store` is set. */
+  storeKey?: string;
 }
 
 export interface AcquireOpts {
@@ -223,12 +262,34 @@ export class RateLimitGovernor {
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly onPause?: (ev: GovernorPauseEvent) => void;
+  private readonly store?: GovernorStore;
+  private readonly storeKey?: string;
+  private readonly floor: GovernorLimits;
 
   constructor(limits: GovernorLimits, deps: GovernorDeps = {}) {
     this.state = initGovernorState(limits);
+    this.floor = { ...limits };
     this.now = deps.now ?? (() => Date.now());
     this.sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.onPause = deps.onPause;
+    this.store = deps.store;
+    this.storeKey = deps.storeKey;
+    if (this.store && !this.storeKey) throw new Error('RateLimitGovernor: storeKey is required when a store is set');
+  }
+
+  /** Pull the shared RATE+PAUSE fields from a store-loaded state into the local snapshot (so
+      `snapshot()` / observability reflect the shared budget; concurrency stays local). */
+  private syncSharedInto(shared: GovernorState): void {
+    const before = this.state.pausedUntil;
+    this.state.windowStart = shared.windowStart;
+    this.state.reqInWindow = shared.reqInWindow;
+    this.state.inTokInWindow = shared.inTokInWindow;
+    this.state.outTokInWindow = shared.outTokInWindow;
+    this.state.pausedUntil = shared.pausedUntil;
+    this.state.paceDelayMs = shared.paceDelayMs;
+    this.state.lastAcquireAt = shared.lastAcquireAt;
+    this.state.limits = { ...this.state.limits, ...shared.limits, maxConcurrent: this.state.limits.maxConcurrent };
+    this.notifyPauseIfExtended(before, 'penalty');
   }
 
   /** A point-in-time copy of the state (for observability — RB-009). */
@@ -260,17 +321,49 @@ export class RateLimitGovernor {
   async acquire(est: TokenEstimate = {}, opts: AcquireOpts = {}): Promise<(() => void) | null> {
     const maxWait = opts.maxWaitMs ?? Infinity;
     let waited = 0;
+    const mkRelease = (): (() => void) => {
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        recordRelease(this.state);
+      };
+    };
     for (;;) {
       if (opts.signal?.aborted) return null;
-      const d = decideAcquire(this.state, this.now(), est);
-      if (d.allowed) {
-        recordAcquire(this.state, this.now(), est);
-        let released = false;
-        return () => {
-          if (released) return;
-          released = true;
-          recordRelease(this.state);
-        };
+      let d: AcquireDecision;
+      if (!this.store) {
+        // IN-MEMORY fast path: decide + record SYNCHRONOUSLY (no await between the check and the
+        // increment) so concurrency stays atomic under many interleaved callers.
+        d = decideAcquire(this.state, this.now(), est);
+        if (d.allowed) {
+          recordAcquire(this.state, this.now(), est);
+          return mkRelease();
+        }
+      } else {
+        // CROSS-PROCESS path (RB-007): concurrency is local; reserve the slot atomically (right
+        // after the sync check, before any await), then run the RATE gate against the shared row.
+        const c = decideConcurrency(this.state);
+        if (c.allowed) {
+          this.state.inFlight += 1; // reserve the local concurrency slot now
+          let rateAllowed = false;
+          let rateWait = CONCURRENCY_POLL_MS;
+          try {
+            const shared = await this.store.transact(this.storeKey!, this.floor, (s) => {
+              const rd = decideRate(s, this.now(), est);
+              rateAllowed = rd.allowed;
+              rateWait = rd.waitMs;
+              if (rd.allowed) recordRate(s, this.now(), est);
+            });
+            this.syncSharedInto(shared);
+          } finally {
+            if (!rateAllowed) this.state.inFlight -= 1; // give the reservation back on a rate denial
+          }
+          if (rateAllowed) return mkRelease();
+          d = { allowed: false, waitMs: rateWait };
+        } else {
+          d = c;
+        }
       }
       const w = Math.max(1, d.waitMs);
       if (waited + w > maxWait) return null; // would wait too long → give up, let the caller decide
@@ -283,11 +376,15 @@ export class RateLimitGovernor {
     const before = this.state.pausedUntil;
     recordHeaders(this.state, headers, this.now());
     this.notifyPauseIfExtended(before, 'headers');
+    // Converge the shared budget too (best-effort; the shared row is authoritative cross-process).
+    if (this.store) void this.store.transact(this.storeKey!, this.floor, (s) => recordHeaders(s, headers, this.now())).catch(() => {});
   }
 
   penalize(opts: { retryAfterMs?: number; resetAt?: number }): void {
     const before = this.state.pausedUntil;
     recordPenalty(this.state, this.now(), opts);
     this.notifyPauseIfExtended(before, 'penalty');
+    // A 429 anywhere pauses the WHOLE account → push to the shared row so every process backs off.
+    if (this.store) void this.store.transact(this.storeKey!, this.floor, (s) => recordPenalty(s, this.now(), opts)).catch(() => {});
   }
 }
