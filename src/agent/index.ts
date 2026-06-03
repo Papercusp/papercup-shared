@@ -55,4 +55,4 @@ export {
   type RunAgentTurnDeps,
 } from './turn-runner';
 // Generic resilience primitives (domain-independent) — re-exported for convenience.
-export { RateLimitGovernor, runWithRetry } from '../resilience';
+export { RateLimitGovernor, runWithRetry, initGovernorState } from '../resilience';
