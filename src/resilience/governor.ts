@@ -14,6 +14,13 @@
  * `recordHeaders` understands the common Anthropic (`anthropic-ratelimit-*`) and OpenAI
  * (`x-ratelimit-*`) header conventions. The decision logic is a PURE core (testable with a
  * fake clock); the async `acquire()` is a thin loop over it using injected `now`/`sleep`.
+ *
+ * WINDOW SEMANTICS: the RPM/ITPM/OTPM accounting is a TUMBLING 60s window (a window older than
+ * 60s reads fresh), not a continuously-replenishing leaky bucket — so it can allow a burst right
+ * after a window flips. That coarseness is intentional (cheap, fake-clock-testable); the smoother
+ * controls are layered on top: a 429 `penalize()` pauses hard, and `paceDelayMs` (review #7/#8)
+ * spreads requests pre-emptively as `*-remaining` drops, so we glide toward a reset rather than
+ * slamming into remaining=0 and tripping the limit.
  */
 
 export interface GovernorLimits {
@@ -35,6 +42,13 @@ export interface GovernorState {
   inTokInWindow: number;
   outTokInWindow: number;
   pausedUntil: number; // epoch ms; 0 = not paused
+  /**
+   * Pre-emptive pacing gap (ms) between acquisitions, derived from headers when a dimension's
+   * `*-remaining` is running low (review #7/#8: "slow as remaining drops" rather than the
+   * all-or-nothing slam into remaining=0). 0 = no soft pacing. Only set in header-driven mode.
+   */
+  paceDelayMs: number;
+  lastAcquireAt: number; // epoch ms of the last granted acquire (anchors the pace gap)
 }
 
 export interface TokenEstimate {
@@ -45,11 +59,16 @@ export interface TokenEstimate {
 export interface AcquireDecision {
   allowed: boolean;
   waitMs: number;
-  reason?: 'paused' | 'concurrency' | 'rpm' | 'itpm' | 'otpm';
+  reason?: 'paused' | 'concurrency' | 'rpm' | 'itpm' | 'otpm' | 'pace';
 }
 
 const WINDOW_MS = 60_000;
 const CONCURRENCY_POLL_MS = 250; // we don't know when a peer releases → short re-poll
+// "Slow as remaining drops" knobs (review #7/#8). Below this fraction of a dimension's limit we
+// start spreading the remaining budget over the time-to-reset; the per-acquire gap is capped so
+// soft pacing never becomes a de-facto long pause (that's what a 429 penalty is for).
+const LOW_WATERMARK = 0.2;
+const MAX_PACE_DELAY_MS = 5_000;
 
 export function initGovernorState(limits: GovernorLimits): GovernorState {
   return {
@@ -60,6 +79,8 @@ export function initGovernorState(limits: GovernorLimits): GovernorState {
     inTokInWindow: 0,
     outTokInWindow: 0,
     pausedUntil: 0,
+    paceDelayMs: 0,
+    lastAcquireAt: 0,
   };
 }
 
@@ -88,6 +109,12 @@ export function decideAcquire(s: GovernorState, now: number, est: TokenEstimate 
   if (s.limits.otpm !== undefined && u.outTok + outTok > s.limits.otpm) {
     return { allowed: false, waitMs: Math.max(1, msToWindowReset), reason: 'otpm' };
   }
+  // Pre-emptive pacing: when remaining is low (header-driven mode) we hold a small gap between
+  // acquisitions so we glide to the reset instead of slamming into remaining=0 (review #7/#8).
+  if (s.paceDelayMs > 0) {
+    const nextAllowedAt = s.lastAcquireAt + s.paceDelayMs;
+    if (now < nextAllowedAt) return { allowed: false, waitMs: nextAllowedAt - now, reason: 'pace' };
+  }
   return { allowed: true, waitMs: 0 };
 }
 
@@ -103,6 +130,7 @@ export function recordAcquire(s: GovernorState, now: number, est: TokenEstimate 
   s.reqInWindow += 1;
   s.inTokInWindow += est.inTok ?? 0;
   s.outTokInWindow += est.outTok ?? 0;
+  s.lastAcquireAt = now;
 }
 
 export function recordRelease(s: GovernorState): void {
@@ -137,20 +165,33 @@ export function recordHeaders(s: GovernorState, headers: Record<string, string |
   const otpm = num(h['anthropic-ratelimit-output-tokens-limit']);
   if (otpm !== undefined) s.limits.otpm = otpm;
 
-  // If any dimension is exhausted (remaining 0) + a reset is given, pause until then.
-  const pairs: Array<[string, string]> = [
-    ['anthropic-ratelimit-requests-remaining', 'anthropic-ratelimit-requests-reset'],
-    ['anthropic-ratelimit-input-tokens-remaining', 'anthropic-ratelimit-input-tokens-reset'],
-    ['anthropic-ratelimit-output-tokens-remaining', 'anthropic-ratelimit-output-tokens-reset'],
-    ['anthropic-ratelimit-tokens-remaining', 'anthropic-ratelimit-tokens-reset'],
+  // Per-dimension: remaining=0 → pause to reset; 0<remaining<watermark → pre-emptively pace
+  // (spread the remaining budget over the time-to-reset). [remaining, reset, limit].
+  const dims: Array<[string, string, number | undefined]> = [
+    ['anthropic-ratelimit-requests-remaining', 'anthropic-ratelimit-requests-reset', rpm],
+    ['anthropic-ratelimit-input-tokens-remaining', 'anthropic-ratelimit-input-tokens-reset', itpm],
+    ['anthropic-ratelimit-output-tokens-remaining', 'anthropic-ratelimit-output-tokens-reset', otpm],
+    ['anthropic-ratelimit-tokens-remaining', 'anthropic-ratelimit-tokens-reset', undefined],
   ];
-  for (const [remK, resetK] of pairs) {
+  let pace = 0; // recomputed from THIS response — healthy headroom decays it back to 0
+  for (const [remK, resetK, limit] of dims) {
     const rem = num(h[remK]);
-    if (rem === 0 && h[resetK]) {
-      const t = Date.parse(h[resetK] as string);
-      if (!Number.isNaN(t) && t > s.pausedUntil) s.pausedUntil = t;
+    if (rem === undefined || !h[resetK]) continue;
+    const t = Date.parse(h[resetK] as string);
+    if (Number.isNaN(t)) continue;
+    if (rem === 0) {
+      if (t > s.pausedUntil) s.pausedUntil = t;
+      continue;
+    }
+    // Soft pacing kicks in only once we know the dimension's ceiling and we're under the
+    // low-watermark fraction of it: glide the remaining `rem` requests over `t - now`.
+    if (limit !== undefined && limit > 0 && rem < limit * LOW_WATERMARK) {
+      const msToReset = Math.max(0, t - now);
+      const spread = Math.min(MAX_PACE_DELAY_MS, Math.floor(msToReset / rem));
+      if (spread > pace) pace = spread;
     }
   }
+  s.paceDelayMs = pace;
 }
 
 /** Fired when a pause is newly SET or EXTENDED (the 429/backpressure transition) — the hook a

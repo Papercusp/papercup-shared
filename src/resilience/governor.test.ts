@@ -73,6 +73,51 @@ test('recordHeaders — adopts the server RPM limit + pauses when remaining hits
   assert.equal(decideAcquire(s, Date.parse('2026-06-02T00:00:00Z'), {}).allowed, false);
 });
 
+// --- slow as remaining drops (review #7/#8): pre-emptive pacing, not all-or-nothing ---
+test('recordHeaders — sets a pace gap when remaining is low; decideAcquire holds the gap', () => {
+  const base = Date.parse('2026-06-02T00:00:00Z');
+  const s = initGovernorState({ maxConcurrent: 10 });
+  // limit 100 req, only 5 remaining (5% < 20% watermark), resets in 10s → spread 10s/5 = 2s gap
+  recordHeaders(
+    s,
+    {
+      'anthropic-ratelimit-requests-limit': '100',
+      'anthropic-ratelimit-requests-remaining': '5',
+      'anthropic-ratelimit-requests-reset': '2026-06-02T00:00:10Z',
+    },
+    base,
+  );
+  assert.equal(s.paceDelayMs, 2_000);
+  // first acquire is allowed; it stamps lastAcquireAt
+  assert.equal(decideAcquire(s, base, {}).allowed, true);
+  recordAcquire(s, base, {});
+  // a follow-up 1s later is held by the 2s pace gap
+  const d = decideAcquire(s, base + 1_000, {});
+  assert.equal(d.allowed, false);
+  assert.equal(d.reason, 'pace');
+  assert.equal(d.waitMs, 1_000);
+  // once the gap elapses, allowed again
+  assert.equal(decideAcquire(s, base + 2_000, {}).allowed, true);
+});
+
+test('recordHeaders — healthy remaining decays the pace gap back to 0 (no needless throttle)', () => {
+  const base = Date.parse('2026-06-02T00:00:00Z');
+  const s = initGovernorState({ maxConcurrent: 10 });
+  recordHeaders(s, { 'anthropic-ratelimit-requests-limit': '100', 'anthropic-ratelimit-requests-remaining': '2', 'anthropic-ratelimit-requests-reset': '2026-06-02T00:00:10Z' }, base);
+  assert.ok(s.paceDelayMs > 0);
+  // next response shows headroom recovered (80 remaining = 80% > watermark) → no pacing
+  recordHeaders(s, { 'anthropic-ratelimit-requests-limit': '100', 'anthropic-ratelimit-requests-remaining': '80', 'anthropic-ratelimit-requests-reset': '2026-06-02T00:01:00Z' }, base);
+  assert.equal(s.paceDelayMs, 0);
+});
+
+test('recordHeaders — the pace gap is capped (soft pacing never becomes a long pause)', () => {
+  const base = Date.parse('2026-06-02T00:00:00Z');
+  const s = initGovernorState({ maxConcurrent: 10 });
+  // 1 remaining, resets in 1 hour → raw spread 3.6e6ms, but capped at MAX_PACE_DELAY_MS (5s)
+  recordHeaders(s, { 'anthropic-ratelimit-requests-limit': '100', 'anthropic-ratelimit-requests-remaining': '1', 'anthropic-ratelimit-requests-reset': '2026-06-02T01:00:00Z' }, base);
+  assert.equal(s.paceDelayMs, 5_000);
+});
+
 // --- coarse mode: only concurrency applies when no rate limits known ---
 test('decideAcquire — coarse mode (no rpm/itpm/otpm) gates on concurrency only', () => {
   const s = initGovernorState({ maxConcurrent: 1 });

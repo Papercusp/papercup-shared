@@ -1531,6 +1531,24 @@ export async function* runAgentChat(
   child.on('exit', (code, signal) => { exitCode = code; exitSignal = signal; exited = true; tick(); });
   child.on('error', () => { exited = true; tick(); });
 
+  // RB review #6 — wall-clock turn timeout backstop. A subprocess that hangs (never exits,
+  // never streams) would otherwise wedge an un-signaled caller forever; the orchestrator passes
+  // its own AbortSignal/deadline, but ungoverned/interactive callers may not. On expiry we set
+  // `timedOut` (→ classified `timeout`, retryable) and SIGTERM, escalating to SIGKILL after a
+  // short grace. Default 15 min — generous, so a caller's own shorter deadline usually fires first.
+  let timedOut = false;
+  const TURN_TIMEOUT_MS = Number(process.env.PAPERCUSP_AGENT_TURN_TIMEOUT_MS ?? 900_000);
+  const turnTimer =
+    TURN_TIMEOUT_MS > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          try { child.kill('SIGTERM'); } catch { /* ignore */ }
+          setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* ignore */ } }, 5_000).unref?.();
+          tick();
+        }, TURN_TIMEOUT_MS)
+      : null;
+  turnTimer?.unref?.();
+
   // Drain loop.
   while (true) {
     while (queue.length > 0) {
@@ -1540,6 +1558,7 @@ export async function* runAgentChat(
     await new Promise<void>((resolve) => { resolveTick = resolve; });
   }
 
+  if (turnTimer) clearTimeout(turnTimer);
   if (opts.signal) opts.signal.removeEventListener('abort', onAbort);
 
   // Silent-failure surfacing: an agent that exits 0 with no text is
@@ -1592,7 +1611,7 @@ export async function* runAgentChat(
   if (governed) {
     cliTurn = classifyTurnError(
       backend as TurnBackend,
-      { exitCode, signal: exitSignal, stderr: stderrBuf, stdout: finalText },
+      { exitCode, signal: exitSignal, stderr: stderrBuf, stdout: finalText, timedOut },
       Date.now(),
     );
     if (cliTurn.class === 'rate_limited' || cliTurn.class === 'overloaded') {

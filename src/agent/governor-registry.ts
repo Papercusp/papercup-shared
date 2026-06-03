@@ -15,20 +15,41 @@
 import type { TurnBackend, TurnProvider } from './turn-error';
 import { RateLimitGovernor, type GovernorLimits, type GovernorDeps, type GovernorState, type GovernorPauseEvent } from '../resilience/governor';
 
+export type LimitModel = 'subscription' | 'apiKey';
+
 export interface BackendProfile {
   provider: TurnProvider;
-  /** subscription = coarse (no per-minute headroom); apiKey = header-driven precise. */
-  limitModel: 'subscription' | 'apiKey';
   /** omp self-paces via fallback chaining → we only cap its concurrency. */
   selfPacing: boolean;
 }
 
 export const BACKEND_PROFILES: Record<TurnBackend, BackendProfile> = {
-  meridian: { provider: 'anthropic', limitModel: 'subscription', selfPacing: false },
-  'claude-code': { provider: 'anthropic', limitModel: 'subscription', selfPacing: false },
-  omp: { provider: 'unknown', limitModel: 'subscription', selfPacing: true },
-  codex: { provider: 'openai', limitModel: 'subscription', selfPacing: false },
+  meridian: { provider: 'anthropic', selfPacing: false },
+  'claude-code': { provider: 'anthropic', selfPacing: false },
+  omp: { provider: 'unknown', selfPacing: true },
+  codex: { provider: 'openai', selfPacing: false },
 };
+
+/**
+ * Whether a provider runs on a precise header-driven API-key bucket or a coarse subscription —
+ * a RUNTIME credential fact (D-006), NOT a compile-time const. The ITPM/OTPM token-bucket is
+ * only honest with an API key (which returns `*-ratelimit-*` per-minute headroom headers); a
+ * subscription (Claude-Max / ChatGPT OAuth) exposes none, so it's concurrency + RPM +
+ * honor-retry-after only. Resolved from env at call time so pointing a backend at an API key
+ * (e.g. to dodge the Max rate window — D-006) flips it to precise mode without a code change.
+ */
+export function resolveProviderLimitModel(provider: TurnProvider, env: Record<string, string | undefined> = process.env): LimitModel {
+  if (provider === 'anthropic') return env.ANTHROPIC_API_KEY ? 'apiKey' : 'subscription';
+  if (provider === 'openai') return env.OPENAI_API_KEY ? 'apiKey' : 'subscription';
+  return 'subscription'; // unknown / multi-provider (omp): no single bucket → coarse
+}
+
+/** The runtime limit model for a backend (omp self-paces → always coarse subscription mode). */
+export function resolveLimitModel(backend: TurnBackend, env: Record<string, string | undefined> = process.env): LimitModel {
+  const p = BACKEND_PROFILES[backend];
+  if (p.selfPacing) return 'subscription';
+  return resolveProviderLimitModel(p.provider, env);
+}
 
 /** Anthropic rate limits are per model class (opus/sonnet/haiku are separate buckets). */
 export function modelClassOf(model: string): string {
@@ -104,6 +125,8 @@ export interface GovernorSnapshot {
   key: string;
   provider: TurnProvider;
   modelClass: string;
+  /** Runtime credential fact (D-006): precise apiKey bucket vs coarse subscription. */
+  limitModel: LimitModel;
   state: GovernorState;
 }
 
@@ -113,10 +136,12 @@ export function snapshotGovernors(): GovernorSnapshot[] {
   const out: GovernorSnapshot[] = [];
   for (const [key, g] of registry) {
     const idx = key.indexOf(':');
+    const provider = key.slice(0, idx) as TurnProvider;
     out.push({
       key,
-      provider: key.slice(0, idx) as TurnProvider,
+      provider,
       modelClass: key.slice(idx + 1),
+      limitModel: resolveProviderLimitModel(provider),
       state: g.snapshot(),
     });
   }

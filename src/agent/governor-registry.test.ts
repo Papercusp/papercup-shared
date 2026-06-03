@@ -10,6 +10,8 @@ import {
   getGovernor,
   governorForBackend,
   resetGovernorRegistry,
+  resolveLimitModel,
+  resolveProviderLimitModel,
   onGovernorPause,
   snapshotGovernors,
 } from './governor-registry';
@@ -22,6 +24,22 @@ test('BACKEND_PROFILES — provider + self-pacing per backend', () => {
   assert.equal(BACKEND_PROFILES.codex.provider, 'openai');
   assert.equal(BACKEND_PROFILES.omp.selfPacing, true); // model-agnostic + fallback chaining
   assert.equal(BACKEND_PROFILES.meridian.selfPacing, false);
+});
+
+// D-006: limitModel is a RUNTIME credential fact, not a compile-time const.
+test('resolveLimitModel — subscription by default, apiKey when a provider key is set in env', () => {
+  // No keys → coarse subscription mode (the Max/ChatGPT OAuth default on the dev box).
+  assert.equal(resolveLimitModel('meridian', {}), 'subscription');
+  assert.equal(resolveLimitModel('claude-code', {}), 'subscription');
+  assert.equal(resolveLimitModel('codex', {}), 'subscription');
+  // An Anthropic API key flips claude paths to precise header-driven mode.
+  assert.equal(resolveLimitModel('meridian', { ANTHROPIC_API_KEY: 'sk-ant-x' }), 'apiKey');
+  assert.equal(resolveProviderLimitModel('anthropic', { ANTHROPIC_API_KEY: 'sk-ant-x' }), 'apiKey');
+  // An OpenAI API key flips codex to precise mode; anthropic key doesn't affect openai.
+  assert.equal(resolveLimitModel('codex', { OPENAI_API_KEY: 'sk-oai-x' }), 'apiKey');
+  assert.equal(resolveProviderLimitModel('openai', { ANTHROPIC_API_KEY: 'sk-ant-x' }), 'subscription');
+  // omp self-paces → always coarse, regardless of any key in env.
+  assert.equal(resolveLimitModel('omp', { ANTHROPIC_API_KEY: 'sk-ant-x', OPENAI_API_KEY: 'sk-oai-x' }), 'subscription');
 });
 
 test('modelClassOf — buckets opus/sonnet/haiku separately (Anthropic limits are per-class)', () => {
@@ -89,4 +107,5 @@ test('snapshotGovernors — reports each live bucket with its pause + concurrenc
   assert.equal(opus!.modelClass, 'opus');
   assert.ok(opus!.state.pausedUntil > 0);
   assert.equal(typeof opus!.state.inFlight, 'number');
+  assert.ok(opus!.limitModel === 'subscription' || opus!.limitModel === 'apiKey'); // D-006 runtime fact
 });

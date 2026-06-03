@@ -35,10 +35,13 @@ export {
   getGovernor,
   modelClassOf,
   BACKEND_PROFILES,
+  resolveLimitModel,
+  resolveProviderLimitModel,
   onGovernorPause,
   snapshotGovernors,
   resetGovernorRegistry,
   type BackendProfile,
+  type LimitModel,
   type GovernorSnapshot,
   type GovernorPauseListener,
 } from './governor-registry';
