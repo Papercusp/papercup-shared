@@ -74,6 +74,9 @@ test('classifySubprocessResult — stderr rate-limit patterns → rate_limited',
   assert.equal(classifySubprocessResult({ exitCode: 1, stderr: 'Error: 429 Too Many Requests' }).class, 'rate_limited');
   assert.equal(classifySubprocessResult({ exitCode: 1, stderr: 'rate limit exceeded, retry after 30s' }).class, 'rate_limited');
   assert.equal(classifySubprocessResult({ exitCode: 1, stderr: 'You have hit your 5-hour limit' }).class, 'rate_limited');
+  // Claude Code subscription session lockout (transient — resets at a time), NOT an agent crash.
+  assert.equal(classifySubprocessResult({ exitCode: 1, stderr: "You've hit your session limit · resets 4:20am (America/New_York)" }).class, 'rate_limited');
+  assert.equal(classifySubprocessResult({ exitCode: 1, stderr: 'session limit reached' }).class, 'rate_limited');
 });
 test('classifySubprocessResult — stderr overloaded → overloaded', () => {
   assert.equal(classifySubprocessResult({ exitCode: 1, stderr: '529 overloaded_error' }).class, 'overloaded');

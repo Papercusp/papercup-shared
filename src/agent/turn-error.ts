@@ -98,7 +98,11 @@ function resetFromHeaders(headers: Record<string, string | undefined> | undefine
   return undefined;
 }
 
-const RATE_RE = /(\b429\b|rate.?limit|too many requests|quota|usage limit|\d+-?hour limit)/i;
+// `session limit` / `hit your … limit` cover the Claude Code SUBSCRIPTION lockout
+// ("You've hit your session limit · resets 4:20am") — a transient, reset-at-a-time cap, NOT
+// an agent crash. Without these it fell through to `agent_crash`, so the gym's RB-006 rate-pause
+// rethrew instead of pausing/skipping → an unattended loop hard-failed on a session lockout.
+const RATE_RE = /(\b429\b|rate.?limit|too many requests|quota|usage limit|session limit|\d+-?hour limit|hit your (?:session|usage|weekly|monthly) limit)/i;
 const OVERLOAD_RE = /(\b529\b|overloaded|service unavailable|\b50[0234]\b)/i;
 const AUTH_RE = /(\b401\b|\b403\b|unauthorized|forbidden|invalid api key|authentication)/i;
 const IO_RE = /(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|network|fetch failed)/i;
