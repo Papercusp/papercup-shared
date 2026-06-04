@@ -33,6 +33,7 @@
  * Cancellation: pass a signal; spawn is killed on abort.
  */
 
+import { createRequire } from 'node:module';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -42,6 +43,11 @@ import { basename, join } from 'node:path';
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
 import { governorForBackend, BACKEND_PROFILES } from './governor-registry';
 import { classifyTurnError, type TurnBackend, type TurnError } from './turn-error';
+
+// This package is `"type": "module"`; ESM has no ambient `require`. The lazy
+// loads below (heavy/optional deps + node builtins, deferred to call time)
+// use this synchronous loader.
+const nodeRequire = createRequire(import.meta.url);
 
 /** Default cap on a CLI spawn's wait for a shared-governor permit (RB-012). Long enough to
     wait out a normal 429's retry-after, short enough that a multi-hour subscription lockout
@@ -524,7 +530,7 @@ async function* meridianAgentChat(
   // Lazy-load the SDK so consumers that never use this path don't pay the
   // import cost.
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const sdkMod = require('@anthropic-ai/sdk') as { default?: unknown } | unknown;
+  const sdkMod = nodeRequire('@anthropic-ai/sdk') as { default?: unknown } | unknown;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const Anthropic: any = (sdkMod as { default?: unknown }).default ?? sdkMod;
 
@@ -834,7 +840,7 @@ export async function* runAgentChat(
         const realCreds = join(homedir(), '.claude', '.credentials.json');
         if (existsSync(realCreds)) {
           // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const { symlinkSync } = require('node:fs') as typeof import('node:fs');
+          const { symlinkSync } = nodeRequire('node:fs') as typeof import('node:fs');
           symlinkSync(realCreds, join(claudeConfigDir, '.credentials.json'));
         }
       } catch (err) {
@@ -881,7 +887,7 @@ export async function* runAgentChat(
           // node:fs symlink — relative cleanup is fine since we rm the
           // whole tmpdir. Use require to avoid widening the top imports.
           // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const { symlinkSync } = require('node:fs') as typeof import('node:fs');
+          const { symlinkSync } = nodeRequire('node:fs') as typeof import('node:fs');
           symlinkSync(realAuth, join(codexHome, 'auth.json'));
         }
       } catch (err) {
@@ -1056,7 +1062,7 @@ export async function* runAgentChat(
         if (!existsSync(modelPath)) continue;
         try {
           // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const yaml = require('yaml') as typeof import('yaml');
+          const yaml = nodeRequire('yaml') as typeof import('yaml');
           const isJson = modelFile.endsWith('.json');
           const raw = readFileSync(modelPath, 'utf8');
           const parsed = (isJson ? JSON.parse(raw) : yaml.parse(raw)) as
@@ -1111,7 +1117,7 @@ export async function* runAgentChat(
         const configPath = join(ompAgentDir, 'config.yml');
         if (existsSync(configPath)) {
           // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const yaml = require('yaml') as typeof import('yaml');
+          const yaml = nodeRequire('yaml') as typeof import('yaml');
           const parsed = (yaml.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown> | null) ?? {};
           const tools = (parsed.tools ??= {} as Record<string, unknown>) as Record<string, unknown>;
           tools.discoveryMode = 'off';
