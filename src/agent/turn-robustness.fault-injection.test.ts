@@ -299,3 +299,79 @@ test('RB-010 SLO — the GOVERNED caller keeps 429-rate low AND throughput near 
   // (d) header AUTO-TUNE works: the governor learned the real RPM from the success headers.
   assert.equal(governed.state.limits.rpm, LIMIT);
 });
+
+// --- ACCEPTANCE (rate-limit-layer-v2-2026-06-05 P-022) -----------------------------------------
+// A simulated 429 backs off the FLEET, not just the tripping agent: two INDEPENDENT callers
+// share one (provider, modelClass) bucket from the registry; caller A's 429 penalty parks the
+// shared budget, so caller B — which never saw a 429 — waits out the same reset before its
+// turn runs. The registry-level AIMD (D-005) also halves the fleet's effective concurrency.
+import {
+  getGovernor,
+  resetGovernorRegistry,
+  setGlobalConcurrencyCap,
+  setGlobalConcurrencyFloor,
+  effectiveConcurrencySnapshot,
+} from './governor-registry';
+
+test('ACCEPTANCE P-022 — a 429 on ONE agent backs off the WHOLE fleet via the shared bucket; AIMD halves eff', async () => {
+  resetGovernorRegistry();
+  setGlobalConcurrencyCap(8); // activates AIMD (eff starts at 8)
+  setGlobalConcurrencyFloor(1);
+  try {
+    const clock = fakeClock(0);
+    // BOTH callers resolve the SAME shared singleton bucket — the fleet path.
+    const gov = getGovernor('anthropic', 'opus', { now: clock.now, sleep: clock.sleep });
+
+    // Caller A trips a 429 with a 60s retry-after, recovers on retry.
+    let aAttempts = 0;
+    const a = await runAgentTurn<string>(
+      { backend: 'meridian', maxAttempts: 3 }, // HTTP-shaped raw → the meridian classifier
+      {
+        governor: gov,
+        now: clock.now,
+        sleep: clock.sleep,
+        runOnce: async (): Promise<TurnOutcome<string>> => {
+          aAttempts++;
+          if (aAttempts === 1) {
+            return { ok: false, raw: { status: 429, headers: { 'retry-after': '60' }, message: '429 too many requests' } };
+          }
+          return { ok: true, value: 'a-recovered' };
+        },
+      },
+    );
+    assert.equal(a.ok, true);
+    assert.ok(clock.t >= 60_000, `A waited out its own retry-after (t=${clock.t})`);
+
+    // AIMD: the account-wide penalty halved the fleet's effective concurrency (8 → 4).
+    assert.equal(effectiveConcurrencySnapshot().effective, 4);
+
+    // Caller B — a DIFFERENT agent that never saw a 429 — must also have been held by the
+    // shared pause had it started during the penalty window. Re-penalize and prove it.
+    gov.penalize({ retryAfterMs: 30_000 }); // a fresh fleet-wide pause at t≈60s+
+    const pauseSetAt = clock.t;
+    let bRan = 0;
+    const b = await runAgentTurn<string>(
+      { backend: 'meridian', maxAttempts: 2 },
+      {
+        governor: gov, // the SAME shared bucket
+        now: clock.now,
+        sleep: clock.sleep,
+        runOnce: async (): Promise<TurnOutcome<string>> => {
+          bRan = clock.t;
+          return { ok: true, value: 'b-clean' };
+        },
+      },
+    );
+    assert.equal(b.ok, true);
+    assert.ok(
+      bRan - pauseSetAt >= 30_000,
+      `B (clean caller) waited out the FLEET pause set by the other agent: waited ${bRan - pauseSetAt}ms`,
+    );
+    // The second distinct penalty halved eff again (4 → 2).
+    assert.equal(effectiveConcurrencySnapshot().effective, 2);
+  } finally {
+    resetGovernorRegistry();
+    setGlobalConcurrencyCap(undefined);
+    setGlobalConcurrencyFloor(undefined);
+  }
+});
