@@ -33,9 +33,8 @@
  * Cancellation: pass a signal; spawn is killed on abort.
  */
 
-import { createRequire } from 'node:module';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 // Agent-turn robustness (opt-in via PAPERCUSP_AGENT_GOVERNOR=1). These modules are pure +
@@ -43,11 +42,6 @@ import { basename, join } from 'node:path';
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
 import { governorForBackend, BACKEND_PROFILES } from './governor-registry';
 import { classifyTurnError, type TurnBackend, type TurnError } from './turn-error';
-
-// This package is `"type": "module"`; ESM has no ambient `require`. The lazy
-// loads below (heavy/optional deps + node builtins, deferred to call time)
-// use this synchronous loader.
-const nodeRequire = createRequire(import.meta.url);
 
 /** Default cap on a CLI spawn's wait for a shared-governor permit (RB-012). Long enough to
     wait out a normal 429's retry-after, short enough that a multi-hour subscription lockout
@@ -527,10 +521,12 @@ async function* meridianAgentChat(
     return;
   }
 
-  // Lazy-load the SDK so consumers that never use this path don't pay the
-  // import cost.
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const sdkMod = nodeRequire('@anthropic-ai/sdk') as { default?: unknown } | unknown;
+  // Lazy-load the SDK so consumers that never use this path don't pay the import
+  // cost. Dynamic `import()` (not a static top-level import) keeps it lazy, stays
+  // inlinable by the desktop sidecar's esbuild bundle, and resolves the class off
+  // the module namespace at runtime — avoiding the ESM↔CJS named-import linking
+  // failure under tsx (operator-core is `"type": "module"`).
+  const sdkMod = await import('@anthropic-ai/sdk');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const Anthropic: any = (sdkMod as { default?: unknown }).default ?? sdkMod;
 
@@ -839,8 +835,6 @@ export async function* runAgentChat(
       try {
         const realCreds = join(homedir(), '.claude', '.credentials.json');
         if (existsSync(realCreds)) {
-          // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const { symlinkSync } = nodeRequire('node:fs') as typeof import('node:fs');
           symlinkSync(realCreds, join(claudeConfigDir, '.credentials.json'));
         }
       } catch (err) {
@@ -884,10 +878,6 @@ export async function* runAgentChat(
       try {
         const realAuth = join(homedir(), '.codex', 'auth.json');
         if (existsSync(realAuth)) {
-          // node:fs symlink — relative cleanup is fine since we rm the
-          // whole tmpdir. Use require to avoid widening the top imports.
-          // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const { symlinkSync } = nodeRequire('node:fs') as typeof import('node:fs');
           symlinkSync(realAuth, join(codexHome, 'auth.json'));
         }
       } catch (err) {
@@ -1061,8 +1051,7 @@ export async function* runAgentChat(
         const modelPath = join(ompAgentDir, modelFile);
         if (!existsSync(modelPath)) continue;
         try {
-          // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const yaml = nodeRequire('yaml') as typeof import('yaml');
+          const yaml = await import('yaml');
           const isJson = modelFile.endsWith('.json');
           const raw = readFileSync(modelPath, 'utf8');
           const parsed = (isJson ? JSON.parse(raw) : yaml.parse(raw)) as
@@ -1116,8 +1105,7 @@ export async function* runAgentChat(
       try {
         const configPath = join(ompAgentDir, 'config.yml');
         if (existsSync(configPath)) {
-          // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const yaml = nodeRequire('yaml') as typeof import('yaml');
+          const yaml = await import('yaml');
           const parsed = (yaml.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown> | null) ?? {};
           const tools = (parsed.tools ??= {} as Record<string, unknown>) as Record<string, unknown>;
           tools.discoveryMode = 'off';
