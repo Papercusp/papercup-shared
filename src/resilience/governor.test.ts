@@ -14,9 +14,25 @@ import {
   RateLimitGovernor,
   type GovernorState,
   type GovernorLimits,
+  type GlobalConcurrencyGate,
 } from './governor';
 
 const MIN = 60_000;
+
+/** A tiny in-memory fleet-wide gate for the D-004 tests. */
+function fakeGate(cap: number): GlobalConcurrencyGate {
+  let inFlight = 0;
+  return {
+    tryAcquire() {
+      if (inFlight >= cap) return false;
+      inFlight += 1;
+      return true;
+    },
+    release() {
+      inFlight = Math.max(0, inFlight - 1);
+    },
+  };
+}
 
 // --- concurrency cap ---
 test('decideAcquire — denies once at maxConcurrent, allows after release', () => {
@@ -164,6 +180,42 @@ test('RateLimitGovernor.acquire — returns null when the abort signal is alread
   ac.abort();
   const r = await g.acquire({}, { signal: ac.signal });
   assert.equal(r, null);
+});
+
+// --- D-004: fleet-wide global concurrency gate (the user's live maxSimultaneousAgents) ---
+test('RateLimitGovernor.acquire — globalGate caps total in-flight BELOW the bucket maxConcurrent', async () => {
+  let clock = 0;
+  const gate = fakeGate(2);
+  const g = new RateLimitGovernor({ maxConcurrent: 10 }, { now: () => clock, sleep: async (ms) => { clock += ms; }, globalGate: gate });
+  const r1 = await g.acquire({});
+  const r2 = await g.acquire({});
+  assert.ok(r1 && r2);
+  let third = false;
+  const p = g.acquire({}).then((r) => { third = true; return r; });
+  await Promise.resolve();
+  assert.equal(third, false); // fleet cap (2) reached even though the bucket allows 10
+  r1!();
+  const r3 = await p;
+  assert.equal(third, true); // a release frees a fleet slot
+  if (r3) r3();
+});
+test('RateLimitGovernor.acquire — two buckets SHARE one globalGate → cross-bucket fleet cap', async () => {
+  let clock = 0;
+  const gate = fakeGate(2);
+  const mk = () => new RateLimitGovernor({ maxConcurrent: 10 }, { now: () => clock, sleep: async (ms) => { clock += ms; }, globalGate: gate });
+  const a = mk();
+  const b = mk();
+  const r1 = await a.acquire({}); // bucket A
+  const r2 = await b.acquire({}); // bucket B → 2 total across buckets
+  assert.ok(r1 && r2);
+  let third = false;
+  const p = a.acquire({}).then((r) => { third = true; return r; });
+  await Promise.resolve();
+  assert.equal(third, false); // the fleet total (2) is reached regardless of which bucket
+  r2!(); // releasing in bucket B frees a global slot for bucket A
+  const r3 = await p;
+  assert.equal(third, true);
+  if (r3) r3();
 });
 
 // --- RB-010: the "does pacing work" SLO — peak in-flight never exceeds maxConcurrent

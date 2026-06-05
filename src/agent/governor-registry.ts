@@ -13,7 +13,7 @@
  * them up from the provider's `*-ratelimit-*-limit` headers when available (API-key paths).
  */
 import type { TurnBackend, TurnProvider } from './turn-error';
-import { RateLimitGovernor, type GovernorLimits, type GovernorDeps, type GovernorState, type GovernorPauseEvent, type GovernorStore } from '../resilience/governor';
+import { RateLimitGovernor, type GovernorLimits, type GovernorDeps, type GovernorState, type GovernorPauseEvent, type GovernorStore, type GlobalConcurrencyGate } from '../resilience/governor';
 
 export type LimitModel = 'subscription' | 'apiKey';
 
@@ -74,6 +74,37 @@ const DEFAULT_FLOORS: Record<TurnProvider, GovernorLimits> = {
 
 const registry = new Map<string, RateLimitGovernor>();
 
+// --- Fleet-wide concurrency cap (rate-limit-layer-v2 D-004) ------------------------------------
+// A single shared counter + cap that EVERY governor consults on top of its own per-bucket
+// maxConcurrent, so the TOTAL concurrent agents across all (provider,modelClass) buckets is
+// bounded by the user's live `maxSimultaneousAgents`. The host (operator-core) pushes the live
+// value via setGlobalConcurrencyCap() — read by the governor IMMEDIATELY (next acquire), no
+// restart. Default Infinity = unbounded (legacy behavior; tests that don't set a cap are
+// byte-identical). The gate object is shared by reference into every governor the registry makes.
+let globalCap = Infinity;
+let globalInFlight = 0;
+const globalGate: GlobalConcurrencyGate = {
+  tryAcquire() {
+    if (globalInFlight >= globalCap) return false;
+    globalInFlight += 1;
+    return true;
+  },
+  release() {
+    globalInFlight = Math.max(0, globalInFlight - 1);
+  },
+};
+
+/** Set the fleet-wide concurrent-agent cap (the user's live `maxSimultaneousAgents`). `undefined`
+    or ≤0 clears it (Infinity = unbounded). Honored by the very next `acquire` across all buckets. */
+export function setGlobalConcurrencyCap(n: number | undefined): void {
+  globalCap = typeof n === 'number' && n > 0 ? n : Infinity;
+}
+
+/** The live fleet-wide cap + current total in-flight — surfaced by the rate read-model / top-bar. */
+export function globalConcurrencySnapshot(): { cap: number; inFlight: number } {
+  return { cap: globalCap, inFlight: globalInFlight };
+}
+
 // Cross-process shared-budget store (RB-007). When set (by the operator at boot, behind a flag),
 // every NEW governor routes its rate+pause budget through it so the whole fleet + gym + this dev
 // session share ONE account budget. Concurrency stays per-process. Default unset = in-memory.
@@ -122,6 +153,8 @@ export function getGovernor(provider: TurnProvider, modelClass: string, deps?: G
       { ...DEFAULT_FLOORS[provider] },
       {
         ...deps,
+        // Fleet-wide cap (D-004): share the registry's one global gate unless a test injects its own.
+        globalGate: deps?.globalGate ?? globalGate,
         // Bind the cross-process store (RB-007) unless the caller injected its own (tests do).
         ...(deps?.store ? {} : sharedStore ? { store: sharedStore, storeKey: key } : {}),
         onPause: (ev) => {
@@ -169,7 +202,9 @@ export function governorForBackend(backend: TurnBackend, model: string, deps?: G
   return getGovernor(p.provider, p.selfPacing ? 'self' : modelClassOf(model), deps);
 }
 
-/** Test hook — drop all singletons. */
+/** Test hook — drop all singletons + reset the fleet-wide in-flight counter (cap is left as set;
+    call setGlobalConcurrencyCap(undefined) to also clear the cap). */
 export function resetGovernorRegistry(): void {
   registry.clear();
+  globalInFlight = 0;
 }

@@ -43,12 +43,14 @@ export {
   snapshotGovernors,
   resetGovernorRegistry,
   setGovernorStore,
+  setGlobalConcurrencyCap,
+  globalConcurrencySnapshot,
   type BackendProfile,
   type LimitModel,
   type GovernorSnapshot,
   type GovernorPauseListener,
 } from './governor-registry';
-export type { GovernorPauseEvent, GovernorState, GovernorStore, GovernorLimits } from '../resilience/governor';
+export type { GovernorPauseEvent, GovernorState, GovernorStore, GovernorLimits, GlobalConcurrencyGate } from '../resilience/governor';
 export {
   runAgentTurn,
   type TurnOutcome,

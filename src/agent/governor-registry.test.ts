@@ -14,9 +14,14 @@ import {
   resolveProviderLimitModel,
   onGovernorPause,
   snapshotGovernors,
+  setGlobalConcurrencyCap,
+  globalConcurrencySnapshot,
 } from './governor-registry';
 
-beforeEach(() => resetGovernorRegistry());
+beforeEach(() => {
+  resetGovernorRegistry();
+  setGlobalConcurrencyCap(undefined); // clear any fleet cap a prior test set
+});
 
 test('BACKEND_PROFILES — provider + self-pacing per backend', () => {
   assert.equal(BACKEND_PROFILES.meridian.provider, 'anthropic');
@@ -71,6 +76,41 @@ test('governorForBackend — claude (meridian + CLI) share the Anthropic bucket 
   const mer = governorForBackend('meridian', 'claude-opus-4-8');
   const cli = governorForBackend('claude-code', 'claude-opus-4-8');
   assert.equal(mer, cli); // same provider+class → one shared budget (don't co-burst the account)
+});
+
+// D-004: the fleet-wide concurrency cap is shared across every registry bucket -----------
+test('setGlobalConcurrencyCap — bounds TOTAL in-flight across separate (provider,modelClass) buckets', async () => {
+  setGlobalConcurrencyCap(2); // the user drops "maxSimultaneousAgents" to 2
+  const opus = getGovernor('anthropic', 'opus');
+  const codex = getGovernor('openai', 'default'); // a DIFFERENT bucket
+  const r1 = await opus.acquire({});
+  const r2 = await codex.acquire({}); // 1 in each bucket → 2 total, fleet cap reached
+  assert.ok(r1 && r2);
+  assert.equal(globalConcurrencySnapshot().inFlight, 2);
+  let third = false;
+  const p = opus.acquire({}).then((r) => { third = true; return r; });
+  await Promise.resolve();
+  assert.equal(third, false); // a 3rd agent (any bucket) is blocked by the fleet cap
+  r2!(); // free a fleet slot from the codex bucket
+  const r3 = await p;
+  assert.equal(third, true); // now the opus acquire proceeds
+  if (r3) r3();
+  assert.equal(globalConcurrencySnapshot().cap, 2);
+});
+test('setGlobalConcurrencyCap — a live raise is honored on the NEXT acquire (no restart)', async () => {
+  setGlobalConcurrencyCap(1);
+  const g = getGovernor('anthropic', 'sonnet');
+  const r1 = await g.acquire({});
+  assert.ok(r1);
+  let second = false;
+  const p = g.acquire({}).then((r) => { second = true; return r; });
+  await Promise.resolve();
+  assert.equal(second, false); // cap 1 → blocked
+  setGlobalConcurrencyCap(2); // user raises the cap live
+  const r2 = await p; // the pending acquire now proceeds without a release
+  assert.equal(second, true);
+  if (r1) r1();
+  if (r2) r2();
 });
 
 // RB-009 observability ------------------------------------------------------------------

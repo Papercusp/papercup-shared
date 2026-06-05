@@ -237,6 +237,21 @@ export interface GovernorStore {
   transact(key: string, floor: GovernorLimits, mutate: (s: GovernorState) => void): Promise<GovernorState>;
 }
 
+/**
+ * Fleet-wide concurrency gate (rate-limit-layer-v2 D-004). A single shared counter+cap that
+ * EVERY governor consults on top of its own per-bucket `maxConcurrent`, so the TOTAL in-flight
+ * turns across all `(provider, modelClass)` buckets is bounded by the user's live
+ * `maxSimultaneousAgents`. The same gate object is injected into every governor (by the
+ * registry) so they share one counter. Domain-free: the governor knows only "ask before a slot,
+ * give it back on release". Omit = no global cap (per-bucket behavior, byte-identical to before).
+ */
+export interface GlobalConcurrencyGate {
+  /** Atomically take a global slot iff total in-flight < cap; false if the fleet cap is reached. */
+  tryAcquire(): boolean;
+  /** Return a global slot (paired 1:1 with a successful tryAcquire). */
+  release(): void;
+}
+
 export interface GovernorDeps {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -246,6 +261,8 @@ export interface GovernorDeps {
   store?: GovernorStore;
   /** Bucket key for the store (e.g. "anthropic:opus"). Required when `store` is set. */
   storeKey?: string;
+  /** Fleet-wide concurrency gate (D-004) shared across all buckets. Omit = no global cap. */
+  globalGate?: GlobalConcurrencyGate;
 }
 
 export interface AcquireOpts {
@@ -264,6 +281,7 @@ export class RateLimitGovernor {
   private readonly onPause?: (ev: GovernorPauseEvent) => void;
   private readonly store?: GovernorStore;
   private readonly storeKey?: string;
+  private readonly globalGate?: GlobalConcurrencyGate;
   private readonly floor: GovernorLimits;
 
   constructor(limits: GovernorLimits, deps: GovernorDeps = {}) {
@@ -274,6 +292,7 @@ export class RateLimitGovernor {
     this.onPause = deps.onPause;
     this.store = deps.store;
     this.storeKey = deps.storeKey;
+    this.globalGate = deps.globalGate;
     if (this.store && !this.storeKey) throw new Error('RateLimitGovernor: storeKey is required when a store is set');
   }
 
@@ -327,6 +346,7 @@ export class RateLimitGovernor {
         if (released) return;
         released = true;
         recordRelease(this.state);
+        this.globalGate?.release(); // give the fleet-wide slot back too (D-004)
       };
     };
     for (;;) {
@@ -337,14 +357,23 @@ export class RateLimitGovernor {
         // increment) so concurrency stays atomic under many interleaved callers.
         d = decideAcquire(this.state, this.now(), est);
         if (d.allowed) {
-          recordAcquire(this.state, this.now(), est);
-          return mkRelease();
+          // Fleet-wide cap (D-004): this bucket has room AND rate budget — now take a global slot.
+          // If the fleet is at its cap, wait + re-poll (don't charge the bucket). Released in mkRelease.
+          if (this.globalGate && !this.globalGate.tryAcquire()) {
+            d = { allowed: false, waitMs: CONCURRENCY_POLL_MS, reason: 'concurrency' };
+          } else {
+            recordAcquire(this.state, this.now(), est);
+            return mkRelease();
+          }
         }
       } else {
         // CROSS-PROCESS path (RB-007): concurrency is local; reserve the slot atomically (right
         // after the sync check, before any await), then run the RATE gate against the shared row.
         const c = decideConcurrency(this.state);
-        if (c.allowed) {
+        if (c.allowed && this.globalGate && !this.globalGate.tryAcquire()) {
+          // Bucket has room but the fleet-wide cap is reached (D-004) → wait, charge nothing.
+          d = { allowed: false, waitMs: CONCURRENCY_POLL_MS, reason: 'concurrency' };
+        } else if (c.allowed) {
           this.state.inFlight += 1; // reserve the local concurrency slot now
           let rateAllowed = false;
           let rateWait = CONCURRENCY_POLL_MS;
@@ -357,7 +386,10 @@ export class RateLimitGovernor {
             });
             this.syncSharedInto(shared);
           } finally {
-            if (!rateAllowed) this.state.inFlight -= 1; // give the reservation back on a rate denial
+            if (!rateAllowed) {
+              this.state.inFlight -= 1; // give the reservation back on a rate denial
+              this.globalGate?.release(); // and the fleet-wide slot taken just above (D-004)
+            }
           }
           if (rateAllowed) return mkRelease();
           d = { allowed: false, waitMs: rateWait };
