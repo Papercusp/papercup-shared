@@ -15,12 +15,16 @@ import {
   onGovernorPause,
   snapshotGovernors,
   setGlobalConcurrencyCap,
+  setGlobalConcurrencyFloor,
   globalConcurrencySnapshot,
+  effectiveConcurrencySnapshot,
+  AIMD_CLEAN_TURNS_PER_STEP,
 } from './governor-registry';
 
 beforeEach(() => {
   resetGovernorRegistry();
-  setGlobalConcurrencyCap(undefined); // clear any fleet cap a prior test set
+  setGlobalConcurrencyCap(undefined); // clear any fleet cap a prior test set (also resets AIMD)
+  setGlobalConcurrencyFloor(undefined);
 });
 
 test('BACKEND_PROFILES — provider + self-pacing per backend', () => {
@@ -148,4 +152,90 @@ test('snapshotGovernors — reports each live bucket with its pause + concurrenc
   assert.ok(opus!.state.pausedUntil > 0);
   assert.equal(typeof opus!.state.inFlight, 'number');
   assert.ok(opus!.limitModel === 'subscription' || opus!.limitModel === 'apiKey'); // D-006 runtime fact
+});
+
+// --- AIMD adaptive concurrency (rate-limit-layer-v2 D-005 / P-015..P-017) ---------------------
+// The registry's global gate runs an effective concurrency eff ≤ cap: +1 per
+// AIMD_CLEAN_TURNS_PER_STEP clean turns, halved toward the floor on a distinct account-wide
+// penalty. Driven end-to-end through real governors (acquire/release/penalize), fake clock.
+
+function aimdDeps() {
+  let clock = 0;
+  return {
+    now: () => clock,
+    sleep: async (ms: number) => {
+      clock += ms;
+    },
+  };
+}
+
+test('AIMD — eff starts at the cap; a distinct 429 halves it; clean turns ramp it back +1 per N', async () => {
+  setGlobalConcurrencyCap(4);
+  setGlobalConcurrencyFloor(1);
+  const deps = aimdDeps();
+  const g = getGovernor('anthropic', 'opus', deps);
+  assert.equal(effectiveConcurrencySnapshot().effective, 4); // starts at the cap
+
+  g.penalize({ retryAfterMs: 1_000 }); // extends the pause → one multiplicative decrease
+  assert.equal(effectiveConcurrencySnapshot().effective, 2);
+
+  // 5 clean turns (fake clock skips the pause) → +1.
+  for (let i = 0; i < AIMD_CLEAN_TURNS_PER_STEP; i++) (await g.acquire({}))!();
+  assert.equal(effectiveConcurrencySnapshot().effective, 3);
+  // 5 more → back at the cap; 5 more → NEVER exceeds the cap.
+  for (let i = 0; i < AIMD_CLEAN_TURNS_PER_STEP * 2; i++) (await g.acquire({}))!();
+  assert.equal(effectiveConcurrencySnapshot().effective, 4);
+});
+
+test('AIMD — eff never drops below the floor', () => {
+  setGlobalConcurrencyCap(8);
+  setGlobalConcurrencyFloor(3);
+  const g = getGovernor('anthropic', 'sonnet', aimdDeps());
+  g.penalize({ retryAfterMs: 1_000 }); // 8 → 4
+  assert.equal(effectiveConcurrencySnapshot().effective, 4);
+  g.penalize({ retryAfterMs: 5_000 }); // extends again: 4 → floor(2) → clamped to floor 3
+  assert.equal(effectiveConcurrencySnapshot().effective, 3);
+  g.penalize({ retryAfterMs: 60_000 }); // and stays at the floor
+  assert.equal(effectiveConcurrencySnapshot().effective, 3);
+});
+
+test('AIMD — duplicate penalties on the SAME backpressure event halve only once', () => {
+  setGlobalConcurrencyCap(8);
+  setGlobalConcurrencyFloor(1);
+  const g = getGovernor('anthropic', 'haiku', aimdDeps());
+  g.penalize({ resetAt: 60_000 }); // distinct event → 8 → 4
+  g.penalize({ resetAt: 60_000 }); // same reset, no extension → NOT another halve
+  g.penalize({ retryAfterMs: 1 }); // shorter than the standing pause → no extension either
+  assert.equal(effectiveConcurrencySnapshot().effective, 4);
+});
+
+test('AIMD — reacts within one acquire to a lowered cap (eff clamps; the gate honors it now)', async () => {
+  setGlobalConcurrencyCap(4);
+  const deps = aimdDeps();
+  const a = getGovernor('anthropic', 'opus', deps);
+  const r1 = await a.acquire({});
+  const r2 = await a.acquire({});
+  assert.ok(r1 && r2);
+  setGlobalConcurrencyCap(2); // the user drops the fleet cap mid-flight
+  assert.equal(effectiveConcurrencySnapshot().effective, 2);
+  let third = false;
+  const p = a.acquire({}, { maxWaitMs: 2_000 }).then((r) => {
+    third = r !== null;
+    return r;
+  });
+  await Promise.resolve();
+  const r3 = await p; // 2 already in flight ≥ new cap 2 → must NOT be granted before a release
+  assert.equal(third, false);
+  assert.equal(r3, null);
+  r1!();
+  r2!();
+});
+
+test('AIMD — inactive (effective null, no adaptation) until a finite cap is installed', async () => {
+  assert.equal(effectiveConcurrencySnapshot().effective, null);
+  const g = getGovernor('anthropic', 'opus', aimdDeps());
+  g.penalize({ retryAfterMs: 1_000 }); // no cap → nothing to halve
+  assert.equal(effectiveConcurrencySnapshot().effective, null);
+  (await g.acquire({}))!(); // clean turn → still inactive, no crash
+  assert.equal(effectiveConcurrencySnapshot().effective, null);
 });

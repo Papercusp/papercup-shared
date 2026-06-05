@@ -326,3 +326,131 @@ test('RateLimitGovernor.snapshot — returns an independent copy of the state', 
   snap.limits.rpm = 999; // mutating the copy must not affect the live state
   assert.equal(g.state.limits.rpm, 10);
 });
+
+// --- Cascade-aware staggered resume (rate-limit-layer-v2 D-006 / P-018..P-019) -----------------
+// Waiters parked on ONE pause wake with ORDERED per-waiter offsets (ticket × 250ms, ≤ 5s) so the
+// fleet re-enters spread over a bounded window instead of re-stampeding the limit at the reset
+// instant. Virtual-clock scheduler: sleepers wake only when time is advanced past their deadline.
+
+function virtualClock() {
+  let t = 0;
+  const sleepers: Array<{ until: number; resolve: () => void }> = [];
+  const drain = async () => {
+    // Let woken promises run their continuations (a few microtask turns + a macrotask).
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+  };
+  return {
+    now: () => t,
+    sleep: (ms: number) =>
+      new Promise<void>((resolve) => {
+        sleepers.push({ until: t + ms, resolve });
+      }),
+    /** All currently-parked wake deadlines (epoch ms), in arrival order. */
+    pending: () => sleepers.map((s) => s.until),
+    async advanceTo(to: number) {
+      t = to;
+      for (let i = sleepers.length - 1; i >= 0; i--) {
+        if (sleepers[i].until <= t) {
+          const [s] = sleepers.splice(i, 1);
+          s.resolve();
+        }
+      }
+      await drain();
+    },
+    drain,
+  };
+}
+
+test('staggered resume — N waiters on one pause wake SPREAD OUT and ordered, not simultaneously (D-006)', async () => {
+  const vc = virtualClock();
+  const g = new RateLimitGovernor({ maxConcurrent: 10 }, { now: vc.now, sleep: vc.sleep });
+  g.penalize({ retryAfterMs: 10_000 }); // bucket paused until t=10000
+
+  const grantedAt: number[] = [];
+  const mk = () =>
+    g.acquire({}).then((release) => {
+      grantedAt.push(vc.now());
+      release?.();
+    });
+  const p1 = mk();
+  await vc.drain(); // let waiter 1 park (ticket 0)
+  const p2 = mk();
+  await vc.drain(); // ticket 1
+  const p3 = mk();
+  await vc.drain(); // ticket 2
+
+  // Each waiter parked with a DISTINCT ordered deadline: reset + ticket×250ms.
+  const parked = vc.pending().slice().sort((a, b) => a - b);
+  assert.deepEqual(parked, [10_000, 10_250, 10_500]);
+  assert.ok(parked[parked.length - 1] - parked[0] <= 5_000, 'spread stays within the bounded window');
+
+  await vc.advanceTo(10_000);
+  await vc.advanceTo(10_250);
+  await vc.advanceTo(10_500);
+  await Promise.all([p1, p2, p3]);
+  assert.equal(grantedAt.length, 3); // everyone got in — staggered, none starved
+  assert.ok(new Set(grantedAt).size > 1, `wakes must not all land on one instant: ${grantedAt.join(',')}`);
+});
+
+test('staggered resume — a NEW pause epoch resets the tickets (no unbounded drift)', async () => {
+  const vc = virtualClock();
+  const g = new RateLimitGovernor({ maxConcurrent: 10 }, { now: vc.now, sleep: vc.sleep });
+  g.penalize({ retryAfterMs: 1_000 });
+  const p1 = g.acquire({}).then((r) => r?.());
+  await vc.drain();
+  assert.deepEqual(vc.pending(), [1_000]); // first epoch, ticket 0 → no offset
+  await vc.advanceTo(1_000);
+  await p1;
+
+  g.penalize({ retryAfterMs: 1_000 }); // SECOND distinct pause (until t=2000)
+  const p2 = g.acquire({}).then((r) => r?.());
+  await vc.drain();
+  assert.deepEqual(vc.pending(), [2_000]); // tickets restarted → first waiter again has no offset
+  await vc.advanceTo(2_000);
+  await p2;
+});
+
+// --- AIMD turn-health feedback (D-005): the governor reports clean releases + distinct penalties
+test('AIMD hooks — clean release fires noteClean; an in-flight penalty suppresses it; notePenalty once per distinct event', async () => {
+  let clean = 0;
+  let penalty = 0;
+  let inFlight = 0;
+  const gate: GlobalConcurrencyGate = {
+    tryAcquire() {
+      inFlight += 1;
+      return true;
+    },
+    release() {
+      inFlight -= 1;
+    },
+    noteClean() {
+      clean += 1;
+    },
+    notePenalty() {
+      penalty += 1;
+    },
+  };
+  let clock = 0;
+  const g = new RateLimitGovernor(
+    { maxConcurrent: 5 },
+    { now: () => clock, sleep: async (ms) => { clock += ms; }, globalGate: gate },
+  );
+
+  (await g.acquire({}))!(); // clean turn
+  assert.equal(clean, 1);
+
+  const r = await g.acquire({});
+  g.penalize({ retryAfterMs: 1_000 }); // penalty lands while the turn is in flight
+  r!();
+  assert.equal(clean, 1, 'a turn overlapping a penalty is NOT clean');
+  assert.equal(penalty, 1);
+
+  g.penalize({ retryAfterMs: 1 }); // does not extend the standing pause → same event, no re-halve
+  assert.equal(penalty, 1);
+
+  clock = 60_000; // pause long expired
+  (await g.acquire({}))!(); // healthy again → clean turns resume
+  assert.equal(clean, 2);
+  assert.equal(inFlight, 0); // all global slots returned
+});

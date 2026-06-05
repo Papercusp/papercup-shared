@@ -83,26 +83,81 @@ const registry = new Map<string, RateLimitGovernor>();
 // byte-identical). The gate object is shared by reference into every governor the registry makes.
 let globalCap = Infinity;
 let globalInFlight = 0;
+
+// --- AIMD adaptive concurrency (rate-limit-layer-v2 D-005) -------------------------------------
+// The user's cap is the HARD ceiling; the gate runs an EFFECTIVE concurrency `eff ≤ cap` that
+// additively increases (+1 per N consecutive clean turns) and multiplicatively decreases (halve
+// toward the floor) on an account-wide penalty — so the fleet self-throttles to the safe level
+// under the user's max instead of slamming the cap into a 429 wall. Inactive (eff undefined,
+// legacy-identical) until a finite cap is installed; headers govern RATE, this governs CONCURRENCY.
+export const AIMD_CLEAN_TURNS_PER_STEP = 5;
+let globalFloor = 1;
+let aimdEff: number | undefined;
+let aimdCleanStreak = 0;
+
 const globalGate: GlobalConcurrencyGate = {
   tryAcquire() {
-    if (globalInFlight >= globalCap) return false;
+    const limit = Math.min(globalCap, aimdEff ?? Infinity);
+    if (globalInFlight >= limit) return false;
     globalInFlight += 1;
     return true;
   },
   release() {
     globalInFlight = Math.max(0, globalInFlight - 1);
   },
+  noteClean() {
+    if (aimdEff === undefined) return; // AIMD inactive without a finite cap
+    aimdCleanStreak += 1;
+    if (aimdCleanStreak >= AIMD_CLEAN_TURNS_PER_STEP) {
+      aimdCleanStreak = 0;
+      if (aimdEff < globalCap) aimdEff += 1; // additive increase, never past the live cap
+    }
+  },
+  notePenalty() {
+    aimdCleanStreak = 0;
+    if (aimdEff === undefined) return;
+    aimdEff = Math.max(globalFloor, Math.floor(aimdEff / 2)); // multiplicative decrease to floor
+  },
 };
 
 /** Set the fleet-wide concurrent-agent cap (the user's live `maxSimultaneousAgents`). `undefined`
-    or ≤0 clears it (Infinity = unbounded). Honored by the very next `acquire` across all buckets. */
+    or ≤0 clears it (Infinity = unbounded, AIMD inactive). Honored by the very next `acquire`
+    across all buckets; the AIMD effective concurrency starts at the cap and adapts under it. */
 export function setGlobalConcurrencyCap(n: number | undefined): void {
-  globalCap = typeof n === 'number' && n > 0 ? n : Infinity;
+  if (typeof n === 'number' && n > 0) {
+    const prevCap = globalCap;
+    globalCap = n;
+    // The user's edit is honored LIVE: when eff is not adapted-down (fresh, or sitting at the old
+    // cap) it follows the edit in both directions. Only a penalty-adapted eff (< old cap) holds
+    // its safe level on a raise and ramps up via clean turns.
+    if (aimdEff === undefined || !Number.isFinite(prevCap) || aimdEff >= prevCap) {
+      aimdEff = n;
+    } else {
+      aimdEff = Math.min(aimdEff, n);
+    }
+    if (aimdEff < globalFloor) aimdEff = Math.min(globalFloor, globalCap);
+  } else {
+    globalCap = Infinity;
+    aimdEff = undefined;
+    aimdCleanStreak = 0;
+  }
+}
+
+/** Set the AIMD floor (D-005) — the effective concurrency never adapts below it. */
+export function setGlobalConcurrencyFloor(n: number | undefined): void {
+  globalFloor = typeof n === 'number' && n >= 1 ? Math.floor(n) : 1;
+  if (aimdEff !== undefined && aimdEff < globalFloor) aimdEff = Math.min(globalFloor, globalCap);
 }
 
 /** The live fleet-wide cap + current total in-flight — surfaced by the rate read-model / top-bar. */
 export function globalConcurrencySnapshot(): { cap: number; inFlight: number } {
   return { cap: globalCap, inFlight: globalInFlight };
+}
+
+/** The AIMD view (D-005): the adapted effective concurrency under the cap (null = AIMD inactive,
+    i.e. no finite cap installed), the floor it never drops below, and the current clean streak. */
+export function effectiveConcurrencySnapshot(): { effective: number | null; floor: number; cleanStreak: number } {
+  return { effective: aimdEff ?? null, floor: globalFloor, cleanStreak: aimdCleanStreak };
 }
 
 // Cross-process shared-budget store (RB-007). When set (by the operator at boot, behind a flag),

@@ -64,6 +64,12 @@ export interface AcquireDecision {
 
 const WINDOW_MS = 60_000;
 const CONCURRENCY_POLL_MS = 250; // we don't know when a peer releases → short re-poll
+// Cascade-aware staggered resume (rate-limit-layer-v2 D-006): waiters parked on one pause get
+// ORDERED per-waiter offsets so they wake spread over a bounded window instead of re-stampeding
+// the limit at the same `pausedUntil` instant. Deterministic (ticket × step, capped) — testable
+// with a fake clock and no Math.random.
+const RESUME_STAGGER_STEP_MS = 250;
+const RESUME_STAGGER_MAX_MS = 5_000;
 // "Slow as remaining drops" knobs (review #7/#8). Below this fraction of a dimension's limit we
 // start spreading the remaining budget over the time-to-reset; the per-acquire gap is capped so
 // soft pacing never becomes a de-facto long pause (that's what a 429 penalty is for).
@@ -250,6 +256,15 @@ export interface GlobalConcurrencyGate {
   tryAcquire(): boolean;
   /** Return a global slot (paired 1:1 with a successful tryAcquire). */
   release(): void;
+  /**
+   * AIMD feedback (rate-limit-layer-v2 D-005). The governor reports each turn's health so the
+   * gate can adapt its EFFECTIVE concurrency under the hard cap: `noteClean` after a release
+   * whose turn saw no account-wide penalty (additive increase: +1 per N clean turns);
+   * `notePenalty` on every account-wide penalize (multiplicative decrease: halve toward the
+   * floor). Optional so a bare cap-only gate (tests, simple hosts) stays valid.
+   */
+  noteClean?(): void;
+  notePenalty?(): void;
 }
 
 export interface GovernorDeps {
@@ -283,6 +298,12 @@ export class RateLimitGovernor {
   private readonly storeKey?: string;
   private readonly globalGate?: GlobalConcurrencyGate;
   private readonly floor: GovernorLimits;
+  /** Bumped on every account-wide penalty — lets a release decide whether its turn was CLEAN
+      (no penalty between acquire and release) for the AIMD feedback (D-005). */
+  private penaltySeq = 0;
+  /** Staggered-resume bookkeeping (D-006): one ordered ticket per waiter per pause epoch. */
+  private pauseEpochUntil = 0;
+  private pauseTickets = 0;
 
   constructor(limits: GovernorLimits, deps: GovernorDeps = {}) {
     this.state = initGovernorState(limits);
@@ -340,12 +361,16 @@ export class RateLimitGovernor {
   async acquire(est: TokenEstimate = {}, opts: AcquireOpts = {}): Promise<(() => void) | null> {
     const maxWait = opts.maxWaitMs ?? Infinity;
     let waited = 0;
+    let pauseTicket: number | undefined; // staggered-resume ticket for THIS waiter (D-006)
     const mkRelease = (): (() => void) => {
+      const seqAtAcquire = this.penaltySeq;
       let released = false;
       return () => {
         if (released) return;
         released = true;
         recordRelease(this.state);
+        // AIMD feedback (D-005): a turn with no account-wide penalty in between is CLEAN.
+        if (this.penaltySeq === seqAtAcquire) this.globalGate?.noteClean?.();
         this.globalGate?.release(); // give the fleet-wide slot back too (D-004)
       };
     };
@@ -377,11 +402,13 @@ export class RateLimitGovernor {
           this.state.inFlight += 1; // reserve the local concurrency slot now
           let rateAllowed = false;
           let rateWait = CONCURRENCY_POLL_MS;
+          let rateReason: AcquireDecision['reason'];
           try {
             const shared = await this.store.transact(this.storeKey!, this.floor, (s) => {
               const rd = decideRate(s, this.now(), est);
               rateAllowed = rd.allowed;
               rateWait = rd.waitMs;
+              rateReason = rd.reason;
               if (rd.allowed) recordRate(s, this.now(), est);
             });
             this.syncSharedInto(shared);
@@ -392,12 +419,25 @@ export class RateLimitGovernor {
             }
           }
           if (rateAllowed) return mkRelease();
-          d = { allowed: false, waitMs: rateWait };
+          d = { allowed: false, waitMs: rateWait, reason: rateReason };
         } else {
           d = c;
         }
       }
-      const w = Math.max(1, d.waitMs);
+      let w = Math.max(1, d.waitMs);
+      // Staggered resume (D-006): every waiter parked on the SAME pause takes one ordered ticket;
+      // its wake is offset by ticket × step (capped) so the fleet re-enters spread over a bounded
+      // window instead of re-stampeding (and re-tripping) the limit at the reset instant.
+      if (d.reason === 'paused') {
+        if (pauseTicket === undefined || this.state.pausedUntil !== this.pauseEpochUntil) {
+          if (this.state.pausedUntil !== this.pauseEpochUntil) {
+            this.pauseEpochUntil = this.state.pausedUntil;
+            this.pauseTickets = 0;
+          }
+          pauseTicket = this.pauseTickets++;
+        }
+        w += Math.min(pauseTicket * RESUME_STAGGER_STEP_MS, RESUME_STAGGER_MAX_MS);
+      }
       if (waited + w > maxWait) return null; // would wait too long → give up, let the caller decide
       waited += w;
       await this.sleep(w);
@@ -414,7 +454,11 @@ export class RateLimitGovernor {
 
   penalize(opts: { retryAfterMs?: number; resetAt?: number }): void {
     const before = this.state.pausedUntil;
+    this.penaltySeq += 1; // any in-flight turn that releases after this is NOT clean (D-005)
     recordPenalty(this.state, this.now(), opts);
+    // AIMD multiplicative decrease (D-005) — once per DISTINCT backpressure event (a pause that
+    // actually extends), so N agents co-failing on the same 429 halve the fleet once, not N times.
+    if (this.state.pausedUntil > before) this.globalGate?.notePenalty?.();
     this.notifyPauseIfExtended(before, 'penalty');
     // A 429 anywhere pauses the WHOLE account → push to the shared row so every process backs off.
     if (this.store) void this.store.transact(this.storeKey!, this.floor, (s) => recordPenalty(s, this.now(), opts)).catch(() => {});
