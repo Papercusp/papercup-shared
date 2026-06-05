@@ -11,11 +11,19 @@
  * jsdom env + @testing-library/react. Console stays silent (the default
  * vitest-fail-on-console setup is on).
  */
+import type { ReactNode } from 'react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { cleanup, render, screen } from '@testing-library/react';
+import * as RT from '@radix-ui/react-tooltip';
 import { Tooltip } from './Tooltip';
 
 afterEach(() => cleanup());
+
+// Radix's Tooltip.Root must sit under a TooltipProvider (the app mounts a
+// single one at its root). Wrap label-bearing renders to mirror that.
+function withProvider(node: ReactNode) {
+  return <RT.Provider>{node}</RT.Provider>;
+}
 
 describe('Tooltip — empty-label guard', () => {
   it('renders children verbatim and adds no trigger wrapper when label is empty', () => {
@@ -46,9 +54,11 @@ describe('Tooltip — empty-label guard', () => {
 describe('Tooltip — with a label', () => {
   it('renders the children as the tooltip trigger', () => {
     render(
-      <Tooltip label="Helpful hint">
-        <button data-testid="child">Hover me</button>
-      </Tooltip>,
+      withProvider(
+        <Tooltip label="Helpful hint">
+          <button data-testid="child">Hover me</button>
+        </Tooltip>,
+      ),
     );
     const child = screen.getByTestId('child');
     // Radix marks the trigger element with data-state (closed until hovered).
@@ -57,9 +67,11 @@ describe('Tooltip — with a label', () => {
 
   it('passes the children through (asChild) rather than wrapping in an extra element', () => {
     render(
-      <Tooltip label="hint" side="right" align="start">
-        <button data-testid="child">Go</button>
-      </Tooltip>,
+      withProvider(
+        <Tooltip label="hint" side="right" align="start">
+          <button data-testid="child">Go</button>
+        </Tooltip>,
+      ),
     );
     const child = screen.getByTestId('child');
     // asChild → the trigger IS the button, not a wrapper around it.
