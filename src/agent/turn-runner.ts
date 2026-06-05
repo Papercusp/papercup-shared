@@ -9,7 +9,7 @@
  * handled class — the caller decides (re-queue / pause-loop / escalate / degrade). A
  * rejected `runOnce` is caught + classified, never propagated.
  */
-import { classifyTurnError, type TurnBackend, type TurnError, type TurnProvider } from './turn-error';
+import { classifyTurnError, isAccountWide, type TurnBackend, type TurnError, type TurnProvider } from './turn-error';
 import type { RateLimitGovernor, TokenEstimate } from '../resilience/governor';
 import { runWithRetry, type AttemptOutcome, type RetryVerdict } from '../resilience/retry';
 
@@ -74,8 +74,8 @@ export async function runAgentTurn<T>(spec: RunAgentTurnSpec, deps: RunAgentTurn
           ok: false,
           error: {
             retryable: te.retryable,
-            // rate_limited/overloaded are account-wide → pause the shared governor.
-            accountWide: te.class === 'rate_limited' || te.class === 'overloaded',
+            // rate_limited/overloaded/usage_limit are account-wide → pause the shared governor.
+            accountWide: isAccountWide(te.class),
             retryAfterMs: te.retryAfterMs,
             resetAt: te.resetAt,
             message: te.message,

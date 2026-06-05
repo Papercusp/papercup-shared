@@ -61,6 +61,30 @@ test('runAgentTurn — a non-retryable class (auth) returns the error immediatel
   if (!r.ok) assert.equal(r.error.class, 'auth');
 });
 
+test('runAgentTurn — usage_limit (plan cap) returns immediately, does NOT retry, parks the fleet (D-001)', async () => {
+  const { g } = fakeGovernor();
+  const resetAt = Date.parse('2026-06-05T12:00:00Z');
+  let calls = 0;
+  const r = await runAgentTurn<string>(
+    { backend: 'meridian', maxAttempts: 5 },
+    {
+      ...deps(g),
+      runOnce: async (): Promise<TurnOutcome<string>> => {
+        calls++;
+        return { ok: false, raw: { status: 429, message: 'You exceeded your current quota — insufficient_quota', headers: { 'anthropic-ratelimit-requests-reset': '2026-06-05T12:00:00Z' } } };
+      },
+    },
+  );
+  assert.equal(r.ok, false);
+  assert.equal(calls, 1); // retrying a plan cap is futile — must not burn attempts
+  if (!r.ok) {
+    assert.equal(r.error.class, 'usage_limit');
+    assert.equal(r.error.surfaceToUser, true);
+    assert.equal(r.error.resetAt, resetAt);
+  }
+  assert.equal(g.state.pausedUntil, resetAt); // fleet parked until reset
+});
+
 test('runAgentTurn — exhausts maxAttempts and returns the last classified error', async () => {
   const { g } = fakeGovernor();
   let calls = 0;

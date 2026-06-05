@@ -25,6 +25,8 @@ export {
   classifyTurnError,
   classifySubprocessResult,
   classifyHttpError,
+  isAccountWide,
+  parseUsageResetMs,
   type TurnError,
   type TurnBackend,
   type TurnProvider,

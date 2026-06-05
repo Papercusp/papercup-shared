@@ -11,7 +11,8 @@
  */
 
 export type TurnErrorClass =
-  | 'rate_limited' // 429 / acceleration limit — wait for retry-after / reset
+  | 'rate_limited' // 429 / acceleration (RPM) limit — transient: back off the fleet briefly + retry
+  | 'usage_limit' // plan/subscription CAP (Max/ChatGPT daily-weekly-session, insufficient_quota) — capped until a reset window (often hours): pause the fleet + surface, do NOT retry into the wall
   | 'overloaded' // 529 / 5xx transient — back off + retry
   | 'timeout' // wall-clock / deadline exceeded
   | 'transient_io' // network blip (ECONNRESET, socket hang up, …)
@@ -34,6 +35,13 @@ export interface TurnError {
   provider: TurnProvider;
   /** Convenience: is this class worth another attempt (with the right wait)? */
   retryable: boolean;
+  /**
+   * Should the operator surface this to the human (vs absorb + auto-handle)? True for the
+   * classes the user must know about — a plan/usage cap they're hitting (`usage_limit`), an
+   * auth failure that needs new creds (`auth`), and unexpected permanent failures. False for
+   * transient classes the governor handles silently (`rate_limited`/`overloaded`/`timeout`/…).
+   */
+  surfaceToUser?: boolean;
 }
 
 const RETRYABLE: ReadonlySet<TurnErrorClass> = new Set<TurnErrorClass>([
@@ -46,8 +54,22 @@ const RETRYABLE: ReadonlySet<TurnErrorClass> = new Set<TurnErrorClass>([
   'malformed_output',
 ]);
 
+// Classes the human should see (vs the governor handling them silently). `usage_limit` is the
+// load-bearing one — retrying is futile, so the user must know the fleet is parked until reset.
+const SURFACE_TO_USER: ReadonlySet<TurnErrorClass> = new Set<TurnErrorClass>(['usage_limit', 'auth', 'permanent']);
+
+/**
+ * Classes that back off the SHARED account-wide budget — every agent on the account pauses
+ * together, not just the one that tripped. `rate_limited` (transient RPM) and `overloaded`
+ * (5xx) pause-and-retry; `usage_limit` (plan cap) pauses-until-reset without retrying. The
+ * single predicate every penalize/pause call site consults, so adding a class is one edit.
+ */
+export function isAccountWide(cls: TurnErrorClass): boolean {
+  return cls === 'rate_limited' || cls === 'overloaded' || cls === 'usage_limit';
+}
+
 function mk(cls: TurnErrorClass, message: string, provider: TurnProvider, extra?: Partial<TurnError>): TurnError {
-  return { class: cls, message, provider, retryable: RETRYABLE.has(cls), ...extra };
+  return { class: cls, message, provider, retryable: RETRYABLE.has(cls), surfaceToUser: SURFACE_TO_USER.has(cls), ...extra };
 }
 
 /** `retry-after` is either delta-seconds or an HTTP-date. Returns ms, or undefined. */
@@ -98,15 +120,63 @@ function resetFromHeaders(headers: Record<string, string | undefined> | undefine
   return undefined;
 }
 
-// `session limit` / `hit your … limit` cover the Claude Code SUBSCRIPTION lockout
-// ("You've hit your session limit · resets 4:20am") — a transient, reset-at-a-time cap, NOT
-// an agent crash. Without these it fell through to `agent_crash`, so the gym's RB-006 rate-pause
-// rethrew instead of pausing/skipping → an unattended loop hard-failed on a session lockout.
-const RATE_RE = /(\b429\b|rate.?limit|too many requests|quota|usage limit|session limit|\d+-?hour limit|hit your (?:session|usage|weekly|monthly) limit)/i;
+// Plan / subscription CAP — the account is capped until a reset window (often hours away), so
+// retrying is futile: pause the fleet + surface the reset, don't hammer the wall. Covers the
+// Claude Code subscription lockout ("You've hit your usage limit · resets 4:20am" / "session
+// limit" / "5-hour limit") AND OpenAI/codex hard quota ("insufficient_quota"). Kept DISTINCT
+// from a transient RPM 429 (`RATE_RE`) because the disposition is opposite (D-001, Brief 20).
+const USAGE_LIMIT_RE =
+  /(usage limit|session limit|weekly limit|monthly limit|daily limit|\d+-?hour limit|hit your (?:session|usage|weekly|monthly|daily) limit|insufficient_quota|quota exceeded|exceeded your (?:current )?quota|out of (?:credits|quota))/i;
+// Transient acceleration / requests-per-minute 429 — back off the fleet briefly + retry. The
+// usage-cap phrases were SPLIT OUT into USAGE_LIMIT_RE above (D-001).
+const RATE_RE = /(\b429\b|rate.?limit|too many requests|slow down)/i;
 const OVERLOAD_RE = /(\b529\b|overloaded|service unavailable|\b50[0234]\b)/i;
 const AUTH_RE = /(\b401\b|\b403\b|unauthorized|forbidden|invalid api key|authentication)/i;
 const IO_RE = /(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|network|fetch failed)/i;
 const TIMEOUT_RE = /(\b408\b|timed? ?out|deadline exceeded)/i;
+
+/**
+ * Best-effort reset extraction from a subscription usage-limit MESSAGE (the subprocess path,
+ * where structured `*-reset` headers aren't visible). Handles the relative form
+ * ("resets in 2h 30m", "try again in 90 minutes") and the absolute clock form Claude prints
+ * ("resets 4:20am", "resets at 11 pm", "resets 16:00"). Returns epoch ms, or undefined when no
+ * reset is parseable (the caller still pauses + surfaces, just without a precise time). Pure:
+ * `now` is injected so the absolute-clock "next occurrence" math is testable.
+ */
+export function parseUsageResetMs(text: string, now: number = Date.now()): number | undefined {
+  // Relative: "resets in 2h", "try again in 90 minutes", "in 2h 30m", "in 45s".
+  const rel = /(?:resets?|try again|again|wait)\b[^0-9]{0,12}((?:\d+\s*(?:h|hr|hrs|hours?|m|min|mins|minutes?|s|sec|secs|seconds?)\b\s*)+)/i.exec(text);
+  if (rel) {
+    let ms = 0;
+    let matched = false;
+    const re = /(\d+)\s*(h|hr|hrs|hours?|m|min|mins|minutes?|s|sec|secs|seconds?)\b/gi;
+    let mm: RegExpExecArray | null;
+    while ((mm = re.exec(rel[1])) !== null) {
+      matched = true;
+      const n = parseInt(mm[1], 10);
+      const u = mm[2].toLowerCase();
+      ms += u.startsWith('h') ? n * 3_600_000 : u.startsWith('m') ? n * 60_000 : n * 1000;
+    }
+    if (matched && ms > 0) return now + ms;
+  }
+  // Absolute clock: "resets 4:20am", "resets at 11 pm", "resets 16:00" → the NEXT occurrence.
+  const abs = /resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i.exec(text);
+  if (abs) {
+    let h = parseInt(abs[1], 10);
+    const min = abs[2] ? parseInt(abs[2], 10) : 0;
+    const ap = abs[3]?.toLowerCase();
+    if (ap === 'pm' && h < 12) h += 12;
+    if (ap === 'am' && h === 12) h = 0;
+    if (h <= 23 && min <= 59) {
+      const d = new Date(now);
+      d.setHours(h, min, 0, 0);
+      let t = d.getTime();
+      if (t <= now) t += 86_400_000; // already passed today → tomorrow
+      return t;
+    }
+  }
+  return undefined;
+}
 
 /** Classify an HTTP-style failure (meridian in-process call, or an API error). */
 export function classifyHttpError(
@@ -120,6 +190,12 @@ export function classifyHttpError(
   const resetAt = resetFromHeaders(headers, now);
   const st = input.status;
 
+  // A plan/usage CAP (429 w/ insufficient_quota, or a no-status message naming a usage cap) →
+  // pause-until-reset + surface, do NOT retry. Checked before the transient-429 branch since the
+  // disposition is opposite (D-001). The header reset (if any) IS the cap's reset time.
+  if (USAGE_LIMIT_RE.test(msg) && (st === 429 || st === undefined)) {
+    return mk('usage_limit', msg, provider, { retryAfterMs, resetAt });
+  }
   if (st === 429 || (st === undefined && RATE_RE.test(msg))) {
     return mk('rate_limited', msg, provider, { retryAfterMs, resetAt });
   }
@@ -142,6 +218,12 @@ export function classifySubprocessResult(
 ): TurnError {
   const stderr = input.stderr ?? '';
   if (input.timedOut) return mk('timeout', 'subprocess timed out', provider);
+  // Plan/usage CAP first (opposite disposition to a transient 429): pause-until-reset + surface,
+  // no retry. The CLI prints the reset in the message ("resets 4:20am"), so parse it best-effort.
+  if (USAGE_LIMIT_RE.test(stderr)) {
+    const resetAt = parseUsageResetMs(stderr, now);
+    return mk('usage_limit', stderr.slice(0, 200) || 'usage limit reached', provider, resetAt !== undefined ? { resetAt } : undefined);
+  }
   if (RATE_RE.test(stderr)) {
     // Some CLIs print "retry after 30s" / "try again in 12 seconds".
     const m = /(?:retry after|try again in|wait)\s+(\d+(?:\.\d+)?)\s*(s|sec|seconds|m|min|minutes|ms)?/i.exec(stderr);

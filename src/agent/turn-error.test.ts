@@ -7,9 +7,11 @@ import assert from 'node:assert/strict';
 import {
   parseRetryAfterMs,
   parseResetAt,
+  parseUsageResetMs,
   classifyHttpError,
   classifySubprocessResult,
   classifyTurnError,
+  isAccountWide,
 } from './turn-error';
 
 // --- parseRetryAfterMs ---
@@ -70,13 +72,42 @@ test('classifyHttpError — no status, message regex → rate_limited / overload
 test('classifySubprocessResult — timedOut → timeout', () => {
   assert.equal(classifySubprocessResult({ exitCode: null, timedOut: true }).class, 'timeout');
 });
-test('classifySubprocessResult — stderr rate-limit patterns → rate_limited', () => {
-  assert.equal(classifySubprocessResult({ exitCode: 1, stderr: 'Error: 429 Too Many Requests' }).class, 'rate_limited');
+test('classifySubprocessResult — transient RPM stderr → rate_limited (retryable, not surfaced)', () => {
+  const e1 = classifySubprocessResult({ exitCode: 1, stderr: 'Error: 429 Too Many Requests' });
+  assert.equal(e1.class, 'rate_limited');
+  assert.equal(e1.retryable, true);
+  assert.equal(e1.surfaceToUser, false);
   assert.equal(classifySubprocessResult({ exitCode: 1, stderr: 'rate limit exceeded, retry after 30s' }).class, 'rate_limited');
-  assert.equal(classifySubprocessResult({ exitCode: 1, stderr: 'You have hit your 5-hour limit' }).class, 'rate_limited');
-  // Claude Code subscription session lockout (transient — resets at a time), NOT an agent crash.
-  assert.equal(classifySubprocessResult({ exitCode: 1, stderr: "You've hit your session limit · resets 4:20am (America/New_York)" }).class, 'rate_limited');
-  assert.equal(classifySubprocessResult({ exitCode: 1, stderr: 'session limit reached' }).class, 'rate_limited');
+  assert.equal(classifySubprocessResult({ exitCode: 1, stderr: 'slow down — too many requests' }).class, 'rate_limited');
+});
+// D-001: the Claude/OpenAI subscription/plan CAP is a DISTINCT class from a transient 429 — it is
+// capped until a (often hours-off) reset, so retrying is futile: NOT retryable, surfaced, paused.
+test('classifySubprocessResult — plan/usage cap stderr → usage_limit (not retryable, surfaced)', () => {
+  for (const stderr of [
+    'You have hit your 5-hour limit',
+    "You've hit your session limit · resets 4:20am (America/New_York)",
+    'session limit reached',
+    'You have reached your weekly limit',
+    'Error: insufficient_quota — you have exceeded your current quota',
+  ]) {
+    const e = classifySubprocessResult({ exitCode: 1, stderr }, 'anthropic');
+    assert.equal(e.class, 'usage_limit', stderr);
+    assert.equal(e.retryable, false, stderr);
+    assert.equal(e.surfaceToUser, true, stderr);
+  }
+});
+test('classifySubprocessResult — usage_limit parses a reset time from the message', () => {
+  const now = Date.parse('2026-06-05T08:00:00Z');
+  // Relative reset.
+  const rel = classifySubprocessResult({ exitCode: 1, stderr: 'usage limit reached — try again in 2h 30m' }, 'anthropic', now);
+  assert.equal(rel.class, 'usage_limit');
+  assert.equal(rel.resetAt, now + (2 * 3_600_000 + 30 * 60_000));
+  // Absolute clock reset → next occurrence, with the right local hour.
+  const abs = classifySubprocessResult({ exitCode: 1, stderr: "You've hit your usage limit · resets 4:20am" }, 'anthropic', now);
+  assert.equal(abs.class, 'usage_limit');
+  assert.ok(abs.resetAt !== undefined && abs.resetAt > now);
+  assert.equal(new Date(abs.resetAt as number).getHours(), 4);
+  assert.equal(new Date(abs.resetAt as number).getMinutes(), 20);
 });
 test('classifySubprocessResult — stderr overloaded → overloaded', () => {
   assert.equal(classifySubprocessResult({ exitCode: 1, stderr: '529 overloaded_error' }).class, 'overloaded');
@@ -93,10 +124,57 @@ test('classifySubprocessResult — killed by signal → agent_crash', () => {
   assert.equal(classifySubprocessResult({ exitCode: null, signal: 'SIGKILL' }).class, 'agent_crash');
 });
 
+// --- classifyHttpError usage_limit (D-001) ---
+test('classifyHttpError — bare 429 → rate_limited (transient, not surfaced)', () => {
+  const e = classifyHttpError({ status: 429, message: 'rate_limit_error' }, 'anthropic');
+  assert.equal(e.class, 'rate_limited');
+  assert.equal(e.surfaceToUser, false);
+});
+test('classifyHttpError — 429 insufficient_quota (codex/OpenAI hard cap) → usage_limit', () => {
+  const e = classifyHttpError({ status: 429, message: 'You exceeded your current quota — insufficient_quota' }, 'openai');
+  assert.equal(e.class, 'usage_limit');
+  assert.equal(e.retryable, false);
+  assert.equal(e.surfaceToUser, true);
+});
+test('classifyHttpError — no-status usage-cap message → usage_limit with header reset', () => {
+  const e = classifyHttpError(
+    { headers: { 'anthropic-ratelimit-requests-reset': '2026-06-05T12:00:00Z' }, message: 'You have hit your weekly limit' },
+    'anthropic',
+  );
+  assert.equal(e.class, 'usage_limit');
+  assert.equal(e.resetAt, Date.parse('2026-06-05T12:00:00Z'));
+});
+
+// --- isAccountWide (D-001) — the single fleet-pause predicate ---
+test('isAccountWide — rate_limited / overloaded / usage_limit pause the fleet; others do not', () => {
+  assert.equal(isAccountWide('rate_limited'), true);
+  assert.equal(isAccountWide('overloaded'), true);
+  assert.equal(isAccountWide('usage_limit'), true);
+  for (const c of ['timeout', 'transient_io', 'auth', 'agent_crash', 'empty_output', 'malformed_output', 'permanent'] as const) {
+    assert.equal(isAccountWide(c), false, c);
+  }
+});
+
+// --- parseUsageResetMs (D-001) ---
+test('parseUsageResetMs — relative durations', () => {
+  const now = 1_000_000;
+  assert.equal(parseUsageResetMs('resets in 90 minutes', now), now + 90 * 60_000);
+  assert.equal(parseUsageResetMs('try again in 2h 30m', now), now + (2 * 3_600_000 + 30 * 60_000));
+  assert.equal(parseUsageResetMs('wait 45s and retry', now), now + 45_000);
+  assert.equal(parseUsageResetMs('no time here', now), undefined);
+});
+test('parseUsageResetMs — absolute clock → next occurrence, local hour preserved', () => {
+  const now = Date.parse('2026-06-05T20:00:00Z');
+  const t = parseUsageResetMs('resets at 11pm', now);
+  assert.ok(t !== undefined && t > now);
+  assert.equal(new Date(t as number).getHours(), 23);
+});
+
 // --- classifyTurnError dispatch ---
 test('classifyTurnError — dispatches by backend shape', () => {
   assert.equal(classifyTurnError('meridian', { status: 429, headers: { 'retry-after': '5' } }).class, 'rate_limited');
   assert.equal(classifyTurnError('claude-code', { exitCode: 1, stderr: '429 rate limit' }).class, 'rate_limited');
+  assert.equal(classifyTurnError('claude-code', { exitCode: 1, stderr: "You've hit your usage limit" }).class, 'usage_limit');
   assert.equal(classifyTurnError('omp', { exitCode: 0, stdout: '' }).class, 'empty_output');
   assert.equal(classifyTurnError('codex', { exitCode: 137, signal: 'SIGKILL' }).class, 'agent_crash');
 });

@@ -83,6 +83,20 @@ export async function runWithRetry<T>(opts: RetryOptions, deps: RetryDeps<T>): P
       }
       verdict = outcome.error;
       last = verdict;
+      // Account-wide STOP with a known reset (e.g. a plan/usage cap — accountWide but NOT
+      // retryable): pause the SHARED governor so the whole fleet backs off until reset, even
+      // though THIS turn won't retry into the wall. Without this, a non-retryable account-wide
+      // verdict returns immediately and peers keep hammering the capped account.
+      if (verdict.accountWide && !verdict.retryable) {
+        const until =
+          verdict.retryAfterMs ?? (verdict.resetAt !== undefined ? Math.max(0, verdict.resetAt - now()) : undefined);
+        if (until !== undefined && until > 0) {
+          deps.governor.penalize({
+            retryAfterMs: until,
+            ...(verdict.resetAt !== undefined ? { resetAt: verdict.resetAt } : {}),
+          });
+        }
+      }
       if (!verdict.retryable || attempt === maxAttempts) return { ok: false, error: verdict };
 
       const hintMs = verdict.accountWide

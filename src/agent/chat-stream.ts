@@ -41,7 +41,7 @@ import { basename, join } from 'node:path';
 // import nothing from this file, so there's no cycle and ~no load cost when the flag is off.
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
 import { governorForBackend, BACKEND_PROFILES } from './governor-registry';
-import { classifyTurnError, type TurnBackend, type TurnError } from './turn-error';
+import { classifyTurnError, isAccountWide, type TurnBackend, type TurnError } from './turn-error';
 
 /** Default cap on a CLI spawn's wait for a shared-governor permit (RB-012). Long enough to
     wait out a normal 429's retry-after, short enough that a multi-hour subscription lockout
@@ -1608,7 +1608,9 @@ export async function* runAgentChat(
       { exitCode, signal: exitSignal, stderr: stderrBuf, stdout: finalText, timedOut },
       Date.now(),
     );
-    if (cliTurn.class === 'rate_limited' || cliTurn.class === 'overloaded') {
+    if (isAccountWide(cliTurn.class)) {
+      // rate_limited/overloaded (transient) AND usage_limit (plan cap) all pause the shared
+      // bucket so concurrent CLI spawns back off together (D-001).
       governorForBackend(backend as TurnBackend, opts.model ?? '').penalize({
         retryAfterMs: cliTurn.retryAfterMs,
         resetAt: cliTurn.resetAt,

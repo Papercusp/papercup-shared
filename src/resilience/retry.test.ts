@@ -54,6 +54,22 @@ test('runWithRetry — non-retryable returns the verdict immediately', async () 
   if (!r.ok) assert.equal(r.error.message, 'auth');
 });
 
+test('runWithRetry — account-wide NON-retryable with a reset (usage cap) parks the FLEET, no retry (D-001)', async () => {
+  const c = gov();
+  let n = 0;
+  const resetAt = c.now() + 3 * 60 * 60 * 1000; // 3h off (a plan cap)
+  const r = await runWithRetry<string>({ maxAttempts: 5 }, {
+    governor: c.g, now: c.now, sleep: c.sleep,
+    attempt: async (): Promise<AttemptOutcome<string>> => {
+      n++;
+      return { ok: false, error: { retryable: false, accountWide: true, resetAt, message: 'usage limit' } };
+    },
+  });
+  assert.equal(r.ok, false);
+  assert.equal(n, 1); // did NOT retry into the wall
+  assert.equal(c.g.state.pausedUntil, resetAt); // but DID pause the shared bucket so the fleet backs off
+});
+
 test('runWithRetry — per-call (not account-wide) retryable uses local backoff', async () => {
   const c = gov();
   let n = 0;
