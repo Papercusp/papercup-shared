@@ -1,0 +1,115 @@
+/**
+ * chat-stream-resolve.test.ts — the backend/binary resolution seam of
+ * chat-stream. `resolveBackend` + `resolveAgentBin` are pure precedence
+ * functions exported so non-runAgentChat callers resolve identically; they read
+ * process.env (AGENT_BACKEND / AGENT_CMD / CLAUDE_CMD), so each test owns a
+ * clean env slice. (The runAgentChat generator itself is a subprocess/SSE
+ * integration surface and is out of scope for this unit lane.)
+ */
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import {
+  resolveBackend,
+  resolveAgentBin,
+  type AgentBackend,
+  type RunAgentChatOptions,
+} from './chat-stream';
+
+const ENV_KEYS = ['AGENT_BACKEND', 'AGENT_CMD', 'CLAUDE_CMD'] as const;
+const saved: Record<string, string | undefined> = {};
+
+function opts(partial: Partial<RunAgentChatOptions> = {}): RunAgentChatOptions {
+  return { promptText: '', ...partial };
+}
+
+beforeEach(() => {
+  for (const k of ENV_KEYS) {
+    saved[k] = process.env[k];
+    delete process.env[k];
+  }
+});
+
+afterEach(() => {
+  for (const k of ENV_KEYS) {
+    if (saved[k] === undefined) delete process.env[k];
+    else process.env[k] = saved[k];
+  }
+});
+
+describe('resolveBackend', () => {
+  it('an explicit opts.backend wins over everything', () => {
+    process.env.AGENT_BACKEND = 'claude-code';
+    expect(resolveBackend(opts({ backend: 'codex' }))).toBe('codex');
+  });
+
+  it('maps the AGENT_BACKEND env aliases', () => {
+    const cases: Array<[string, AgentBackend]> = [
+      ['omp', 'omp'],
+      ['pi', 'omp'],
+      ['claude-code', 'claude-code'],
+      ['claude', 'claude-code'],
+      ['meridian', 'meridian'],
+      ['codex', 'codex'],
+      ['  CODEX  ', 'codex'], // trimmed + lowercased
+    ];
+    for (const [env, expected] of cases) {
+      process.env.AGENT_BACKEND = env;
+      expect(resolveBackend(opts())).toBe(expected);
+    }
+  });
+
+  it('infers from opts.agentCmd binary name when env is unset', () => {
+    expect(resolveBackend(opts({ agentCmd: 'omp' }))).toBe('omp');
+    expect(resolveBackend(opts({ agentCmd: '/usr/local/bin/claude --foo' }))).toBe('claude-code');
+    expect(resolveBackend(opts({ agentCmd: '/opt/pi' }))).toBe('omp');
+    expect(resolveBackend(opts({ agentCmd: 'codex' }))).toBe('codex');
+  });
+
+  it('infers from AGENT_CMD / CLAUDE_CMD env when no opts.agentCmd', () => {
+    process.env.AGENT_CMD = '/bin/claude';
+    expect(resolveBackend(opts())).toBe('claude-code');
+    delete process.env.AGENT_CMD;
+    process.env.CLAUDE_CMD = 'omp';
+    expect(resolveBackend(opts())).toBe('omp');
+  });
+
+  it('AGENT_BACKEND env beats an inferable agentCmd', () => {
+    process.env.AGENT_BACKEND = 'meridian';
+    expect(resolveBackend(opts({ agentCmd: 'claude' }))).toBe('meridian');
+  });
+
+  it('defaults to omp when nothing resolves', () => {
+    expect(resolveBackend(opts())).toBe('omp');
+    expect(resolveBackend(opts({ agentCmd: 'some-unknown-bin' }))).toBe('omp');
+  });
+});
+
+describe('resolveAgentBin', () => {
+  it('opts.agentCmd wins over env and backend', () => {
+    process.env.AGENT_CMD = '/env/claude';
+    expect(resolveAgentBin(opts({ agentCmd: '/explicit/omp' }), 'omp')).toBe('/explicit/omp');
+  });
+
+  it('AGENT_CMD env wins over the legacy CLAUDE_CMD', () => {
+    process.env.AGENT_CMD = '/new/agent';
+    process.env.CLAUDE_CMD = '/legacy/claude';
+    expect(resolveAgentBin(opts(), 'claude-code')).toBe('/new/agent');
+  });
+
+  it('falls back to the legacy CLAUDE_CMD when AGENT_CMD is unset', () => {
+    process.env.CLAUDE_CMD = '/legacy/claude';
+    expect(resolveAgentBin(opts(), 'claude-code')).toBe('/legacy/claude');
+  });
+
+  it('ignores a blank/whitespace env value and uses the backend default', () => {
+    process.env.AGENT_CMD = '   ';
+    expect(resolveAgentBin(opts(), 'omp')).toBe('omp');
+  });
+
+  it('defaults the binary to the resolved backend', () => {
+    expect(resolveAgentBin(opts(), 'omp')).toBe('omp');
+    expect(resolveAgentBin(opts(), 'codex')).toBe('codex');
+    expect(resolveAgentBin(opts(), 'claude-code')).toBe('claude');
+    // meridian has no subprocess of its own → default claude binary
+    expect(resolveAgentBin(opts(), 'meridian')).toBe('claude');
+  });
+});
