@@ -48,6 +48,34 @@ import { classifyTurnError, isAccountWide, type TurnBackend, type TurnError } fr
     surfaces instead of freezing the caller for hours. */
 export const DEFAULT_CLI_GOVERNOR_MAX_WAIT_MS = 5 * 60_000;
 
+// --- In-process usage telemetry seam (rate-limit-layer-v2 D-002, capture point 1) --------------
+// The meridian path is the ONE place real `anthropic-ratelimit-*` headers + token usage are
+// visible in-process. This lib stays host-free, so the host (operator-core) installs a sink at
+// boot (`setMeridianUsageSink`) and both meridian paths (legacy + governed) emit one event per
+// completed call. Best-effort: a sink failure must never break the LLM call.
+export interface MeridianUsageEvent {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  costUsd: number;
+  /** Lower-cased response headers when the transport exposed them (anthropic-ratelimit-*). */
+  headers?: Record<string, string | undefined>;
+}
+let meridianUsageSink: ((ev: MeridianUsageEvent) => void) | undefined;
+/** Install (or clear) the host's usage-telemetry sink. Call once at operator boot. */
+export function setMeridianUsageSink(fn?: (ev: MeridianUsageEvent) => void): void {
+  meridianUsageSink = fn;
+}
+function emitMeridianUsage(ev: MeridianUsageEvent): void {
+  if (!meridianUsageSink) return;
+  try {
+    meridianUsageSink(ev);
+  } catch {
+    /* telemetry is best-effort; never throw into the LLM path */
+  }
+}
+
 /**
  * Backends the in-app brains can drive. The three subprocess backends
  * (`claude-code`/`omp`/`codex`) are the canonical spawn set shared with
@@ -584,9 +612,8 @@ async function* meridianAgentChat(
       // "Streaming is required for operations that may take longer than 10 minutes").
       // .stream() satisfies that guard; .finalMessage() resolves to the same full
       // Message (content + usage), so the downstream extraction below is unchanged.
-      const resp = await client.messages
-        .stream(params, opts.signal ? { signal: opts.signal } : {})
-        .finalMessage();
+      const stream = client.messages.stream(params, opts.signal ? { signal: opts.signal } : {});
+      const resp = await stream.finalMessage();
       let finalText = '';
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       for (const block of (resp.content ?? []) as Array<any>) {
@@ -596,6 +623,15 @@ async function* meridianAgentChat(
       const outputTokens = resp.usage?.output_tokens ?? 0;
       const p = meridianPriceFor(opts.model);
       const costUsd = (inputTokens * p.in + outputTokens * p.out) / 1_000_000;
+      // Usage telemetry (D-002 capture point 1): tokens + the raw response's ratelimit headers.
+      emitMeridianUsage({
+        model: opts.model,
+        inputTokens,
+        outputTokens,
+        cacheReadTokens: resp.usage?.cache_read_input_tokens ?? undefined,
+        costUsd,
+        headers: headersToRecord(stream.response?.headers),
+      });
       if (finalText) yield { type: 'delta', text: finalText };
       yield { type: 'result', costUsd, tokensIn: inputTokens, tokensOut: outputTokens, finalText };
       return;
@@ -666,7 +702,8 @@ async function* governedMeridian(
       runOnce: async (): Promise<TurnOutcome<V>> => {
         if (opts.signal?.aborted) return { ok: false, raw: { message: 'meridian: aborted' } };
         try {
-          const resp = await client.messages.stream(params, opts.signal ? { signal: opts.signal } : {}).finalMessage();
+          const stream = client.messages.stream(params, opts.signal ? { signal: opts.signal } : {});
+          const resp = await stream.finalMessage();
           let finalText = '';
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           for (const block of (resp.content ?? []) as Array<any>) {
@@ -675,7 +712,20 @@ async function* governedMeridian(
           const tokensIn = resp.usage?.input_tokens ?? 0;
           const tokensOut = resp.usage?.output_tokens ?? 0;
           const p = meridianPriceFor(model);
-          return { ok: true, value: { finalText, tokensIn, tokensOut, costUsd: (tokensIn * p.in + tokensOut * p.out) / 1_000_000 } };
+          const costUsd = (tokensIn * p.in + tokensOut * p.out) / 1_000_000;
+          const headers = headersToRecord(stream.response?.headers);
+          // Usage telemetry (D-002 capture point 1) — tokens + ratelimit headers when present.
+          emitMeridianUsage({
+            model,
+            inputTokens: tokensIn,
+            outputTokens: tokensOut,
+            cacheReadTokens: resp.usage?.cache_read_input_tokens ?? undefined,
+            costUsd,
+            headers,
+          });
+          // Returning headers lets runWithRetry feed governor.recordResponse → header-driven
+          // pacing (limits auto-tune, low-headroom soft pacing) activates on API-key paths.
+          return { ok: true, value: { finalText, tokensIn, tokensOut, costUsd }, ...(headers ? { headers } : {}) };
         } catch (err) {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const e = err as any;

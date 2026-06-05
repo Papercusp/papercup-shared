@@ -11,11 +11,13 @@ export {
   setAgentConfigBootstrap,
   resolveBackend,
   resolveAgentBin,
+  setMeridianUsageSink,
   AGENT_BACKENDS,
   SUBPROCESS_AGENT_BACKENDS,
   type AgentBackend,
   type ChatEvent,
   type RunAgentChatOptions,
+  type MeridianUsageEvent,
 } from './chat-stream';
 
 // Agent-turn robustness (RB-*): the turn-error taxonomy + classifier, the backend governor
