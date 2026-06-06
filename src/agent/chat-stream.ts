@@ -119,6 +119,19 @@ export const CLAUDE_BUILTIN_TOOLS = [
 ] as const;
 
 /**
+ * Extra spawn-env entries for the claude-code backend. Today just the
+ * tool-search toggle: `disableToolSearch` → `ENABLE_TOOL_SEARCH=false`, which
+ * loads the (caller-shrunk) `--mcp-config` surface DIRECTLY instead of deferring
+ * it behind `ToolSearch` — the proven non-deferral lever for the operator brain
+ * (per-tool `_meta.alwaysLoad` is NOT honored over HTTP MCP on claude-code
+ * 2.1.x). Pure + exported for unit testing. See
+ * voice-persona-production-readiness P-009.
+ */
+export function claudeSpawnEnvOverrides(opts: { disableToolSearch?: boolean }): Record<string, string> {
+  return opts.disableToolSearch ? { ENABLE_TOOL_SEARCH: 'false' } : {};
+}
+
+/**
  * Optional bootstrap hook for callers that persist agent config to
  * disk (e.g. the operator's /settings/agent → ~/.papercusp/agent/
  * config.json). Called once per process before the first spawn so
@@ -912,12 +925,10 @@ export async function* runAgentChat(
       }
       spawnEnv = { ...process.env, CLAUDE_CONFIG_DIR: claudeConfigDir };
     }
-    if (opts.disableToolSearch) {
-      // Force the (caller-shrunk) MCP surface to load DIRECTLY — no ToolSearch
-      // deferral. Copy spawnEnv first: it may still alias process.env when
-      // isolateConfig is off, and we must not mutate the parent's env.
-      spawnEnv = { ...spawnEnv, ENABLE_TOOL_SEARCH: 'false' };
-    }
+    // Tool-search toggle (disableToolSearch → ENABLE_TOOL_SEARCH=false). Spread
+    // into a COPY: spawnEnv may still alias process.env when isolateConfig is
+    // off, and we must not mutate the parent's env.
+    spawnEnv = { ...spawnEnv, ...claudeSpawnEnvOverrides(opts) };
   } else if (backend === 'codex') {
     // codex (`codex exec`). Like claude, codex reads the prompt from
     // STDIN via the `-` positional (handled in the stdin block below).

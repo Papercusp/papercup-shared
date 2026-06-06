@@ -4,7 +4,19 @@
  */
 import { test, afterEach } from 'vitest';
 import assert from 'node:assert/strict';
-import { normalizeModelForClaude, headersToRecord, buildSystemParam, promptCacheEnabled } from './chat-stream';
+import { normalizeModelForClaude, headersToRecord, buildSystemParam, promptCacheEnabled, claudeSpawnEnvOverrides } from './chat-stream';
+
+// claudeSpawnEnvOverrides (voice-persona P-009): disableToolSearch →
+// ENABLE_TOOL_SEARCH=false so the operator brain's caller-shrunk MCP surface
+// loads directly instead of deferring behind ToolSearch. Default: no override
+// (every other spawn keeps the deferred default).
+test('claudeSpawnEnvOverrides — disableToolSearch sets ENABLE_TOOL_SEARCH=false', () => {
+  assert.deepEqual(claudeSpawnEnvOverrides({ disableToolSearch: true }), { ENABLE_TOOL_SEARCH: 'false' });
+});
+test('claudeSpawnEnvOverrides — default / false → no env override', () => {
+  assert.deepEqual(claudeSpawnEnvOverrides({}), {});
+  assert.deepEqual(claudeSpawnEnvOverrides({ disableToolSearch: false }), {});
+});
 
 // headersToRecord (P-004): SDK error `.headers` → a lowercased record so the TurnError
 // classifier can read retry-after / anthropic-ratelimit-* off it.
