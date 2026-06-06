@@ -97,12 +97,17 @@ export type AgentBackend = (typeof AGENT_BACKENDS)[number];
  * `claude -p` init's non-`mcp__` `tools` (v2.1).
  *
  * DELIBERATELY KEPT (NOT denied): `ToolSearch` + `ListMcpResourcesTool`/
- * `ReadMcpResourceTool`. A large `--mcp-config` surface (the 226 agentmcp
- * tools) is presented DEFERRED — `ToolSearch` is how the model ACTIVATES a
- * deferred tool before calling it. Denying it left the brain unable to call
- * ANY agentmcp tool: it narrated "checking…" every turn with zero tool calls
- * (verified regression, 2026-06-02). So we trim the dangerous built-ins but
- * preserve the tool-loading path.
+ * `ReadMcpResourceTool`. A large `--mcp-config` surface is presented DEFERRED —
+ * `ToolSearch` is how the model ACTIVATES a deferred tool before calling it.
+ * Denying it left the brain unable to call ANY agentmcp tool: it narrated
+ * "checking…" every turn with zero tool calls (verified regression,
+ * 2026-06-02). So we trim the dangerous built-ins but preserve the tool-loading
+ * path for callers that keep the deferred surface (workers/scopers etc.).
+ *
+ * A caller that instead SHRINKS its surface (operator brain: `?tools=`) and
+ * sets `disableToolSearch` gets that small set loaded DIRECTLY — `ToolSearch`
+ * is then unused (env-disabled), which is why the operator persona also tells
+ * the brain never to call it (voice-persona-production-readiness P-009).
  */
 export const CLAUDE_BUILTIN_TOOLS = [
   'Task', 'AskUserQuestion', 'Bash', 'CronCreate', 'CronDelete', 'CronList',
@@ -274,6 +279,21 @@ export interface RunAgentChatOptions {
    * `bypassPermissions`, `--allowed-tools` does NOT restrict the surface,
    * so this explicit deny-list is the lever. */
   disallowBuiltins?: boolean;
+  /**
+   * Load the `--mcp-config` tool surface DIRECTLY instead of deferring it
+   * behind `ToolSearch` (claude-code only — sets `ENABLE_TOOL_SEARCH=false` in
+   * the spawn env). Claude Code defers any MCP surface by default, so the model
+   * must `ToolSearch`-activate a tool before calling it — which makes a persona
+   * brain flail (multiple searches/turn, colon/underscore name guessing,
+   * occasional loops to the wall-cap). Empirically (claude-code 2.1.x) the
+   * per-tool `_meta.anthropic/alwaysLoad` marker is NOT honored over the HTTP
+   * MCP transport; `ENABLE_TOOL_SEARCH=false` is the lever that works.
+   *
+   * ONLY safe when the caller has already SHRUNK the surface (the operator
+   * brain pins `?tools=` to its ~50-tool working set): disabling deferral on a
+   * full 200+ tool surface would dump every schema into the prompt. Pair with a
+   * filtered `mcpConfig` URL. See voice-persona-production-readiness P-009. */
+  disableToolSearch?: boolean;
   /** Override the agent binary. Defaults to AGENT_CMD/CLAUDE_CMD env or
       'claude'/'omp' depending on backend. */
   agentCmd?: string;
@@ -891,6 +911,12 @@ export async function* runAgentChat(
         console.warn('[chat-stream] claude-code: failed to symlink credentials:', err);
       }
       spawnEnv = { ...process.env, CLAUDE_CONFIG_DIR: claudeConfigDir };
+    }
+    if (opts.disableToolSearch) {
+      // Force the (caller-shrunk) MCP surface to load DIRECTLY — no ToolSearch
+      // deferral. Copy spawnEnv first: it may still alias process.env when
+      // isolateConfig is off, and we must not mutate the parent's env.
+      spawnEnv = { ...spawnEnv, ENABLE_TOOL_SEARCH: 'false' };
     }
   } else if (backend === 'codex') {
     // codex (`codex exec`). Like claude, codex reads the prompt from
