@@ -16,6 +16,7 @@ export {
   invalidateClaudeTokenCache,
   AGENT_BACKENDS,
   SUBPROCESS_AGENT_BACKENDS,
+  CLAUDE_BUILTIN_TOOLS,
   type AgentBackend,
   type ChatEvent,
   type RunAgentChatOptions,
