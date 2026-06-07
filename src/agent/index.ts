@@ -12,6 +12,8 @@ export {
   resolveBackend,
   resolveAgentBin,
   setMeridianUsageSink,
+  readClaudeOauthToken,
+  invalidateClaudeTokenCache,
   AGENT_BACKENDS,
   SUBPROCESS_AGENT_BACKENDS,
   type AgentBackend,

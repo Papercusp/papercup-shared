@@ -431,9 +431,13 @@ function readMeridianToken(): string | null {
  * It's the same Claude-Max OAuth credential Meridian forwards, and works
  * directly against api.anthropic.com with the `anthropic-beta:
  * oauth-2025-04-20` header (verified) — no Meridian router needed. Cached.
+ *
+ * Exported for consumers that need to know whether a Claude session is
+ * present (e.g. the mem0 session-extraction probe) without duplicating
+ * the credentials-file parsing.
  */
 let _claudeTokenCache: string | null | undefined;
-function readClaudeOauthToken(): string | null {
+export function readClaudeOauthToken(): string | null {
   if (_claudeTokenCache !== undefined) return _claudeTokenCache;
   try {
     const raw = readFileSync(join(homedir(), '.claude', '.credentials.json'), 'utf8');
@@ -443,6 +447,19 @@ function readClaudeOauthToken(): string | null {
     _claudeTokenCache = null;
   }
   return _claudeTokenCache;
+}
+
+/**
+ * Drop the cached Claude OAuth token so the next read hits
+ * `~/.claude/.credentials.json` again. The claude CLI refreshes that
+ * file; a long-lived process (the operator) holding the per-process
+ * cache forever would eventually serve an expired token — the exact
+ * silent-auth-death class that made mem0 stillborn. Callers that see a
+ * 401/403 on the anthropic-direct transport invalidate, re-read, and
+ * retry once (mem0-extraction-via-claude-session P-004 / D-004).
+ */
+export function invalidateClaudeTokenCache(): void {
+  _claudeTokenCache = undefined;
 }
 
 interface StatelessTransport {
