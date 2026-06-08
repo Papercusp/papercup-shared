@@ -9,6 +9,8 @@ import {
   modelClassOf,
   getGovernor,
   governorForBackend,
+  governorKey,
+  parseGovernorKey,
   resetGovernorRegistry,
   resolveLimitModel,
   resolveProviderLimitModel,
@@ -238,4 +240,54 @@ test('AIMD — inactive (effective null, no adaptation) until a finite cap is in
   assert.equal(effectiveConcurrencySnapshot().effective, null);
   (await g.acquire({}))!(); // clean turn → still inactive, no crash
   assert.equal(effectiveConcurrencySnapshot().effective, null);
+});
+
+// ── Per-account bucket keying (cloud-deployment-layer Phase 7, P-019) ─────────
+
+test('governorKey — global without an account, account-scoped with one', () => {
+  assert.equal(governorKey('anthropic', 'opus'), 'anthropic:opus');
+  assert.equal(governorKey('anthropic', 'opus', 'acct-1'), 'anthropic:opus@acct-1');
+});
+
+test('parseGovernorKey — round-trips both forms', () => {
+  assert.deepEqual(parseGovernorKey('anthropic:opus'), { provider: 'anthropic', modelClass: 'opus', accountId: undefined });
+  assert.deepEqual(parseGovernorKey('anthropic:opus@acct-1'), { provider: 'anthropic', modelClass: 'opus', accountId: 'acct-1' });
+});
+
+test('getGovernor — distinct singletons per account; same account returns the same instance', () => {
+  const global = getGovernor('anthropic', 'opus');
+  const a1 = getGovernor('anthropic', 'opus', undefined, 'acct-1');
+  const a2 = getGovernor('anthropic', 'opus', undefined, 'acct-2');
+  assert.notEqual(a1, global);
+  assert.notEqual(a1, a2);
+  assert.equal(getGovernor('anthropic', 'opus', undefined, 'acct-1'), a1);
+});
+
+test('per-account pause does NOT pause another account or the global bucket', () => {
+  const a1 = getGovernor('anthropic', 'opus', undefined, 'acct-1');
+  const a2 = getGovernor('anthropic', 'opus', undefined, 'acct-2');
+  const global = getGovernor('anthropic', 'opus');
+  a1.penalize({ retryAfterMs: 60_000 });
+  assert.ok(a1.snapshot().pausedUntil > Date.now()); // acct-1 paused
+  assert.equal(a2.snapshot().pausedUntil, 0); // acct-2 untouched
+  assert.equal(global.snapshot().pausedUntil, 0); // global untouched
+});
+
+test('snapshotGovernors — surfaces accountId for account-scoped buckets', () => {
+  getGovernor('anthropic', 'opus'); // global
+  getGovernor('anthropic', 'opus', undefined, 'acct-9'); // account-scoped
+  const snaps = snapshotGovernors();
+  const global = snaps.find((s) => s.key === 'anthropic:opus');
+  const scoped = snaps.find((s) => s.key === 'anthropic:opus@acct-9');
+  assert.equal(global?.accountId, undefined);
+  assert.equal(scoped?.accountId, 'acct-9');
+  assert.equal(scoped?.modelClass, 'opus');
+});
+
+test('governorForBackend — threads accountId into the bucket key', () => {
+  const g = governorForBackend('claude-code', 'claude-opus-4-8', undefined, 'acct-7');
+  const hit = snapshotGovernors().find((s) => s.accountId === 'acct-7');
+  assert.ok(hit, 'an account-scoped bucket should exist');
+  assert.equal(hit!.key, 'anthropic:opus@acct-7');
+  assert.equal(g, getGovernor('anthropic', 'opus', undefined, 'acct-7'));
 });
