@@ -80,6 +80,23 @@ test('classifySubprocessResult — transient RPM stderr → rate_limited (retrya
   assert.equal(classifySubprocessResult({ exitCode: 1, stderr: 'rate limit exceeded, retry after 30s' }).class, 'rate_limited');
   assert.equal(classifySubprocessResult({ exitCode: 1, stderr: 'slow down — too many requests' }).class, 'rate_limited');
 });
+test('classifySubprocessResult — rate-limit in STDOUT on a FAILED exit → rate_limited (claude prints it there)', () => {
+  // The claude CLI emits "API Error: Server is temporarily limiting requests … · Rate limited" to
+  // STDOUT with EMPTY stderr (observed: bee exit 1, empty stderr, 507 stdout chars). Pre-fix this
+  // fell through to agent_crash so the fleet governor never backed off. Now stdout is scanned on failure.
+  const e = classifySubprocessResult({
+    exitCode: 1,
+    stderr: '',
+    stdout: 'API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited',
+  });
+  assert.equal(e.class, 'rate_limited');
+  assert.equal(e.retryable, true);
+});
+test('classifySubprocessResult — "rate limit" in STDOUT on a CLEAN exit is NOT misclassified (false-positive guard)', () => {
+  // A successful bee whose OUTPUT merely discusses rate limits must stay a success, not rate_limited.
+  const e = classifySubprocessResult({ exitCode: 0, stderr: '', stdout: 'I added rate limit handling to the governor. Done.' });
+  assert.notEqual(e.class, 'rate_limited');
+});
 // D-001: the Claude/OpenAI subscription/plan CAP is a DISTINCT class from a transient 429 — it is
 // capped until a (often hours-off) reset, so retrying is futile: NOT retryable, surfaced, paused.
 test('classifySubprocessResult — plan/usage cap stderr → usage_limit (not retryable, surfaced)', () => {

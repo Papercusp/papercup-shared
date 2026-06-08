@@ -129,7 +129,12 @@ const USAGE_LIMIT_RE =
   /(usage limit|session limit|weekly limit|monthly limit|daily limit|\d+-?hour limit|hit your (?:session|usage|weekly|monthly|daily) limit|insufficient_quota|quota exceeded|exceeded your (?:current )?quota|out of (?:credits|quota))/i;
 // Transient acceleration / requests-per-minute 429 — back off the fleet briefly + retry. The
 // usage-cap phrases were SPLIT OUT into USAGE_LIMIT_RE above (D-001).
-const RATE_RE = /(\b429\b|rate.?limit|too many requests|slow down)/i;
+const RATE_RE = /(\b429\b|rate.?limit|too many requests|slow down|temporarily limiting)/i;
+// Anthropic's TRANSIENT-overload line — "Server is temporarily limiting requests (not your usage
+// limit) · Rate limited" — contains the substring "usage limit", which would otherwise trip
+// USAGE_LIMIT_RE (a plan CAP: pause-until-far-reset, no retry) — the OPPOSITE disposition to the
+// transient 429 it actually is. This guard forces such text down the rate_limited (retry) path.
+const TRANSIENT_OVERRIDE_RE = /temporarily limiting|not (?:your|a) (?:usage|session|weekly|monthly|daily) limit/i;
 const OVERLOAD_RE = /(\b529\b|overloaded|service unavailable|\b50[0234]\b)/i;
 const AUTH_RE = /(\b401\b|\b403\b|unauthorized|forbidden|invalid api key|authentication)/i;
 const IO_RE = /(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|network|fetch failed)/i;
@@ -193,10 +198,10 @@ export function classifyHttpError(
   // A plan/usage CAP (429 w/ insufficient_quota, or a no-status message naming a usage cap) →
   // pause-until-reset + surface, do NOT retry. Checked before the transient-429 branch since the
   // disposition is opposite (D-001). The header reset (if any) IS the cap's reset time.
-  if (USAGE_LIMIT_RE.test(msg) && (st === 429 || st === undefined)) {
+  if (USAGE_LIMIT_RE.test(msg) && !TRANSIENT_OVERRIDE_RE.test(msg) && (st === 429 || st === undefined)) {
     return mk('usage_limit', msg, provider, { retryAfterMs, resetAt });
   }
-  if (st === 429 || (st === undefined && RATE_RE.test(msg))) {
+  if (st === 429 || (st === undefined && (RATE_RE.test(msg) || TRANSIENT_OVERRIDE_RE.test(msg)))) {
     return mk('rate_limited', msg, provider, { retryAfterMs, resetAt });
   }
   if (st === 529 || st === 503 || st === 502 || st === 500 || st === 504 || (st === undefined && OVERLOAD_RE.test(msg))) {
@@ -218,29 +223,37 @@ export function classifySubprocessResult(
 ): TurnError {
   const stderr = input.stderr ?? '';
   if (input.timedOut) return mk('timeout', 'subprocess timed out', provider);
+  // The claude/codex CLIs print API errors (rate limit, overload, auth) to STDOUT, not stderr —
+  // e.g. "API Error: Server is temporarily limiting requests … · Rate limited" with EMPTY stderr.
+  // Fold stdout into the pattern scan ON A FAILED EXIT so such a bee is classified `rate_limited`
+  // (→ the fleet governor's 429 backoff / AIMD) instead of a generic `agent_crash`. Gated on
+  // failure so a SUCCESSFUL bee whose output merely mentions "rate limit" isn't misclassified.
+  const failed = !!input.signal || (input.exitCode !== 0 && input.exitCode !== null);
+  const scan = failed ? `${stderr}\n${input.stdout ?? ''}` : stderr;
+  const errText = stderr.trim() ? stderr : failed ? input.stdout ?? '' : '';
   // Plan/usage CAP first (opposite disposition to a transient 429): pause-until-reset + surface,
   // no retry. The CLI prints the reset in the message ("resets 4:20am"), so parse it best-effort.
-  if (USAGE_LIMIT_RE.test(stderr)) {
-    const resetAt = parseUsageResetMs(stderr, now);
-    return mk('usage_limit', stderr.slice(0, 200) || 'usage limit reached', provider, resetAt !== undefined ? { resetAt } : undefined);
+  if (USAGE_LIMIT_RE.test(scan) && !TRANSIENT_OVERRIDE_RE.test(scan)) {
+    const resetAt = parseUsageResetMs(scan, now);
+    return mk('usage_limit', errText.slice(0, 200) || 'usage limit reached', provider, resetAt !== undefined ? { resetAt } : undefined);
   }
-  if (RATE_RE.test(stderr)) {
+  if (RATE_RE.test(scan)) {
     // Some CLIs print "retry after 30s" / "try again in 12 seconds".
-    const m = /(?:retry after|try again in|wait)\s+(\d+(?:\.\d+)?)\s*(s|sec|seconds|m|min|minutes|ms)?/i.exec(stderr);
+    const m = /(?:retry after|try again in|wait)\s+(\d+(?:\.\d+)?)\s*(s|sec|seconds|m|min|minutes|ms)?/i.exec(scan);
     let retryAfterMs: number | undefined;
     if (m) {
       const n = parseFloat(m[1]);
       const unit = (m[2] ?? 's').toLowerCase();
       retryAfterMs = unit.startsWith('ms') ? n : unit.startsWith('m') ? n * 60_000 : n * 1000;
     }
-    return mk('rate_limited', stderr.slice(0, 200) || 'rate limited', provider, { retryAfterMs });
+    return mk('rate_limited', errText.slice(0, 200) || 'rate limited', provider, { retryAfterMs });
   }
-  if (OVERLOAD_RE.test(stderr)) return mk('overloaded', stderr.slice(0, 200), provider);
-  if (AUTH_RE.test(stderr)) return mk('auth', stderr.slice(0, 200), provider);
-  if (IO_RE.test(stderr)) return mk('transient_io', stderr.slice(0, 200), provider);
+  if (OVERLOAD_RE.test(scan)) return mk('overloaded', errText.slice(0, 200), provider);
+  if (AUTH_RE.test(scan)) return mk('auth', errText.slice(0, 200), provider);
+  if (IO_RE.test(scan)) return mk('transient_io', errText.slice(0, 200), provider);
   if (input.signal) return mk('agent_crash', `killed by ${input.signal}`, provider);
   if (input.exitCode !== 0 && input.exitCode !== null) {
-    return mk('agent_crash', stderr.slice(0, 200) || `exit ${input.exitCode}`, provider);
+    return mk('agent_crash', errText.slice(0, 200) || `exit ${input.exitCode}`, provider);
   }
   // Exit 0 (or null with no signal): success-ish — only empty output is a failure here.
   if (!input.stdout || !input.stdout.trim()) return mk('empty_output', 'agent produced no output', provider);
