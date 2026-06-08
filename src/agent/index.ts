@@ -46,6 +46,8 @@ export {
   resolveProviderLimitModel,
   onGovernorPause,
   snapshotGovernors,
+  governorKey,
+  parseGovernorKey,
   resetGovernorRegistry,
   setGovernorStore,
   setGlobalConcurrencyCap,

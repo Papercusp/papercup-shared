@@ -172,8 +172,26 @@ export function setGovernorStore(store: GovernorStore | undefined): void {
   registry.clear();
 }
 
-export function governorKey(provider: TurnProvider, modelClass: string): string {
-  return `${provider}:${modelClass}`;
+/**
+ * The bucket key for a `(provider, modelClass)` — optionally scoped to a specific
+ * ACCOUNT (`cloud-deployment-layer` Phase 7, P-019). With no `accountId` the key is
+ * the global `<provider>:<modelClass>` (unchanged — shared across the fleet). With
+ * one it is `<provider>:<modelClass>@<accountId>`, giving that Claude account its
+ * OWN governor state + (under the PG store) its own budget row, so accounts with
+ * separate subscriptions track their separate rate limits. The `@` delimiter never
+ * appears in `provider`/`modelClass`; account ids are validated to exclude it.
+ */
+export function governorKey(provider: TurnProvider, modelClass: string, accountId?: string): string {
+  return accountId ? `${provider}:${modelClass}@${accountId}` : `${provider}:${modelClass}`;
+}
+
+/** Inverse of `governorKey` — split a bucket key back into its parts. */
+export function parseGovernorKey(key: string): { provider: TurnProvider; modelClass: string; accountId?: string } {
+  const at = key.indexOf('@');
+  const accountId = at >= 0 ? key.slice(at + 1) : undefined;
+  const base = at >= 0 ? key.slice(0, at) : key;
+  const idx = base.indexOf(':');
+  return { provider: base.slice(0, idx) as TurnProvider, modelClass: base.slice(idx + 1), accountId };
 }
 
 // --- Pause observability (RB-009) -------------------------------------------------------
@@ -199,9 +217,9 @@ function emitGovernorPause(ev: GovernorPauseEvent & { key: string }): void {
   }
 }
 
-/** The singleton governor for a `(provider, modelClass)` bucket (created on first use). */
-export function getGovernor(provider: TurnProvider, modelClass: string, deps?: GovernorDeps): RateLimitGovernor {
-  const key = governorKey(provider, modelClass);
+/** The singleton governor for a `(provider, modelClass[, accountId])` bucket (created on first use). */
+export function getGovernor(provider: TurnProvider, modelClass: string, deps?: GovernorDeps, accountId?: string): RateLimitGovernor {
+  const key = governorKey(provider, modelClass, accountId);
   let g = registry.get(key);
   if (!g) {
     g = new RateLimitGovernor(
@@ -227,6 +245,8 @@ export interface GovernorSnapshot {
   key: string;
   provider: TurnProvider;
   modelClass: string;
+  /** Set when the bucket is scoped to a specific account (P-019); else global. */
+  accountId?: string;
   /** Runtime credential fact (D-006): precise apiKey bucket vs coarse subscription. */
   limitModel: LimitModel;
   state: GovernorState;
@@ -237,12 +257,12 @@ export interface GovernorSnapshot {
 export function snapshotGovernors(): GovernorSnapshot[] {
   const out: GovernorSnapshot[] = [];
   for (const [key, g] of registry) {
-    const idx = key.indexOf(':');
-    const provider = key.slice(0, idx) as TurnProvider;
+    const { provider, modelClass, accountId } = parseGovernorKey(key);
     out.push({
       key,
       provider,
-      modelClass: key.slice(idx + 1),
+      modelClass,
+      ...(accountId ? { accountId } : {}),
       limitModel: resolveProviderLimitModel(provider),
       state: g.snapshot(),
     });
@@ -251,10 +271,12 @@ export function snapshotGovernors(): GovernorSnapshot[] {
 }
 
 /** Resolve the right shared governor for a backend + model: self-pacing backends (omp)
-    collapse to a single concurrency-only bucket; others key by provider+model-class. */
-export function governorForBackend(backend: TurnBackend, model: string, deps?: GovernorDeps): RateLimitGovernor {
+    collapse to a single concurrency-only bucket; others key by provider+model-class. An
+    `accountId` (e.g. a frame's `PAPERCUSP_ACCOUNT_ID`) scopes the bucket to that account
+    so its separate subscription tracks its separate rate limits (P-019). */
+export function governorForBackend(backend: TurnBackend, model: string, deps?: GovernorDeps, accountId?: string): RateLimitGovernor {
   const p = BACKEND_PROFILES[backend];
-  return getGovernor(p.provider, p.selfPacing ? 'self' : modelClassOf(model), deps);
+  return getGovernor(p.provider, p.selfPacing ? 'self' : modelClassOf(model), deps, accountId);
 }
 
 /** Test hook — drop all singletons + reset the fleet-wide in-flight counter (cap is left as set;
