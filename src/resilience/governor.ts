@@ -49,6 +49,28 @@ export interface GovernorState {
    */
   paceDelayMs: number;
   lastAcquireAt: number; // epoch ms of the last granted acquire (anchors the pace gap)
+  /**
+   * The most-constraining UNIFIED window observed from the latest response (Claude
+   * Max/Pro subscription dialect — `anthropic-ratelimit-unified-*`). Subscriptions
+   * expose a rolling-UTILIZATION budget (a 5-hour + 7-day window), NOT the per-minute
+   * RPM/ITPM/OTPM headers, so this is the only honest "how close to the cap?" signal
+   * for a subscription account. `undefined` until a unified header is seen. Observability
+   * only (the pause/pace it drives lives in `pausedUntil`/`paceDelayMs`); surfaced by
+   * `snapshot()` for the rate read-model (RB-009 / hive-inference-gateway P-014).
+   */
+  unified?: UnifiedWindowState;
+}
+
+/** The rolled-up state of the most-constraining unified (subscription) rate window. */
+export interface UnifiedWindowState {
+  /** Which window binds: `5h` | `7d` | `unified` (the representative claim). */
+  window: string;
+  /** Utilization fraction of that window (1.0 = at cap; >1 = over). */
+  utilization: number;
+  /** Epoch ms the binding window resets. 0 = unknown. */
+  resetAt: number;
+  /** Server verdict for the binding window: true once `status: rejected` was seen. */
+  rejected: boolean;
 }
 
 export interface TokenEstimate {
@@ -75,6 +97,11 @@ const RESUME_STAGGER_MAX_MS = 5_000;
 // soft pacing never becomes a de-facto long pause (that's what a 429 penalty is for).
 const LOW_WATERMARK = 0.2;
 const MAX_PACE_DELAY_MS = 5_000;
+// Unified (subscription) dialect: above this utilization fraction of the binding window we start
+// pre-emptively pacing — the per-request gap grows linearly from 0 at the watermark to
+// MAX_PACE_DELAY_MS as utilization → 1, so a 5-hour budget glides toward its reset instead of
+// being burned early then hard-stopping for hours. `status: rejected` still hard-pauses to reset.
+const UNIFIED_PACE_WATERMARK = 0.8;
 
 export function initGovernorState(limits: GovernorLimits): GovernorState {
   return {
@@ -178,6 +205,16 @@ const LC = (h: Record<string, string | undefined>): Record<string, string | unde
   return o;
 };
 
+/** Parse a rate-reset header to epoch ms. The classic Anthropic dialect uses ISO-8601;
+    the unified (subscription) dialect uses a bare unix-SECONDS integer. Returns 0 if unparseable. */
+function parseResetToMs(v: string | undefined): number {
+  if (!v) return 0;
+  const n = Number(v);
+  if (Number.isFinite(n)) return n < 1e12 ? Math.round(n * 1000) : Math.round(n); // seconds vs already-ms
+  const t = Date.parse(v);
+  return Number.isNaN(t) ? 0 : t;
+}
+
 /** Sync limits + pause from response headers (header-driven precise mode). */
 export function recordHeaders(s: GovernorState, headers: Record<string, string | undefined>, now: number): void {
   const h = LC(headers);
@@ -219,6 +256,41 @@ export function recordHeaders(s: GovernorState, headers: Record<string, string |
       if (spread > pace) pace = spread;
     }
   }
+
+  // Unified (subscription) dialect: rolling-UTILIZATION windows (5h + 7d), not per-minute
+  // buckets — a Claude Max/Pro account never returns the classic `*-limit` headers. A window
+  // `status: rejected` → hard-pause to its reset; high utilization (< 1, still allowed) →
+  // pre-emptive pace that grows linearly past the watermark. The most-constraining window is
+  // recorded on `s.unified` for observability (P-014). Resets are unix seconds here.
+  const unifiedWindows: Array<{ window: string; statusK: string; utilK: string; resetK: string }> = [
+    { window: '5h', statusK: 'anthropic-ratelimit-unified-5h-status', utilK: 'anthropic-ratelimit-unified-5h-utilization', resetK: 'anthropic-ratelimit-unified-5h-reset' },
+    { window: '7d', statusK: 'anthropic-ratelimit-unified-7d-status', utilK: 'anthropic-ratelimit-unified-7d-utilization', resetK: 'anthropic-ratelimit-unified-7d-reset' },
+    { window: 'unified', statusK: 'anthropic-ratelimit-unified-status', utilK: 'anthropic-ratelimit-unified-utilization', resetK: 'anthropic-ratelimit-unified-reset' },
+  ];
+  let binding: UnifiedWindowState | undefined;
+  for (const w of unifiedWindows) {
+    const status = h[w.statusK];
+    const util = num(h[w.utilK]);
+    if (status === undefined && util === undefined) continue; // window not present
+    const resetAt = parseResetToMs(h[w.resetK]);
+    const rejected = status === 'rejected';
+    if (rejected && resetAt > s.pausedUntil) s.pausedUntil = resetAt; // hard backpressure to reset
+    if (util !== undefined && util > UNIFIED_PACE_WATERMARK && util < 1 && resetAt > now) {
+      const gap = Math.min(
+        MAX_PACE_DELAY_MS,
+        Math.round((MAX_PACE_DELAY_MS * (util - UNIFIED_PACE_WATERMARK)) / (1 - UNIFIED_PACE_WATERMARK)),
+      );
+      if (gap > pace) pace = gap;
+    }
+    // Most-constraining window wins for observability: a rejected window beats an allowed one;
+    // among same-verdict windows, the higher utilization binds.
+    const u = util ?? (rejected ? 1 : 0);
+    if (!binding || (rejected && !binding.rejected) || (rejected === binding.rejected && u > binding.utilization)) {
+      binding = { window: w.window, utilization: u, resetAt, rejected };
+    }
+  }
+  if (binding) s.unified = binding;
+
   s.paceDelayMs = pace;
 }
 

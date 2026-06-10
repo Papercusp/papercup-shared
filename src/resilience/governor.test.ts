@@ -454,3 +454,74 @@ test('AIMD hooks — clean release fires noteClean; an in-flight penalty suppres
   assert.equal(clean, 2);
   assert.equal(inFlight, 0); // all global slots returned
 });
+
+// --- unified (subscription) dialect: rolling-utilization windows (hive-inference-gateway D-009) ---
+test('recordHeaders — unified 5h rejected hard-pauses to the (unix-seconds) reset', () => {
+  const s = initGovernorState({ maxConcurrent: 10 });
+  const resetSec = 1_781_076_000; // unix seconds
+  recordHeaders(
+    s,
+    {
+      'anthropic-ratelimit-unified-5h-status': 'rejected',
+      'anthropic-ratelimit-unified-5h-utilization': '1.01',
+      'anthropic-ratelimit-unified-5h-reset': String(resetSec),
+      'anthropic-ratelimit-unified-7d-status': 'allowed',
+      'anthropic-ratelimit-unified-7d-utilization': '0.2',
+      'anthropic-ratelimit-unified-7d-reset': String(resetSec + 330_000),
+      'anthropic-ratelimit-unified-status': 'rejected',
+      'anthropic-ratelimit-unified-reset': String(resetSec),
+      'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+    },
+    1_000,
+  );
+  assert.equal(s.pausedUntil, resetSec * 1000, 'paused to the unix-seconds reset, in ms');
+  assert.ok(s.unified, 'unified state recorded');
+  assert.equal(s.unified!.rejected, true);
+  assert.equal(s.unified!.window, '5h'); // 5h binds over the allowed 7d
+  assert.equal(s.unified!.utilization, 1.01);
+  assert.equal(decideAcquire(s, 1_000, {}).allowed, false); // blocked until reset
+  assert.equal(decideAcquire(s, resetSec * 1000 + 1, {}).allowed, true);
+});
+
+test('recordHeaders — unified high utilization (allowed) sets pre-emptive pace, not a pause', () => {
+  const s = initGovernorState({ maxConcurrent: 10 });
+  const now = 1_000;
+  const resetMs = now + 3_600_000;
+  recordHeaders(
+    s,
+    {
+      'anthropic-ratelimit-unified-5h-status': 'allowed',
+      'anthropic-ratelimit-unified-5h-utilization': '0.9', // halfway from watermark 0.8 → 1.0
+      'anthropic-ratelimit-unified-5h-reset': String(Math.round(resetMs / 1000)),
+    },
+    now,
+  );
+  assert.equal(s.pausedUntil, 0, 'allowed window does not pause');
+  // gap = 5000 * (0.9 - 0.8)/(1 - 0.8) = 5000 * 0.5 = 2500
+  assert.equal(s.paceDelayMs, 2500);
+  assert.equal(s.unified!.rejected, false);
+  assert.equal(s.unified!.utilization, 0.9);
+});
+
+test('recordHeaders — unified utilization below the watermark paces 0 (healthy)', () => {
+  const s = initGovernorState({ maxConcurrent: 10 });
+  recordHeaders(
+    s,
+    {
+      'anthropic-ratelimit-unified-5h-status': 'allowed',
+      'anthropic-ratelimit-unified-5h-utilization': '0.2',
+      'anthropic-ratelimit-unified-5h-reset': '1781076000',
+    },
+    1_000,
+  );
+  assert.equal(s.paceDelayMs, 0);
+  assert.equal(s.pausedUntil, 0);
+  assert.equal(s.unified!.utilization, 0.2);
+});
+
+test('recordHeaders — classic and unified dialects are independent; absent unified leaves s.unified undefined', () => {
+  const s = initGovernorState({ maxConcurrent: 10 });
+  recordHeaders(s, { 'anthropic-ratelimit-requests-limit': '1000' }, 1_000);
+  assert.equal(s.limits.rpm, 1000);
+  assert.equal(s.unified, undefined, 'no unified headers → no unified state');
+});
