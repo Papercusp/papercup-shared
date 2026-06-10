@@ -25,6 +25,7 @@ export {
   type AcquireOpts,
   type AcquireDecision,
   type TokenEstimate,
+  type UnifiedWindowState,
 } from './governor';
 export {
   runWithRetry,
@@ -34,3 +35,9 @@ export {
   type RetryOptions,
   type RetryDeps,
 } from './retry';
+export {
+  PriorityAdmissionQueue,
+  priorityFromLabel,
+  type PriorityAdmissionOptions,
+  type AdmissionSnapshot,
+} from './priority-admission';
