@@ -58,6 +58,8 @@ export interface MeridianUsageEvent {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens?: number;
+  /** Prompt-cache WRITE tokens (anthropic `cache_creation_input_tokens`) when reported. */
+  cacheCreationTokens?: number;
   costUsd: number;
   /** Lower-cased response headers when the transport exposed them (anthropic-ratelimit-*). */
   headers?: Record<string, string | undefined>;
@@ -679,6 +681,7 @@ async function* meridianAgentChat(
         inputTokens,
         outputTokens,
         cacheReadTokens: resp.usage?.cache_read_input_tokens ?? undefined,
+        cacheCreationTokens: resp.usage?.cache_creation_input_tokens ?? undefined,
         costUsd,
         headers: headersToRecord(stream.response?.headers),
       });
@@ -770,6 +773,7 @@ async function* governedMeridian(
             inputTokens: tokensIn,
             outputTokens: tokensOut,
             cacheReadTokens: resp.usage?.cache_read_input_tokens ?? undefined,
+            cacheCreationTokens: resp.usage?.cache_creation_input_tokens ?? undefined,
             costUsd,
             headers,
           });
