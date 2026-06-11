@@ -10,6 +10,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   resolveBackend,
   resolveAgentBin,
+  tokenIsLive,
+  chooseStatelessTransport,
+  isConnectionFailure,
   type AgentBackend,
   type RunAgentChatOptions,
 } from './chat-stream';
@@ -111,5 +114,60 @@ describe('resolveAgentBin', () => {
     expect(resolveAgentBin(opts(), 'claude-code')).toBe('claude');
     // meridian has no subprocess of its own → default claude binary
     expect(resolveAgentBin(opts(), 'meridian')).toBe('claude');
+  });
+});
+
+// EI-281: the stateless-transport selection seam. The box-level failure was an
+// EXPIRED omp token (auth.json `expires` long past) winning over a fresh Claude
+// OAuth session, then 8 doomed round-trips to a dead 127.0.0.1:3456.
+describe('tokenIsLive (EI-281)', () => {
+  const NOW = 1_781_145_000_000;
+
+  it('no recorded expiry → live (some auth files omit it)', () => {
+    expect(tokenIsLive(undefined, NOW)).toBe(true);
+    expect(tokenIsLive(null, NOW)).toBe(true);
+  });
+
+  it('an expired token is dead', () => {
+    expect(tokenIsLive(NOW - 1, NOW)).toBe(false);
+    // the real EI-281 shape: omp token expired 2026-04-12, now 2026-06-11
+    expect(tokenIsLive(1_775_896_076_789, NOW)).toBe(false);
+  });
+
+  it('a token inside the 60s skew window is treated as already dead', () => {
+    expect(tokenIsLive(NOW + 30_000, NOW)).toBe(false);
+    expect(tokenIsLive(NOW + 61_000, NOW)).toBe(true);
+  });
+});
+
+describe('chooseStatelessTransport (EI-281)', () => {
+  it('claude-code backend with a Claude session goes direct', () => {
+    expect(chooseStatelessTransport({ backend: 'claude-code', claudeTok: 'c', meridianTok: 'm' })).toBe('anthropic-direct');
+  });
+
+  it('omp backend with a live meridian token routes via meridian', () => {
+    expect(chooseStatelessTransport({ backend: 'omp', claudeTok: 'c', meridianTok: 'm' })).toBe('meridian');
+  });
+
+  it('the EI-281 box shape — omp backend, expired omp token (filtered to null), fresh Claude session → direct', () => {
+    expect(chooseStatelessTransport({ backend: 'omp', claudeTok: 'c', meridianTok: null })).toBe('anthropic-direct');
+  });
+
+  it('neither credential usable → null', () => {
+    expect(chooseStatelessTransport({ backend: 'omp', claudeTok: null, meridianTok: null })).toBeNull();
+  });
+});
+
+describe('isConnectionFailure (EI-281)', () => {
+  it("matches the SDK's masked APIConnectionError and raw syscall failures", () => {
+    expect(isConnectionFailure(new Error('Connection error.'))).toBe(true);
+    expect(isConnectionFailure(new Error('connect ECONNREFUSED 127.0.0.1:3456'))).toBe(true);
+    expect(isConnectionFailure(new Error('fetch failed'))).toBe(true);
+  });
+
+  it('does not match HTTP-level errors (those are retry/transient territory)', () => {
+    expect(isConnectionFailure(new Error('529 {"type":"overloaded_error"}'))).toBe(false);
+    expect(isConnectionFailure(new Error('401 unauthorized'))).toBe(false);
+    expect(isConnectionFailure(new Error('rate limited'))).toBe(false);
   });
 });

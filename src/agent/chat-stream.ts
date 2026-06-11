@@ -414,18 +414,36 @@ export type ChatEvent =
 // pricing / retry / streaming surface below serves both.
 // ===========================================================================
 
-let _meridianTokenCache: string | null | undefined; // undefined = not loaded; null = no token
+let _meridianTokenCache: { access: string; expires: number | null } | null | undefined; // undefined = not loaded; null = no token
+
+/** Tokens this close to their recorded expiry are treated as already dead —
+    a request issued now would land server-side past the cutoff. */
+const TOKEN_EXPIRY_SKEW_MS = 60_000;
+
+/**
+ * Whether a token with this recorded expiry (ms epoch; null/undefined = no
+ * recorded expiry) is still usable at `nowMs`. EI-281: an expired omp token
+ * must not win transport selection over a live Claude session.
+ */
+export function tokenIsLive(expires: number | null | undefined, nowMs: number = Date.now()): boolean {
+  return expires == null || expires > nowMs + TOKEN_EXPIRY_SKEW_MS;
+}
 
 function readMeridianToken(): string | null {
-  if (_meridianTokenCache !== undefined) return _meridianTokenCache;
-  try {
-    const raw = readFileSync(join(homedir(), '.omp', 'agent', 'auth.json'), 'utf8');
-    const parsed = JSON.parse(raw) as { anthropic?: { token?: { access?: string } } };
-    _meridianTokenCache = parsed.anthropic?.token?.access ?? null;
-  } catch {
-    _meridianTokenCache = null;
+  if (_meridianTokenCache === undefined) {
+    try {
+      const raw = readFileSync(join(homedir(), '.omp', 'agent', 'auth.json'), 'utf8');
+      const parsed = JSON.parse(raw) as { anthropic?: { token?: { access?: string; expires?: number } } };
+      const access = parsed.anthropic?.token?.access;
+      _meridianTokenCache = access ? { access, expires: parsed.anthropic?.token?.expires ?? null } : null;
+    } catch {
+      _meridianTokenCache = null;
+    }
   }
-  return _meridianTokenCache;
+  // Expiry is evaluated per read (not baked into the cache) so a token that
+  // expires while this process is long-lived flips to null on its own.
+  if (!_meridianTokenCache || !tokenIsLive(_meridianTokenCache.expires)) return null;
+  return _meridianTokenCache.access;
 }
 
 /**
@@ -471,41 +489,58 @@ interface StatelessTransport {
   label: 'anthropic-direct' | 'meridian';
 }
 
-/**
- * Resolve the transport for a stateless Anthropic-format call.
- *
- *  - claude-code backend (or no Meridian token but a Claude session present)
- *    → DIRECT to api.anthropic.com with the Claude OAuth session. Meridian is
- *    the multi-provider router; a claude user doesn't need it.
- *  - otherwise → the local Meridian router with omp's OAuth token, carrying a
- *    per-call-unique `x-meridian-agent` so requests don't fold into a shared
- *    agent context.
- *
- * Returns `{ error }` when neither credential is present.
- */
-function resolveStatelessTransport(): StatelessTransport | { error: string } {
-  const backend = resolveBackend({}); // env-driven effective agent backend
-  const claudeTok = readClaudeOauthToken();
-  const meridianTok = readMeridianToken();
-  const direct = (): StatelessTransport => ({
+function anthropicDirectTransport(claudeTok: string): StatelessTransport {
+  return {
     baseURL: process.env.PAPERCUSP_ANTHROPIC_URL ?? 'https://api.anthropic.com',
-    token: claudeTok!,
+    token: claudeTok,
     headers: { 'anthropic-beta': 'oauth-2025-04-20' },
     label: 'anthropic-direct',
-  });
-  const viaMeridian = (): StatelessTransport => ({
+  };
+}
+
+function meridianTransport(meridianTok: string): StatelessTransport {
+  return {
     baseURL: process.env.PAPERCUSP_MERIDIAN_URL ?? 'http://127.0.0.1:3456',
-    token: meridianTok!,
+    token: meridianTok,
     headers: { 'x-meridian-agent': `papercup-llm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}` },
     label: 'meridian',
-  });
-  if (backend === 'claude-code' && claudeTok) return direct();
-  if (meridianTok) return viaMeridian();
-  if (claudeTok) return direct();
+  };
+}
+
+/**
+ * Pure transport choice for a stateless Anthropic-format call. Callers pass
+ * tokens that are already expiry-filtered (`readMeridianToken` returns null
+ * for an expired omp token — EI-281), so precedence stays backend-keyed:
+ *
+ *  - claude-code backend (or no live Meridian token but a Claude session
+ *    present) → DIRECT to api.anthropic.com with the Claude OAuth session.
+ *    Meridian is the multi-provider router; a claude user doesn't need it.
+ *  - otherwise → the local Meridian router with omp's OAuth token.
+ *
+ * Returns null when neither credential is usable.
+ */
+export function chooseStatelessTransport(args: {
+  backend: AgentBackend;
+  claudeTok: string | null;
+  meridianTok: string | null;
+}): 'anthropic-direct' | 'meridian' | null {
+  if (args.backend === 'claude-code' && args.claudeTok) return 'anthropic-direct';
+  if (args.meridianTok) return 'meridian';
+  if (args.claudeTok) return 'anthropic-direct';
+  return null;
+}
+
+function resolveStatelessTransport(): StatelessTransport | { error: string } {
+  const backend = resolveBackend({ promptText: '' }); // env-driven effective agent backend
+  const claudeTok = readClaudeOauthToken();
+  const meridianTok = readMeridianToken();
+  const choice = chooseStatelessTransport({ backend, claudeTok, meridianTok });
+  if (choice === 'anthropic-direct') return anthropicDirectTransport(claudeTok!);
+  if (choice === 'meridian') return meridianTransport(meridianTok!);
   return {
     error:
-      'stateless LLM path needs a Claude session (~/.claude/.credentials.json) ' +
-      'or omp/Meridian auth (~/.omp/agent/auth.json)',
+      'stateless LLM path needs a live Claude session (~/.claude/.credentials.json) ' +
+      'or unexpired omp/Meridian auth (~/.omp/agent/auth.json)',
   };
 }
 
@@ -555,6 +590,18 @@ function isMeridianTransient(err: unknown): boolean {
   return /(\b529\b|overloaded|rate.?limit|service unavailable|\b50[02-4]\b|ETIMEDOUT|ECONNRESET|ECONNREFUSED|socket hang up)/i.test(msg);
 }
 
+/**
+ * Connection-level failure to reach the transport at all. The Anthropic SDK
+ * masks the underlying syscall error as APIConnectionError with the bare
+ * message "Connection error." — which `isMeridianTransient` deliberately does
+ * NOT match (retrying a dead local router 8 times helps nobody). Used for the
+ * EI-281 dead-router fallback to anthropic-direct, not as a retry classifier.
+ */
+export function isConnectionFailure(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /(connection error|ECONNREFUSED|ECONNRESET|ETIMEDOUT|fetch failed|socket hang up)/i.test(msg);
+}
+
 /** Prompt-caching is ON unless explicitly disabled (RB-008). Off-switch:
     `PAPERCUSP_PROMPT_CACHE=0` (e.g. if a transport rejects `cache_control`). */
 export function promptCacheEnabled(): boolean {
@@ -595,11 +642,12 @@ async function* meridianAgentChat(
   }
   // Resolve transport: direct-to-Anthropic for claude-code users, else the
   // local Meridian router (see resolveStatelessTransport).
-  const transport = resolveStatelessTransport();
-  if ('error' in transport) {
-    yield { type: 'error', message: transport.error };
+  const resolved = resolveStatelessTransport();
+  if ('error' in resolved) {
+    yield { type: 'error', message: resolved.error };
     return;
   }
+  let transport: StatelessTransport = resolved;
 
   // Lazy-load the SDK so consumers that never use this path don't pay the import
   // cost. Dynamic `import()` (not a static top-level import) keeps it lazy, stays
@@ -610,12 +658,14 @@ async function* meridianAgentChat(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const Anthropic: any = (sdkMod as { default?: unknown }).default ?? sdkMod;
 
-  const client = new Anthropic({
-    baseURL: transport.baseURL,
-    authToken: transport.token,
-    defaultHeaders: transport.headers,
-    maxRetries: 2,
-  });
+  const mkClient = (t: StatelessTransport) =>
+    new Anthropic({
+      baseURL: t.baseURL,
+      authToken: t.token,
+      defaultHeaders: t.headers,
+      maxRetries: 2,
+    });
+  let client = mkClient(transport);
 
   // Build request params. messages overrides promptText for multi-turn.
   const messages = opts.messages && opts.messages.length > 0
@@ -690,6 +740,18 @@ async function* meridianAgentChat(
       return;
     } catch (err) {
       lastErr = err;
+      // EI-281: an unreachable local Meridian router must not strand the run
+      // when a live Claude session exists — flip to anthropic-direct and spend
+      // the remaining attempts there. (The opt-in governed path above keeps
+      // its own client; this fallback covers the default loop.)
+      if (transport.label === 'meridian' && isConnectionFailure(err) && readClaudeOauthToken()) {
+        transport = anthropicDirectTransport(readClaudeOauthToken()!);
+        client = mkClient(transport);
+        console.warn(
+          '[meridian] local router unreachable — falling back to anthropic-direct with the Claude OAuth session (EI-281)',
+        );
+        continue;
+      }
       if (!isMeridianTransient(err) || attempt === RETRY_MAX) {
         yield {
           type: 'error',
