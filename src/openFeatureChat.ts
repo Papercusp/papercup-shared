@@ -43,6 +43,43 @@ export async function openFeatureChat(opts: {
   mode?: 'chat' | 'discuss';
 }): Promise<{ chatId: string } | { error: string }> {
   try {
+    // Reuse-before-create (WI-125): a repeat click for the same
+    // (role, featureId) focuses the existing live conversation instead of
+    // minting a new agent_chats row each time. The list endpoint already
+    // excludes archived chats; the dock dedupes panels by chatId, so
+    // re-dispatching an existing chat focuses its panel. Best-effort — any
+    // failure here falls through to the create path.
+    try {
+      const list = await fetch(`/api/harness/${encodeURIComponent(opts.slug)}/agent-chats`);
+      if (list.ok) {
+        const body = (await list.json()) as {
+          chats?: Array<{ id: string; role: string; feature_id: string | null; title: string | null }>;
+        };
+        const existing = (body.chats ?? []).find(
+          (c) => c.role === opts.role && c.feature_id === opts.featureId,
+        );
+        if (existing) {
+          const detail: OpenChatEventDetail = {
+            slug: opts.slug,
+            chatId: existing.id,
+            title: existing.title ?? opts.title,
+            role: existing.role,
+            featureId: opts.featureId,
+            ...(opts.mode ? { mode: opts.mode } : {}),
+          };
+          if (typeof window !== 'undefined') {
+            const w = window as WindowWithQueue;
+            const queue = w.__PAPERCUSP_PENDING_CHAT_OPENS__ ?? [];
+            queue.push(detail);
+            w.__PAPERCUSP_PENDING_CHAT_OPENS__ = queue;
+            window.dispatchEvent(new CustomEvent(OPEN_CHAT_EVENT, { detail }));
+          }
+          return { chatId: existing.id };
+        }
+      }
+    } catch {
+      /* list unavailable — create as before */
+    }
     const r = await fetch(`/api/harness/${encodeURIComponent(opts.slug)}/agent-chats`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
