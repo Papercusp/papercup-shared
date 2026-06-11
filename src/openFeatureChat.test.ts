@@ -37,16 +37,23 @@ afterEach(() => {
 });
 
 describe('openFeatureChat — request shape', () => {
-  it('POSTs to the slug-encoded agent-chats endpoint with the role/feature body', async () => {
-    const fetchMock = vi.fn(async () =>
-      jsonResponse({ id: 'chat-1', title: 'T', role: 'worker', feature_id: 'F-1' }),
+  it('lists first (reuse probe), then POSTs to the slug-encoded endpoint with the role/feature body', async () => {
+    // WI-125: call 1 is the reuse-probe GET; with no matching live chat the
+    // helper falls through to the create POST (call 2).
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) =>
+      init?.method === 'POST'
+        ? jsonResponse({ id: 'chat-1', title: 'T', role: 'worker', feature_id: 'F-1' })
+        : jsonResponse({ chats: [] }),
     );
     vi.stubGlobal('fetch', fetchMock);
 
     await openFeatureChat({ slug: 'my harness/x', role: 'worker', featureId: 'F-1', title: 'T' });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchMock.mock.calls[0];
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [getUrl, getInit] = fetchMock.mock.calls[0];
+    expect(getUrl).toBe('/api/harness/my%20harness%2Fx/agent-chats');
+    expect(getInit?.method).toBeUndefined();
+    const [url, init] = fetchMock.mock.calls[1];
     // slug is encoded into the path
     expect(url).toBe('/api/harness/my%20harness%2Fx/agent-chats');
     expect(init?.method).toBe('POST');
@@ -56,6 +63,32 @@ describe('openFeatureChat — request shape', () => {
       feature_id: 'F-1',
       title: 'T',
     });
+  });
+
+  it('reuses an existing live chat for the same (role, featureId) instead of creating (WI-125)', async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({
+        chats: [
+          { id: 'chat-old', role: 'worker', feature_id: 'WI-7', title: 'Existing' },
+          { id: 'chat-other', role: 'validator', feature_id: 'WI-7', title: 'Other role' },
+        ],
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const events: OpenChatEventDetail[] = [];
+    const handler = (e: Event) => events.push((e as CustomEvent<OpenChatEventDetail>).detail);
+    window.addEventListener(OPEN_CHAT_EVENT, handler);
+
+    const res = await openFeatureChat({ slug: 's', role: 'worker', featureId: 'WI-7', mode: 'discuss' });
+
+    window.removeEventListener(OPEN_CHAT_EVENT, handler);
+    // No POST happened — only the reuse-probe GET.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(res).toEqual({ chatId: 'chat-old' });
+    // The event re-dispatches the EXISTING chat (the dock focuses its panel).
+    expect(events).toEqual([
+      { slug: 's', chatId: 'chat-old', title: 'Existing', role: 'worker', featureId: 'WI-7', mode: 'discuss' },
+    ]);
   });
 });
 
