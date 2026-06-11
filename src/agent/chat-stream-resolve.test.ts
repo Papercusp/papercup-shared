@@ -13,6 +13,7 @@ import {
   tokenIsLive,
   chooseStatelessTransport,
   isConnectionFailure,
+  isAuthFailure,
   type AgentBackend,
   type RunAgentChatOptions,
 } from './chat-stream';
@@ -169,5 +170,28 @@ describe('isConnectionFailure (EI-281)', () => {
     expect(isConnectionFailure(new Error('529 {"type":"overloaded_error"}'))).toBe(false);
     expect(isConnectionFailure(new Error('401 unauthorized'))).toBe(false);
     expect(isConnectionFailure(new Error('rate limited'))).toBe(false);
+  });
+});
+
+describe('isAuthFailure (EI-281 rotated-token retry)', () => {
+  it('matches the SDK status property', () => {
+    const e = Object.assign(new Error('boom'), { status: 401 });
+    expect(isAuthFailure(e)).toBe(true);
+    expect(isAuthFailure(Object.assign(new Error('boom'), { status: 403 }))).toBe(true);
+    expect(isAuthFailure(Object.assign(new Error('boom'), { status: 429 }))).toBe(false);
+  });
+
+  it('matches the SDK `<status> <body>` message form and Anthropic error types', () => {
+    expect(isAuthFailure(new Error('401 {"type":"error","error":{"type":"authentication_error"}}'))).toBe(true);
+    expect(isAuthFailure(new Error('403 forbidden'))).toBe(true);
+    expect(isAuthFailure(new Error('permission_error: oauth token revoked'))).toBe(true);
+  });
+
+  it('does not match transient/connection errors', () => {
+    expect(isAuthFailure(new Error('529 {"type":"overloaded_error"}'))).toBe(false);
+    expect(isAuthFailure(new Error('Connection error.'))).toBe(false);
+    expect(isAuthFailure(new Error('rate limited'))).toBe(false);
+    // 4013-shaped ids must not false-positive the `<status> ` prefix match.
+    expect(isAuthFailure(new Error('40134 bad id'))).toBe(false);
   });
 });

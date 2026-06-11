@@ -456,17 +456,29 @@ function readMeridianToken(): string | null {
  * present (e.g. the mem0 session-extraction probe) without duplicating
  * the credentials-file parsing.
  */
-let _claudeTokenCache: string | null | undefined;
-export function readClaudeOauthToken(): string | null {
-  if (_claudeTokenCache !== undefined) return _claudeTokenCache;
+let _claudeTokenCache: { access: string; expires: number | null } | null | undefined;
+
+function loadClaudeCreds(): { access: string; expires: number | null } | null {
   try {
     const raw = readFileSync(join(homedir(), '.claude', '.credentials.json'), 'utf8');
-    const parsed = JSON.parse(raw) as { claudeAiOauth?: { accessToken?: string } };
-    _claudeTokenCache = parsed.claudeAiOauth?.accessToken ?? null;
+    const parsed = JSON.parse(raw) as { claudeAiOauth?: { accessToken?: string; expiresAt?: number } };
+    const access = parsed.claudeAiOauth?.accessToken;
+    return access ? { access, expires: parsed.claudeAiOauth?.expiresAt ?? null } : null;
   } catch {
-    _claudeTokenCache = null;
+    return null;
   }
-  return _claudeTokenCache;
+}
+
+export function readClaudeOauthToken(): string | null {
+  if (_claudeTokenCache === undefined) _claudeTokenCache = loadClaudeCreds();
+  // Self-heal (EI-281, long-lived-process half): Claude OAuth tokens rotate
+  // ~2-hourly on disk (claude CLI / credential-sync), so a process that
+  // outlives its boot-read token must re-read the file — otherwise every
+  // anthropic-direct call 401s silently until the next restart (this is what
+  // starved the scout-cycle routine in the operator host).
+  if (_claudeTokenCache && !tokenIsLive(_claudeTokenCache.expires)) _claudeTokenCache = loadClaudeCreds();
+  if (!_claudeTokenCache || !tokenIsLive(_claudeTokenCache.expires)) return null;
+  return _claudeTokenCache.access;
 }
 
 /**
@@ -600,6 +612,16 @@ function isMeridianTransient(err: unknown): boolean {
 export function isConnectionFailure(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /(connection error|ECONNREFUSED|ECONNRESET|ETIMEDOUT|fetch failed|socket hang up)/i.test(msg);
+}
+
+/** Auth rejection (expired/revoked token). The Anthropic SDK APIError carries
+    `.status`; the message form is `<status> <body>`. Used for the EI-281
+    rotated-token retry on anthropic-direct, not as a general retry classifier. */
+export function isAuthFailure(err: unknown): boolean {
+  const status = (err as { status?: number } | null)?.status;
+  if (status === 401 || status === 403) return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  return /^\s*40[13]\b/.test(msg) || /authentication_error|permission_error/i.test(msg);
 }
 
 /** Prompt-caching is ON unless explicitly disabled (RB-008). Off-switch:
@@ -751,6 +773,23 @@ async function* meridianAgentChat(
           '[meridian] local router unreachable — falling back to anthropic-direct with the Claude OAuth session (EI-281)',
         );
         continue;
+      }
+      // EI-281 (auth half): a 401/403 on anthropic-direct usually means the
+      // cached Claude token rotated on disk after we read it. Invalidate,
+      // re-read, and retry once with the fresh token; if the re-read yields
+      // the SAME token, the session is genuinely dead — fail normally.
+      if (transport.label === 'anthropic-direct' && isAuthFailure(err)) {
+        const staleTok = transport.token;
+        invalidateClaudeTokenCache();
+        const freshTok = readClaudeOauthToken();
+        if (freshTok && freshTok !== staleTok) {
+          transport = anthropicDirectTransport(freshTok);
+          client = mkClient(transport);
+          console.warn(
+            '[meridian] anthropic-direct auth failure with a rotated on-disk token — retrying with the fresh Claude OAuth session (EI-281)',
+          );
+          continue;
+        }
       }
       if (!isMeridianTransient(err) || attempt === RETRY_MAX) {
         yield {
