@@ -556,6 +556,24 @@ function resolveStatelessTransport(): StatelessTransport | { error: string } {
   };
 }
 
+export type StatelessTransportProbe =
+  | { ok: true; label: 'anthropic-direct' | 'meridian' }
+  | { ok: false; error: string };
+
+/**
+ * Credential-presence probe for health monitors: which transport WOULD a
+ * stateless call resolve to right now, without issuing one. Shares the exact
+ * resolution the real calls use, so a health leg riding it can never disagree
+ * with the call path. NEVER probe :3456 TCP for this — meridian-not-running
+ * is the HEALTHY state on a claude-code box (the omp token died 2026-04-11;
+ * calls go anthropic-direct — see
+ * agent-insights/gym-boot-readiness-and-meridian-topology).
+ */
+export function probeStatelessTransport(): StatelessTransportProbe {
+  const t = resolveStatelessTransport();
+  return 'error' in t ? { ok: false, error: t.error } : { ok: true, label: t.label };
+}
+
 interface ModelPrice { in: number; out: number }
 const MERIDIAN_PRICES: Record<string, ModelPrice> = {
   // Anthropic family (per 1M tokens, USD)

@@ -14,6 +14,8 @@ export {
   setMeridianUsageSink,
   readClaudeOauthToken,
   invalidateClaudeTokenCache,
+  probeStatelessTransport,
+  type StatelessTransportProbe,
   AGENT_BACKENDS,
   SUBPROCESS_AGENT_BACKENDS,
   CLAUDE_BUILTIN_TOOLS,
