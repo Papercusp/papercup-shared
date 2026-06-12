@@ -11,7 +11,7 @@ export {
   setAgentConfigBootstrap,
   resolveBackend,
   resolveAgentBin,
-  setMeridianUsageSink,
+  setStatelessUsageSink,
   readClaudeOauthToken,
   invalidateClaudeTokenCache,
   probeStatelessTransport,
@@ -22,7 +22,7 @@ export {
   type AgentBackend,
   type ChatEvent,
   type RunAgentChatOptions,
-  type MeridianUsageEvent,
+  type StatelessUsageEvent,
 } from './chat-stream';
 
 // Agent-turn robustness (RB-*): the turn-error taxonomy + classifier, the backend governor

@@ -1,12 +1,12 @@
 /**
  * Unified agent turn-error taxonomy (agent-turn-robustness P-001).
  *
- * Every agent turn — an in-process meridian LLM call OR a spawned CLI agent
+ * Every agent turn — an in-process anthropic-direct LLM call OR a spawned CLI agent
  * (claude/omp/codex) — fails in one of a small, fixed set of ways. Classifying the
  * failure into one `TurnErrorClass` lets a single policy layer (`runAgentTurn`) decide
  * how to react (wait for the rate-limit reset, back off, escalate, degrade) instead of
  * each call site reinventing ad-hoc retry logic. Pure + backend-agnostic: the HTTP path
- * (meridian/API) classifies from `{status, headers, message}`; the subprocess path (CLI
+ * (anthropic-direct/API) classifies from `{status, headers, message}`; the subprocess path (CLI
  * backends) classifies from `{exitCode, signal, stderr, stdout, timedOut}`.
  */
 
@@ -22,7 +22,7 @@ export type TurnErrorClass =
   | 'malformed_output' // produced output the caller couldn't parse
   | 'permanent'; // non-retryable 4xx / unknown permanent failure
 
-export type TurnBackend = 'meridian' | 'claude-code' | 'omp' | 'codex';
+export type TurnBackend = 'anthropic-direct' | 'claude-code' | 'omp' | 'codex';
 export type TurnProvider = 'anthropic' | 'openai' | 'unknown';
 
 export interface TurnError {
@@ -183,7 +183,7 @@ export function parseUsageResetMs(text: string, now: number = Date.now()): numbe
   return undefined;
 }
 
-/** Classify an HTTP-style failure (meridian in-process call, or an API error). */
+/** Classify an HTTP-style failure (anthropic-direct in-process call, or an API error). */
 export function classifyHttpError(
   input: { status?: number; headers?: Record<string, string | undefined>; message?: string },
   provider: TurnProvider = 'unknown',
@@ -260,7 +260,7 @@ export function classifySubprocessResult(
   return mk('permanent', 'unclassified clean exit', provider); // shouldn't happen; caller treats stdout as success
 }
 
-interface MeridianRaw {
+interface HttpRaw {
   status?: number;
   headers?: Record<string, string | undefined>;
   message?: string;
@@ -274,19 +274,19 @@ interface SubprocessRaw {
 }
 
 const PROVIDER_BY_BACKEND: Record<TurnBackend, TurnProvider> = {
-  meridian: 'anthropic',
+  'anthropic-direct': 'anthropic',
   'claude-code': 'anthropic',
   omp: 'unknown', // model-agnostic / multi-provider
   codex: 'openai',
 };
 
-/** Top-level dispatch: meridian → HTTP-shape; CLI backends → subprocess-shape. */
+/** Top-level dispatch: anthropic-direct → HTTP-shape; CLI backends → subprocess-shape. */
 export function classifyTurnError(
   backend: TurnBackend,
-  raw: MeridianRaw | SubprocessRaw,
+  raw: HttpRaw | SubprocessRaw,
   now: number = Date.now(),
 ): TurnError {
   const provider = PROVIDER_BY_BACKEND[backend];
-  if (backend === 'meridian') return classifyHttpError(raw as MeridianRaw, provider, now);
+  if (backend === 'anthropic-direct') return classifyHttpError(raw as HttpRaw, provider, now);
   return classifySubprocessResult(raw as SubprocessRaw, provider, now);
 }

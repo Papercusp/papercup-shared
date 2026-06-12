@@ -18,7 +18,7 @@ test('runAgentTurn — returns the value on first success + records headers', as
   const { g } = fakeGovernor();
   let headersSeen = false;
   const r = await runAgentTurn<string>(
-    { backend: 'meridian' },
+    { backend: 'anthropic-direct' },
     { ...deps(g), runOnce: async (): Promise<TurnOutcome<string>> => ({ ok: true, value: 'hi', headers: { 'anthropic-ratelimit-requests-limit': '50' } }) },
   );
   assert.equal(r.ok, true);
@@ -33,7 +33,7 @@ test('runAgentTurn — retries a rate_limited turn (penalizes governor) then suc
   const { g } = fakeGovernor();
   let calls = 0;
   const r = await runAgentTurn<string>(
-    { backend: 'meridian', maxAttempts: 4 },
+    { backend: 'anthropic-direct', maxAttempts: 4 },
     {
       ...deps(g),
       runOnce: async (): Promise<TurnOutcome<string>> => {
@@ -53,7 +53,7 @@ test('runAgentTurn — a non-retryable class (auth) returns the error immediatel
   const { g } = fakeGovernor();
   let calls = 0;
   const r = await runAgentTurn<string>(
-    { backend: 'meridian', maxAttempts: 5 },
+    { backend: 'anthropic-direct', maxAttempts: 5 },
     { ...deps(g), runOnce: async (): Promise<TurnOutcome<string>> => { calls++; return { ok: false, raw: { status: 401 } }; } },
   );
   assert.equal(r.ok, false);
@@ -66,7 +66,7 @@ test('runAgentTurn — usage_limit (plan cap) returns immediately, does NOT retr
   const resetAt = Date.parse('2026-06-05T12:00:00Z');
   let calls = 0;
   const r = await runAgentTurn<string>(
-    { backend: 'meridian', maxAttempts: 5 },
+    { backend: 'anthropic-direct', maxAttempts: 5 },
     {
       ...deps(g),
       runOnce: async (): Promise<TurnOutcome<string>> => {
@@ -105,7 +105,7 @@ test('runAgentTurn — rate_limited with NO retry-after backs off via the govern
   const g = new RateLimitGovernor({ maxConcurrent: 4 }, { now: () => clock, sleep });
   let calls = 0;
   const r = await runAgentTurn<string>(
-    { backend: 'meridian', maxAttempts: 4, baseBackoffMs: 1000 },
+    { backend: 'anthropic-direct', maxAttempts: 4, baseBackoffMs: 1000 },
     {
       governor: g,
       now: () => clock,
@@ -129,7 +129,7 @@ test('runAgentTurn — overloaded (529) with no retry-after backs off (not penal
   const g = new RateLimitGovernor({ maxConcurrent: 4 }, { now: () => clock, sleep });
   let calls = 0;
   const r = await runAgentTurn<string>(
-    { backend: 'meridian', maxAttempts: 3, baseBackoffMs: 1000 },
+    { backend: 'anthropic-direct', maxAttempts: 3, baseBackoffMs: 1000 },
     { governor: g, now: () => clock, sleep, runOnce: async (): Promise<TurnOutcome<string>> => { calls++; return { ok: false, raw: { status: 529 } }; } },
   );
   assert.equal(r.ok, false);
@@ -147,7 +147,7 @@ test('runAgentTurn — bails with a structured error when a far-off governor pau
   g.penalize({ retryAfterMs: 5 * 60 * 60 * 1000 });
   let calls = 0;
   const r = await runAgentTurn<string>(
-    { backend: 'meridian', maxWaitMs: 2000 },
+    { backend: 'anthropic-direct', maxWaitMs: 2000 },
     { governor: g, now: () => clock, sleep, runOnce: async (): Promise<TurnOutcome<string>> => { calls++; return { ok: true, value: 'x' }; } },
   );
   assert.equal(r.ok, false);
@@ -162,7 +162,7 @@ test('runAgentTurn — never throws even if runOnce rejects (treated as transien
   const { g } = fakeGovernor();
   let calls = 0;
   const r = await runAgentTurn<string>(
-    { backend: 'meridian', maxAttempts: 3 },
+    { backend: 'anthropic-direct', maxAttempts: 3 },
     {
       ...deps(g),
       runOnce: async (): Promise<TurnOutcome<string>> => {

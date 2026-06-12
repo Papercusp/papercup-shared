@@ -30,21 +30,21 @@ beforeEach(() => {
 });
 
 test('BACKEND_PROFILES — provider + self-pacing per backend', () => {
-  assert.equal(BACKEND_PROFILES.meridian.provider, 'anthropic');
+  assert.equal(BACKEND_PROFILES['anthropic-direct'].provider, 'anthropic');
   assert.equal(BACKEND_PROFILES['claude-code'].provider, 'anthropic');
   assert.equal(BACKEND_PROFILES.codex.provider, 'openai');
   assert.equal(BACKEND_PROFILES.omp.selfPacing, true); // model-agnostic + fallback chaining
-  assert.equal(BACKEND_PROFILES.meridian.selfPacing, false);
+  assert.equal(BACKEND_PROFILES['anthropic-direct'].selfPacing, false);
 });
 
 // D-006: limitModel is a RUNTIME credential fact, not a compile-time const.
 test('resolveLimitModel — subscription by default, apiKey when a provider key is set in env', () => {
   // No keys → coarse subscription mode (the Max/ChatGPT OAuth default on the dev box).
-  assert.equal(resolveLimitModel('meridian', {}), 'subscription');
+  assert.equal(resolveLimitModel('anthropic-direct', {}), 'subscription');
   assert.equal(resolveLimitModel('claude-code', {}), 'subscription');
   assert.equal(resolveLimitModel('codex', {}), 'subscription');
   // An Anthropic API key flips claude paths to precise header-driven mode.
-  assert.equal(resolveLimitModel('meridian', { ANTHROPIC_API_KEY: 'sk-ant-x' }), 'apiKey');
+  assert.equal(resolveLimitModel('anthropic-direct', { ANTHROPIC_API_KEY: 'sk-ant-x' }), 'apiKey');
   assert.equal(resolveProviderLimitModel('anthropic', { ANTHROPIC_API_KEY: 'sk-ant-x' }), 'apiKey');
   // An OpenAI API key flips codex to precise mode; anthropic key doesn't affect openai.
   assert.equal(resolveLimitModel('codex', { OPENAI_API_KEY: 'sk-oai-x' }), 'apiKey');
@@ -78,8 +78,8 @@ test('governorForBackend — omp is self-pacing (concurrency-only: no rpm/itpm/o
   assert.equal(typeof claude.state.limits.rpm, 'number'); // claude gets a conservative RPM floor
 });
 
-test('governorForBackend — claude (meridian + CLI) share the Anthropic bucket per model-class', () => {
-  const mer = governorForBackend('meridian', 'claude-opus-4-8');
+test('governorForBackend — claude (anthropic-direct + CLI) share the Anthropic bucket per model-class', () => {
+  const mer = governorForBackend('anthropic-direct', 'claude-opus-4-8');
   const cli = governorForBackend('claude-code', 'claude-opus-4-8');
   assert.equal(mer, cli); // same provider+class → one shared budget (don't co-burst the account)
 });

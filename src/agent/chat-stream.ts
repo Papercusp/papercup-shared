@@ -20,8 +20,11 @@
  *     are configured through a per-spawn `CODEX_HOME=<tmpdir>` holding
  *     `AGENTS.md` (system prompt), `config.toml` (`[mcp_servers.*]`), and
  *     a symlink to `~/.codex/auth.json` (shared ChatGPT OAuth login).
- *   - 'meridian': stateless single Anthropic-format HTTP round-trip, no
- *     subprocess. No MCP. For one-shot LLM turns (judges, summarisers).
+ *   - 'anthropic-direct': stateless single Anthropic-format HTTP round-trip
+ *     straight to api.anthropic.com (Claude OAuth session), no subprocess.
+ *     No MCP. For one-shot LLM turns (judges, summarisers). (Named
+ *     `meridian` until 2026-06-12 — EI-399; the local Meridian router leg
+ *     is retired, see agent-insights/gym-boot-readiness-and-meridian-topology.)
  *
  * Caller responsibilities (intentionally NOT in here):
  *   - Prompt assembly (each surface loads its own prompt + memory)
@@ -49,11 +52,11 @@ import { classifyTurnError, isAccountWide, type TurnBackend, type TurnError } fr
 export const DEFAULT_CLI_GOVERNOR_MAX_WAIT_MS = 5 * 60_000;
 
 // --- In-process usage telemetry seam (rate-limit-layer-v2 D-002, capture point 1) --------------
-// The meridian path is the ONE place real `anthropic-ratelimit-*` headers + token usage are
-// visible in-process. This lib stays host-free, so the host (operator-core) installs a sink at
-// boot (`setMeridianUsageSink`) and both meridian paths (legacy + governed) emit one event per
-// completed call. Best-effort: a sink failure must never break the LLM call.
-export interface MeridianUsageEvent {
+// The stateless anthropic-direct path is the ONE place real `anthropic-ratelimit-*` headers +
+// token usage are visible in-process. This lib stays host-free, so the host (operator-core)
+// installs a sink at boot (`setStatelessUsageSink`) and both stateless paths (legacy + governed)
+// emit one event per completed call. Best-effort: a sink failure must never break the LLM call.
+export interface StatelessUsageEvent {
   model: string;
   inputTokens: number;
   outputTokens: number;
@@ -64,15 +67,15 @@ export interface MeridianUsageEvent {
   /** Lower-cased response headers when the transport exposed them (anthropic-ratelimit-*). */
   headers?: Record<string, string | undefined>;
 }
-let meridianUsageSink: ((ev: MeridianUsageEvent) => void) | undefined;
+let statelessUsageSink: ((ev: StatelessUsageEvent) => void) | undefined;
 /** Install (or clear) the host's usage-telemetry sink. Call once at operator boot. */
-export function setMeridianUsageSink(fn?: (ev: MeridianUsageEvent) => void): void {
-  meridianUsageSink = fn;
+export function setStatelessUsageSink(fn?: (ev: StatelessUsageEvent) => void): void {
+  statelessUsageSink = fn;
 }
-function emitMeridianUsage(ev: MeridianUsageEvent): void {
-  if (!meridianUsageSink) return;
+function emitStatelessUsage(ev: StatelessUsageEvent): void {
+  if (!statelessUsageSink) return;
   try {
-    meridianUsageSink(ev);
+    statelessUsageSink(ev);
   } catch {
     /* telemetry is best-effort; never throw into the LLM path */
   }
@@ -82,13 +85,13 @@ function emitMeridianUsage(ev: MeridianUsageEvent): void {
  * Backends the in-app brains can drive. The three subprocess backends
  * (`claude-code`/`omp`/`codex`) are the canonical spawn set shared with
  * `@papercusp/orchestrator` (`AGENT_BACKENDS`) and
- * `apps/operator/lib/agent-config.ts` (`AGENT_BACKENDS`); `meridian` is an
- * extra brains-only stateless HTTP round-trip (no subprocess, not
+ * `apps/operator/lib/agent-config.ts` (`AGENT_BACKENDS`); `anthropic-direct`
+ * is an extra brains-only stateless HTTP round-trip (no subprocess, not
  * spawnable by the orchestrator). The submodule boundary rules out a
  * single literal import; `apps/operator/lib/__tests__/agent-backend-sync.test.ts`
  * guards the subprocess subset against drift across the three. */
-export const AGENT_BACKENDS = ['claude-code', 'omp', 'meridian', 'codex'] as const;
-/** The subset that maps to a real subprocess (excludes `meridian`). */
+export const AGENT_BACKENDS = ['claude-code', 'omp', 'anthropic-direct', 'codex'] as const;
+/** The subset that maps to a real subprocess (excludes `anthropic-direct`). */
 export const SUBPROCESS_AGENT_BACKENDS = ['claude-code', 'omp', 'codex'] as const;
 export type AgentBackend = (typeof AGENT_BACKENDS)[number];
 
@@ -167,13 +170,6 @@ function maybeBootstrap(): void {
 
 /**
  * Resolve which backend to drive. Explicit opt > AGENT_BACKEND env >
- * inferred from the binary name. Default fallback: omp (Meridian-routed).
- *
- * Exported so non-runAgentChat callers with their own bespoke stream
- * parser can resolve the backend identically.
- */
-/**
- * Resolve which backend to drive. Explicit opt > AGENT_BACKEND env >
  * inferred from the binary name. Default fallback: omp.
  *
  * Exported so non-runAgentChat callers with their own bespoke stream
@@ -184,7 +180,7 @@ export function resolveBackend(opts: RunAgentChatOptions): AgentBackend {
   const env = (process.env.AGENT_BACKEND ?? '').trim().toLowerCase();
   if (env === 'omp' || env === 'pi') return 'omp';
   if (env === 'claude-code' || env === 'claude') return 'claude-code';
-  if (env === 'meridian') return 'meridian';
+  if (env === 'anthropic-direct') return 'anthropic-direct';
   if (env === 'codex') return 'codex';
   const cmd = opts.agentCmd ?? process.env.AGENT_CMD ?? process.env.CLAUDE_CMD ?? '';
   const first = cmd.split(/\s+/).filter(Boolean)[0] ?? '';
@@ -209,7 +205,7 @@ export function resolveAgentBin(opts: RunAgentChatOptions, backend: AgentBackend
 
 /**
  * claude's `--model` wants a bare id (`claude-opus-4-7`) or an alias
- * (`opus`/`sonnet`/`haiku`); it rejects omp/Meridian's `provider/model`
+ * (`opus`/`sonnet`/`haiku`); it rejects omp's `provider/model`
  * form (e.g. `anthropic/claude-opus-4-7`), which is what callers like the
  * operator brain default pass. Strip a single leading `provider/` segment
  * for the claude-code backend; an already-bare id passes through. (omp
@@ -342,28 +338,28 @@ export interface RunAgentChatOptions {
    */
   sessionMode?: 'resume' | 'force';
   /**
-   * Multi-turn message history. For stateless backends (`meridian`) this
-   * is the entire conversation sent to the model each turn — caller
-   * manages history. For subprocess backends (`omp` / `claude-code`),
-   * `promptText` is the only user message; this field is ignored
-   * (the agent loop manages its own conversation state).
+   * Multi-turn message history. For the stateless backend
+   * (`anthropic-direct`) this is the entire conversation sent to the
+   * model each turn — caller manages history. For subprocess backends
+   * (`omp` / `claude-code`), `promptText` is the only user message;
+   * this field is ignored (the agent loop manages its own conversation
+   * state).
    */
   messages?: Array<{ role: 'user' | 'assistant'; content: string }>;
   /**
-   * Max output tokens. `meridian` honors this; `omp` / `claude-code`
-   * have their own internal limits.
+   * Max output tokens. `anthropic-direct` honors this; `omp` /
+   * `claude-code` have their own internal limits.
    */
   maxTokens?: number;
   /**
-   * Sampling temperature (0–1). `meridian` honors when the model
+   * Sampling temperature (0–1). `anthropic-direct` honors when the model
    * accepts it (skipped for `opus*` per the Anthropic API constraint).
    * `omp` / `claude-code` ignore.
    */
   temperature?: number;
   /**
    * Thinking budget (tokens). Maps to Anthropic's `thinking: {type:
-   * 'enabled', budget_tokens: N}`. Meridian translates per-provider
-   * (e.g. OpenAI `reasoning_effort`). `meridian` only.
+   * 'enabled', budget_tokens: N}`. `anthropic-direct` only.
    */
   thinkingBudgetTokens?: number;
   /**
@@ -395,26 +391,26 @@ export type ChatEvent =
        * RB-006: the classified turn error, when known. Lets a consumer (e.g. the gym's
        * `llmCall` → `runAbEvaluation`) distinguish a `rate_limited` failure (pause + resume)
        * from a permanent one (skip) instead of re-parsing the message string. Populated on
-       * the governed meridian + CLI paths; absent on the legacy un-governed path (consumers
+       * the governed stateless + CLI paths; absent on the legacy un-governed path (consumers
        * fall back to message classification / treat as a generic error).
        */
       turn?: TurnError;
     };
 
 // ===========================================================================
-// Stateless `meridian` backend — a single Anthropic-format HTTP round-trip,
-// NO subprocess (~100-300ms vs. ~1-2s for an agent spawn). Use when a caller
-// needs an LLM round-trip but NOT a full agent loop (no MCP, no multi-step
-// tool use): llm-testing judge + sim-user, summarisers, one-shot Q&A.
+// Stateless `anthropic-direct` backend — a single Anthropic-format HTTP
+// round-trip, NO subprocess (~100-300ms vs. ~1-2s for an agent spawn). Use
+// when a caller needs an LLM round-trip but NOT a full agent loop (no MCP,
+// no multi-step tool use): llm-testing judge + sim-user, summarisers,
+// one-shot Q&A.
 //
-// Transport is resolved per call (resolveStatelessTransport): a claude-code
-// user goes DIRECT to api.anthropic.com with their Claude OAuth session —
-// Meridian, the multi-provider router, is only needed for non-claude backends
-// — while an omp user routes through the local Meridian router. The shared
-// pricing / retry / streaming surface below serves both.
+// Transport: DIRECT to api.anthropic.com with the Claude OAuth session
+// (~/.claude/.credentials.json). The omp-era leg through the local Meridian
+// router (:3456) was retired 2026-06-12 (EI-399) — the omp token died
+// 2026-04-11 and every stateless call had long resolved anthropic-direct
+// (agent-insights/gym-boot-readiness-and-meridian-topology is the
+// historical record).
 // ===========================================================================
-
-let _meridianTokenCache: { access: string; expires: number | null } | null | undefined; // undefined = not loaded; null = no token
 
 /** Tokens this close to their recorded expiry are treated as already dead —
     a request issued now would land server-side past the cutoff. */
@@ -422,35 +418,18 @@ const TOKEN_EXPIRY_SKEW_MS = 60_000;
 
 /**
  * Whether a token with this recorded expiry (ms epoch; null/undefined = no
- * recorded expiry) is still usable at `nowMs`. EI-281: an expired omp token
+ * recorded expiry) is still usable at `nowMs`. EI-281: an expired token
  * must not win transport selection over a live Claude session.
  */
 export function tokenIsLive(expires: number | null | undefined, nowMs: number = Date.now()): boolean {
   return expires == null || expires > nowMs + TOKEN_EXPIRY_SKEW_MS;
 }
 
-function readMeridianToken(): string | null {
-  if (_meridianTokenCache === undefined) {
-    try {
-      const raw = readFileSync(join(homedir(), '.omp', 'agent', 'auth.json'), 'utf8');
-      const parsed = JSON.parse(raw) as { anthropic?: { token?: { access?: string; expires?: number } } };
-      const access = parsed.anthropic?.token?.access;
-      _meridianTokenCache = access ? { access, expires: parsed.anthropic?.token?.expires ?? null } : null;
-    } catch {
-      _meridianTokenCache = null;
-    }
-  }
-  // Expiry is evaluated per read (not baked into the cache) so a token that
-  // expires while this process is long-lived flips to null on its own.
-  if (!_meridianTokenCache || !tokenIsLive(_meridianTokenCache.expires)) return null;
-  return _meridianTokenCache.access;
-}
-
 /**
  * Claude Code's own OAuth session token (`~/.claude/.credentials.json`).
- * It's the same Claude-Max OAuth credential Meridian forwards, and works
- * directly against api.anthropic.com with the `anthropic-beta:
- * oauth-2025-04-20` header (verified) — no Meridian router needed. Cached.
+ * A Claude-Max OAuth credential that works directly against
+ * api.anthropic.com with the `anthropic-beta: oauth-2025-04-20` header
+ * (verified). Cached.
  *
  * Exported for consumers that need to know whether a Claude session is
  * present (e.g. the mem0 session-extraction probe) without duplicating
@@ -498,7 +477,7 @@ interface StatelessTransport {
   baseURL: string;
   token: string;
   headers: Record<string, string>;
-  label: 'anthropic-direct' | 'meridian';
+  label: 'anthropic-direct';
 }
 
 function anthropicDirectTransport(claudeTok: string): StatelessTransport {
@@ -510,63 +489,40 @@ function anthropicDirectTransport(claudeTok: string): StatelessTransport {
   };
 }
 
-function meridianTransport(meridianTok: string): StatelessTransport {
-  return {
-    baseURL: process.env.PAPERCUSP_MERIDIAN_URL ?? 'http://127.0.0.1:3456',
-    token: meridianTok,
-    headers: { 'x-meridian-agent': `papercup-llm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}` },
-    label: 'meridian',
-  };
-}
-
 /**
- * Pure transport choice for a stateless Anthropic-format call. Callers pass
- * tokens that are already expiry-filtered (`readMeridianToken` returns null
- * for an expired omp token — EI-281), so precedence stays backend-keyed:
- *
- *  - claude-code backend (or no live Meridian token but a Claude session
- *    present) → DIRECT to api.anthropic.com with the Claude OAuth session.
- *    Meridian is the multi-provider router; a claude user doesn't need it.
- *  - otherwise → the local Meridian router with omp's OAuth token.
- *
- * Returns null when neither credential is usable.
+ * Pure transport choice for a stateless Anthropic-format call: a live Claude
+ * OAuth session → `anthropic-direct`; nothing usable → null. The token the
+ * caller passes is already expiry-filtered (`readClaudeOauthToken` returns
+ * null for an expired session — EI-281). The omp-token → Meridian-router leg
+ * was removed 2026-06-12 (EI-399); anthropic-direct is the named default and
+ * only transport.
  */
 export function chooseStatelessTransport(args: {
-  backend: AgentBackend;
   claudeTok: string | null;
-  meridianTok: string | null;
-}): 'anthropic-direct' | 'meridian' | null {
-  if (args.backend === 'claude-code' && args.claudeTok) return 'anthropic-direct';
-  if (args.meridianTok) return 'meridian';
-  if (args.claudeTok) return 'anthropic-direct';
-  return null;
+}): 'anthropic-direct' | null {
+  return args.claudeTok ? 'anthropic-direct' : null;
 }
 
 function resolveStatelessTransport(): StatelessTransport | { error: string } {
-  const backend = resolveBackend({ promptText: '' }); // env-driven effective agent backend
   const claudeTok = readClaudeOauthToken();
-  const meridianTok = readMeridianToken();
-  const choice = chooseStatelessTransport({ backend, claudeTok, meridianTok });
+  const choice = chooseStatelessTransport({ claudeTok });
   if (choice === 'anthropic-direct') return anthropicDirectTransport(claudeTok!);
-  if (choice === 'meridian') return meridianTransport(meridianTok!);
   return {
-    error:
-      'stateless LLM path needs a live Claude session (~/.claude/.credentials.json) ' +
-      'or unexpired omp/Meridian auth (~/.omp/agent/auth.json)',
+    error: 'stateless LLM path needs a live Claude session (~/.claude/.credentials.json)',
   };
 }
 
 export type StatelessTransportProbe =
-  | { ok: true; label: 'anthropic-direct' | 'meridian' }
+  | { ok: true; label: 'anthropic-direct' }
   | { ok: false; error: string };
 
 /**
- * Credential-presence probe for health monitors: which transport WOULD a
- * stateless call resolve to right now, without issuing one. Shares the exact
+ * Credential-presence probe for health monitors: would a stateless call
+ * resolve a transport right now, without issuing one. Shares the exact
  * resolution the real calls use, so a health leg riding it can never disagree
- * with the call path. NEVER probe :3456 TCP for this — meridian-not-running
- * is the HEALTHY state on a claude-code box (the omp token died 2026-04-11;
- * calls go anthropic-direct — see
+ * with the call path. NEVER TCP-probe :3456 for this — the retired local
+ * Meridian router not running is the normal state (the omp token died
+ * 2026-04-11; calls go anthropic-direct — see
  * agent-insights/gym-boot-readiness-and-meridian-topology).
  */
 export function probeStatelessTransport(): StatelessTransportProbe {
@@ -575,30 +531,26 @@ export function probeStatelessTransport(): StatelessTransportProbe {
 }
 
 interface ModelPrice { in: number; out: number }
-const MERIDIAN_PRICES: Record<string, ModelPrice> = {
-  // Anthropic family (per 1M tokens, USD)
+const ANTHROPIC_PRICES: Record<string, ModelPrice> = {
+  // Anthropic family (per 1M tokens, USD; approximate 2026-05 reference)
   'claude-haiku-4-5':  { in: 0.80, out: 4.00 },
   'claude-sonnet-4-6': { in: 3.00, out: 15.00 },
   'claude-opus-4-7':   { in: 15.00, out: 75.00 },
   'claude-opus-4-8':   { in: 15.00, out: 75.00 },
-  // OpenAI codex models routed via Meridian (approximate 2026-05 reference)
-  'openai-codex/gpt-5':           { in: 1.25, out: 10.00 },
-  'openai-codex/gpt-5.5':         { in: 2.50, out: 20.00 },
-  'openai-codex/gpt-5.5:xhigh':   { in: 2.50, out: 20.00 },
 };
-function meridianPriceFor(model: string): ModelPrice {
-  if (MERIDIAN_PRICES[model]) return MERIDIAN_PRICES[model];
-  const prefix = Object.keys(MERIDIAN_PRICES).find((m) => model.startsWith(m));
-  return prefix ? MERIDIAN_PRICES[prefix] : { in: 0, out: 0 };
+function anthropicPriceFor(model: string): ModelPrice {
+  if (ANTHROPIC_PRICES[model]) return ANTHROPIC_PRICES[model];
+  const prefix = Object.keys(ANTHROPIC_PRICES).find((m) => model.startsWith(m));
+  return prefix ? ANTHROPIC_PRICES[prefix] : { in: 0, out: 0 };
 }
 
 // Codex (`codex exec`) emits NO cost field — only a token `usage` block on
 // `turn.completed`. We derive costUsd from this table the same way the
-// stateless meridian path does (model → in/out per 1M tokens, USD).
+// stateless anthropic-direct path does (model → in/out per 1M tokens, USD).
 // Codex runs OpenAI GPT-5 family models (logged in via ChatGPT OAuth);
 // keys are the BARE model id codex reports (`gpt-5.5`), plus the
-// `openai-codex/*` form for callers that pass the meridian-style prefix.
-// Approximate 2026-05 reference pricing — keep in sync with MERIDIAN_PRICES.
+// `openai-codex/*` provider-prefixed form some callers pass.
+// Approximate 2026-05 reference pricing.
 const CODEX_PRICES: Record<string, ModelPrice> = {
   'gpt-5':              { in: 1.25, out: 10.00 },
   'gpt-5.5':            { in: 2.50, out: 20.00 },
@@ -613,7 +565,7 @@ function codexPriceFor(model: string | undefined): ModelPrice {
   return prefix ? CODEX_PRICES[prefix] : { in: 0, out: 0 };
 }
 
-function isMeridianTransient(err: unknown): boolean {
+function isTransientLlmError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   // Anthropic SDK APIError surfaces as `<status> <body>` in .message.
   // Retry on 529 overloaded, 429 rate-limit, 5xx, and network blips.
@@ -623,9 +575,10 @@ function isMeridianTransient(err: unknown): boolean {
 /**
  * Connection-level failure to reach the transport at all. The Anthropic SDK
  * masks the underlying syscall error as APIConnectionError with the bare
- * message "Connection error." — which `isMeridianTransient` deliberately does
- * NOT match (retrying a dead local router 8 times helps nobody). Used for the
- * EI-281 dead-router fallback to anthropic-direct, not as a retry classifier.
+ * message "Connection error." — which `isTransientLlmError` deliberately does
+ * NOT match (retrying an unreachable endpoint 8 times helps nobody). Kept
+ * exported for consumers that classify connection-level death (EI-281), not
+ * as a retry classifier.
  */
 export function isConnectionFailure(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
@@ -652,11 +605,11 @@ export function promptCacheEnabled(): boolean {
 type CachedSystemBlock = { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } };
 
 /**
- * Build the meridian `system` request field (RB-008: prompt caching).
+ * Build the stateless call's `system` request field (RB-008: prompt caching).
  *
  * When caching is enabled we send the system prompt as a single text block marked
  * `cache_control: { type: 'ephemeral' }` instead of a bare string. The system prompt is the
- * large STABLE prefix on our in-process meridian calls (the gym judge's frozen 32k-thinking
+ * large STABLE prefix on our in-process stateless calls (the gym judge's frozen 32k-thinking
  * rubric, the sim-user persona, the generators' instructions) while the user turn varies —
  * so caching it makes the prefix a cache-READ on repeat calls, and cache-read input tokens
  * don't count toward ITPM, raising effective throughput (the cheapest rate-limit pressure
@@ -669,19 +622,19 @@ export function buildSystemParam(systemPromptText: string, cache: boolean = prom
   return [{ type: 'text', text: systemPromptText, cache_control: { type: 'ephemeral' } }];
 }
 
-async function* meridianAgentChat(
+async function* statelessAgentChat(
   opts: RunAgentChatOptions,
 ): AsyncGenerator<ChatEvent, void, void> {
   if (opts.mcpConfig) {
-    yield { type: 'error', message: 'meridian backend does not support mcpConfig — use omp/claude-code for MCP-bearing turns' };
+    yield { type: 'error', message: 'anthropic-direct backend does not support mcpConfig — use omp/claude-code for MCP-bearing turns' };
     return;
   }
   if (!opts.model) {
-    yield { type: 'error', message: 'meridian backend requires opts.model (resolve via modelRoles or pass explicitly)' };
+    yield { type: 'error', message: 'anthropic-direct backend requires opts.model (resolve via modelRoles or pass explicitly)' };
     return;
   }
-  // Resolve transport: direct-to-Anthropic for claude-code users, else the
-  // local Meridian router (see resolveStatelessTransport).
+  // Resolve transport: direct-to-Anthropic with the Claude OAuth session
+  // (see resolveStatelessTransport).
   const resolved = resolveStatelessTransport();
   if ('error' in resolved) {
     yield { type: 'error', message: resolved.error };
@@ -732,7 +685,7 @@ async function* meridianAgentChat(
   // default → the proven retry loop below runs unchanged (zero behavior change for the
   // live fleet until validated).
   if (process.env.PAPERCUSP_AGENT_GOVERNOR === '1') {
-    yield* governedMeridian(client, params, opts);
+    yield* governedStatelessChat(client, params, opts);
     return;
   }
 
@@ -743,7 +696,7 @@ async function* meridianAgentChat(
   let lastErr: unknown;
   for (let attempt = 1; attempt <= RETRY_MAX; attempt++) {
     if (opts.signal?.aborted) {
-      yield { type: 'error', message: 'meridian: aborted' };
+      yield { type: 'error', message: 'anthropic-direct: aborted' };
       return;
     }
     try {
@@ -763,10 +716,10 @@ async function* meridianAgentChat(
       }
       const inputTokens = resp.usage?.input_tokens ?? 0;
       const outputTokens = resp.usage?.output_tokens ?? 0;
-      const p = meridianPriceFor(opts.model);
+      const p = anthropicPriceFor(opts.model);
       const costUsd = (inputTokens * p.in + outputTokens * p.out) / 1_000_000;
       // Usage telemetry (D-002 capture point 1): tokens + the raw response's ratelimit headers.
-      emitMeridianUsage({
+      emitStatelessUsage({
         model: opts.model,
         inputTokens,
         outputTokens,
@@ -780,23 +733,11 @@ async function* meridianAgentChat(
       return;
     } catch (err) {
       lastErr = err;
-      // EI-281: an unreachable local Meridian router must not strand the run
-      // when a live Claude session exists — flip to anthropic-direct and spend
-      // the remaining attempts there. (The opt-in governed path above keeps
-      // its own client; this fallback covers the default loop.)
-      if (transport.label === 'meridian' && isConnectionFailure(err) && readClaudeOauthToken()) {
-        transport = anthropicDirectTransport(readClaudeOauthToken()!);
-        client = mkClient(transport);
-        console.warn(
-          '[meridian] local router unreachable — falling back to anthropic-direct with the Claude OAuth session (EI-281)',
-        );
-        continue;
-      }
       // EI-281 (auth half): a 401/403 on anthropic-direct usually means the
       // cached Claude token rotated on disk after we read it. Invalidate,
       // re-read, and retry once with the fresh token; if the re-read yields
       // the SAME token, the session is genuinely dead — fail normally.
-      if (transport.label === 'anthropic-direct' && isAuthFailure(err)) {
+      if (isAuthFailure(err)) {
         const staleTok = transport.token;
         invalidateClaudeTokenCache();
         const freshTok = readClaudeOauthToken();
@@ -804,28 +745,28 @@ async function* meridianAgentChat(
           transport = anthropicDirectTransport(freshTok);
           client = mkClient(transport);
           console.warn(
-            '[meridian] anthropic-direct auth failure with a rotated on-disk token — retrying with the fresh Claude OAuth session (EI-281)',
+            '[anthropic-direct] auth failure with a rotated on-disk token — retrying with the fresh Claude OAuth session (EI-281)',
           );
           continue;
         }
       }
-      if (!isMeridianTransient(err) || attempt === RETRY_MAX) {
+      if (!isTransientLlmError(err) || attempt === RETRY_MAX) {
         yield {
           type: 'error',
-          message: `meridian error: ${err instanceof Error ? err.message : String(err)}`,
+          message: `anthropic-direct error: ${err instanceof Error ? err.message : String(err)}`,
         };
         return;
       }
       const backoffMs = Math.min(RETRY_CAP_MS, 1000 * 2 ** attempt) + Math.random() * 500;
       console.warn(
-        `[meridian] transient (attempt ${attempt}/${RETRY_MAX}), retrying in ${Math.round(backoffMs)}ms: ${err instanceof Error ? err.message.slice(0, 140) : String(err)}`,
+        `[anthropic-direct] transient (attempt ${attempt}/${RETRY_MAX}), retrying in ${Math.round(backoffMs)}ms: ${err instanceof Error ? err.message.slice(0, 140) : String(err)}`,
       );
       await new Promise((r) => setTimeout(r, backoffMs));
     }
   }
   yield {
     type: 'error',
-    message: `meridian: exhausted ${RETRY_MAX} retries: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`,
+    message: `anthropic-direct: exhausted ${RETRY_MAX} retries: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`,
   };
 }
 
@@ -847,13 +788,13 @@ export function headersToRecord(h: unknown): Record<string, string | undefined> 
 }
 
 /**
- * Governed meridian request (agent-turn-robustness P-004): the SAME single request as the
+ * Governed stateless request (agent-turn-robustness P-004): the SAME single request as the
  * loop above, but run through `runAgentTurn` + the shared `RateLimitGovernor` —
  * concurrency-capped, paced under the provider RPM, and on a 429 it penalizes the governor
  * with the server's `retry-after` (so the NEXT acquire waits exactly that long, across all
  * callers) instead of a blind exponential backoff. Yields the same delta/result/error.
  */
-async function* governedMeridian(
+async function* governedStatelessChat(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   client: any,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -861,18 +802,18 @@ async function* governedMeridian(
   opts: RunAgentChatOptions,
 ): AsyncGenerator<ChatEvent, void, void> {
   const model = opts.model as string;
-  const governor = governorForBackend('meridian', model);
+  const governor = governorForBackend('anthropic-direct', model);
   type V = { finalText: string; tokensIn: number; tokensOut: number; costUsd: number };
   const result = await runAgentTurn<V>(
     // No estTokens: max_tokens does NOT count toward OTPM (only tokens actually produced),
     // so estimating OTPM as max_tokens would massively over-charge the budget. Until we
     // reconcile from real usage headers, pace on concurrency + RPM + 429-penalty only
     // (token-budget dimensions stay inert on the subscription path anyway). [reviewer #4]
-    { backend: 'meridian', maxAttempts: 8 },
+    { backend: 'anthropic-direct', maxAttempts: 8 },
     {
       governor,
       runOnce: async (): Promise<TurnOutcome<V>> => {
-        if (opts.signal?.aborted) return { ok: false, raw: { message: 'meridian: aborted' } };
+        if (opts.signal?.aborted) return { ok: false, raw: { message: 'anthropic-direct: aborted' } };
         try {
           const stream = client.messages.stream(params, opts.signal ? { signal: opts.signal } : {});
           const resp = await stream.finalMessage();
@@ -883,11 +824,11 @@ async function* governedMeridian(
           }
           const tokensIn = resp.usage?.input_tokens ?? 0;
           const tokensOut = resp.usage?.output_tokens ?? 0;
-          const p = meridianPriceFor(model);
+          const p = anthropicPriceFor(model);
           const costUsd = (tokensIn * p.in + tokensOut * p.out) / 1_000_000;
           const headers = headersToRecord(stream.response?.headers);
           // Usage telemetry (D-002 capture point 1) — tokens + ratelimit headers when present.
-          emitMeridianUsage({
+          emitStatelessUsage({
             model,
             inputTokens: tokensIn,
             outputTokens: tokensOut,
@@ -920,7 +861,7 @@ async function* governedMeridian(
   } else {
     // result.error IS a TurnError — pass it through so the caller can pause/resume on a
     // rate_limited class instead of re-parsing the message (RB-006).
-    yield { type: 'error', message: `meridian error: ${result.error.message}`, turn: result.error };
+    yield { type: 'error', message: `anthropic-direct error: ${result.error.message}`, turn: result.error };
   }
 }
 
@@ -934,8 +875,8 @@ export async function* runAgentChat(
 ): AsyncGenerator<ChatEvent, void, void> {
   maybeBootstrap();
   const backend: AgentBackend = resolveBackend(opts);
-  if (backend === 'meridian') {
-    yield* meridianAgentChat(opts);
+  if (backend === 'anthropic-direct') {
+    yield* statelessAgentChat(opts);
     return;
   }
 
@@ -1457,7 +1398,7 @@ export async function* runAgentChat(
     // ignored: the spawn behaves as a generic coding agent (reads the cwd
     // CLAUDE.md, asks "what would you like to work on?") instead of BEING
     // the persona, which breaks every persona turn. Pass the persona via
-    // `--system-prompt-file` (REPLACE — matches the meridian backend's
+    // `--system-prompt-file` (REPLACE — matches the anthropic-direct backend's
     // `params.system = systemPromptText`, NOT omp's append-to-default).
     // The persona is large (~70k chars), so a file, not an inline arg.
     // Written into claudeConfigDir when isolated (shares its cleanup),

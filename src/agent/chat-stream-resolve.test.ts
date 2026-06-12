@@ -51,7 +51,7 @@ describe('resolveBackend', () => {
       ['pi', 'omp'],
       ['claude-code', 'claude-code'],
       ['claude', 'claude-code'],
-      ['meridian', 'meridian'],
+      ['anthropic-direct', 'anthropic-direct'],
       ['codex', 'codex'],
       ['  CODEX  ', 'codex'], // trimmed + lowercased
     ];
@@ -77,8 +77,8 @@ describe('resolveBackend', () => {
   });
 
   it('AGENT_BACKEND env beats an inferable agentCmd', () => {
-    process.env.AGENT_BACKEND = 'meridian';
-    expect(resolveBackend(opts({ agentCmd: 'claude' }))).toBe('meridian');
+    process.env.AGENT_BACKEND = 'anthropic-direct';
+    expect(resolveBackend(opts({ agentCmd: 'claude' }))).toBe('anthropic-direct');
   });
 
   it('defaults to omp when nothing resolves', () => {
@@ -113,8 +113,8 @@ describe('resolveAgentBin', () => {
     expect(resolveAgentBin(opts(), 'omp')).toBe('omp');
     expect(resolveAgentBin(opts(), 'codex')).toBe('codex');
     expect(resolveAgentBin(opts(), 'claude-code')).toBe('claude');
-    // meridian has no subprocess of its own → default claude binary
-    expect(resolveAgentBin(opts(), 'meridian')).toBe('claude');
+    // anthropic-direct has no subprocess of its own → default claude binary
+    expect(resolveAgentBin(opts(), 'anthropic-direct')).toBe('claude');
   });
 });
 
@@ -141,21 +141,13 @@ describe('tokenIsLive (EI-281)', () => {
   });
 });
 
-describe('chooseStatelessTransport (EI-281)', () => {
-  it('claude-code backend with a Claude session goes direct', () => {
-    expect(chooseStatelessTransport({ backend: 'claude-code', claudeTok: 'c', meridianTok: 'm' })).toBe('anthropic-direct');
+describe('chooseStatelessTransport (EI-281 / EI-399)', () => {
+  it('a live Claude session resolves anthropic-direct — the named default and only transport', () => {
+    expect(chooseStatelessTransport({ claudeTok: 'c' })).toBe('anthropic-direct');
   });
 
-  it('omp backend with a live meridian token routes via meridian', () => {
-    expect(chooseStatelessTransport({ backend: 'omp', claudeTok: 'c', meridianTok: 'm' })).toBe('meridian');
-  });
-
-  it('the EI-281 box shape — omp backend, expired omp token (filtered to null), fresh Claude session → direct', () => {
-    expect(chooseStatelessTransport({ backend: 'omp', claudeTok: 'c', meridianTok: null })).toBe('anthropic-direct');
-  });
-
-  it('neither credential usable → null', () => {
-    expect(chooseStatelessTransport({ backend: 'omp', claudeTok: null, meridianTok: null })).toBeNull();
+  it('no usable credential → null', () => {
+    expect(chooseStatelessTransport({ claudeTok: null })).toBeNull();
   });
 });
 

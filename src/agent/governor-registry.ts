@@ -24,7 +24,7 @@ export interface BackendProfile {
 }
 
 export const BACKEND_PROFILES: Record<TurnBackend, BackendProfile> = {
-  meridian: { provider: 'anthropic', selfPacing: false },
+  'anthropic-direct': { provider: 'anthropic', selfPacing: false },
   'claude-code': { provider: 'anthropic', selfPacing: false },
   omp: { provider: 'unknown', selfPacing: true },
   codex: { provider: 'openai', selfPacing: false },

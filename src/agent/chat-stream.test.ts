@@ -33,7 +33,7 @@ test('headersToRecord — plain object → lowercased; nullish → undefined', (
   assert.equal(headersToRecord(null), undefined);
 });
 
-// claude's `--model` rejects omp/Meridian's `provider/model` form; the
+// claude's `--model` rejects omp's `provider/model` form; the
 // in-process claude branch normalizes before passing it through.
 
 test('normalizeModelForClaude — strips a leading provider/ segment', () => {

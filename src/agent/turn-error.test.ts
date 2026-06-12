@@ -35,7 +35,7 @@ test('parseResetAt — RFC-3339 → epoch ms', () => {
   assert.equal(parseResetAt(undefined), undefined);
 });
 
-// --- classifyHttpError (meridian / API) ---
+// --- classifyHttpError (anthropic-direct / API) ---
 test('classifyHttpError — 429 → rate_limited, honors retry-after + reset', () => {
   const e = classifyHttpError({
     status: 429,
@@ -189,7 +189,7 @@ test('parseUsageResetMs — absolute clock → next occurrence, local hour prese
 
 // --- classifyTurnError dispatch ---
 test('classifyTurnError — dispatches by backend shape', () => {
-  assert.equal(classifyTurnError('meridian', { status: 429, headers: { 'retry-after': '5' } }).class, 'rate_limited');
+  assert.equal(classifyTurnError('anthropic-direct', { status: 429, headers: { 'retry-after': '5' } }).class, 'rate_limited');
   assert.equal(classifyTurnError('claude-code', { exitCode: 1, stderr: '429 rate limit' }).class, 'rate_limited');
   assert.equal(classifyTurnError('claude-code', { exitCode: 1, stderr: "You've hit your usage limit" }).class, 'usage_limit');
   assert.equal(classifyTurnError('omp', { exitCode: 0, stdout: '' }).class, 'empty_output');

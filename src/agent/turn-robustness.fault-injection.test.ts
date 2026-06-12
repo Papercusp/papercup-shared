@@ -2,7 +2,7 @@
  * RB-010 — fault-injection matrix + pacing SLO for the agent turn-robustness stack.
  *
  * Drives the FULL stack every backend shares — `runAgentTurn` → `RateLimitGovernor` →
- * `classifyTurnError` — with every fault class injected, per backend shape (meridian HTTP +
+ * `classifyTurnError` — with every fault class injected, per backend shape (anthropic-direct HTTP +
  * CLI subprocess). Two guarantees the plan demands:
  *   1. NEVER crash the parent: a handled fault returns a structured `TurnError`, never throws.
  *   2. Correct policy: rate_limited waits to reset + resumes; overloaded/timeout/crash/empty/
@@ -49,7 +49,7 @@ function govWith(clock: ReturnType<typeof fakeClock>, opts: { rpm?: number; maxC
 test('runAgentTurn — a THROWN runOnce is caught + classified, never propagated', async () => {
   const clock = fakeClock();
   const res = await runAgentTurn<string>(
-    { backend: 'meridian', maxAttempts: 1 },
+    { backend: 'anthropic-direct', maxAttempts: 1 },
     {
       governor: govWith(clock),
       now: clock.now,
@@ -66,8 +66,8 @@ test('runAgentTurn — a THROWN runOnce is caught + classified, never propagated
   }
 });
 
-// Meridian (HTTP-shape) fault matrix: [status, expected class, retryable].
-const MERIDIAN_FAULTS: Array<[number, string, boolean]> = [
+// anthropic-direct (HTTP-shape) fault matrix: [status, expected class, retryable].
+const HTTP_FAULTS: Array<[number, string, boolean]> = [
   [429, 'rate_limited', true],
   [529, 'overloaded', true],
   [503, 'overloaded', true],
@@ -75,11 +75,11 @@ const MERIDIAN_FAULTS: Array<[number, string, boolean]> = [
   [401, 'auth', false],
   [400, 'permanent', false],
 ];
-for (const [status, expected, retryable] of MERIDIAN_FAULTS) {
-  test(`runAgentTurn[meridian] — HTTP ${status} → ${expected} (retryable=${retryable}), no crash`, async () => {
+for (const [status, expected, retryable] of HTTP_FAULTS) {
+  test(`runAgentTurn[anthropic-direct] — HTTP ${status} → ${expected} (retryable=${retryable}), no crash`, async () => {
     const clock = fakeClock();
     const res = await runAgentTurn<string>(
-      { backend: 'meridian', maxAttempts: 1, maxWaitMs: 5_000 },
+      { backend: 'anthropic-direct', maxAttempts: 1, maxWaitMs: 5_000 },
       {
         governor: govWith(clock),
         now: clock.now,
@@ -129,11 +129,11 @@ for (const [raw, expected, retryable] of SUBPROC_FAULTS) {
 
 // --- 2) CORRECT WAIT/RESUME: a rate_limited turn waits to the reset then succeeds ---------
 
-test('runAgentTurn[meridian] — rate_limited (retry-after) waits, then RESUMES to success', async () => {
+test('runAgentTurn[anthropic-direct] — rate_limited (retry-after) waits, then RESUMES to success', async () => {
   const clock = fakeClock(1_000_000);
   let attempt = 0;
   const res = await runAgentTurn<string>(
-    { backend: 'meridian', maxAttempts: 4 },
+    { backend: 'anthropic-direct', maxAttempts: 4 },
     {
       governor: govWith(clock),
       now: clock.now,
@@ -158,7 +158,7 @@ test('runAgentTurn — an exhausted retryable fault returns the LAST error, stil
   const clock = fakeClock();
   let attempts = 0;
   const res = await runAgentTurn<string>(
-    { backend: 'meridian', maxAttempts: 3, baseBackoffMs: 10, maxWaitMs: 60_000 },
+    { backend: 'anthropic-direct', maxAttempts: 3, baseBackoffMs: 10, maxWaitMs: 60_000 },
     {
       governor: govWith(clock),
       now: clock.now,
@@ -178,7 +178,7 @@ test('runAgentTurn — auth fault fails FAST (no retry spent)', async () => {
   const clock = fakeClock();
   let attempts = 0;
   const res = await runAgentTurn<string>(
-    { backend: 'meridian', maxAttempts: 6 },
+    { backend: 'anthropic-direct', maxAttempts: 6 },
     {
       governor: govWith(clock),
       now: clock.now,
@@ -246,7 +246,7 @@ async function runTurns(n: number, gov: RateLimitGovernor, clock: ReturnType<typ
   let succeeded = 0;
   for (let i = 0; i < n; i++) {
     const res = await runAgentTurn<string>(
-      { backend: 'meridian', maxAttempts: 8, maxWaitMs: 10 * 60_000 },
+      { backend: 'anthropic-direct', maxAttempts: 8, maxWaitMs: 10 * 60_000 },
       { governor: gov, now: clock.now, sleep: clock.sleep, runOnce: async () => server.call() },
     );
     if (res.ok) succeeded++;
@@ -325,7 +325,7 @@ test('ACCEPTANCE P-022 — a 429 on ONE agent backs off the WHOLE fleet via the 
     // Caller A trips a 429 with a 60s retry-after, recovers on retry.
     let aAttempts = 0;
     const a = await runAgentTurn<string>(
-      { backend: 'meridian', maxAttempts: 3 }, // HTTP-shaped raw → the meridian classifier
+      { backend: 'anthropic-direct', maxAttempts: 3 }, // HTTP-shaped raw → the HTTP classifier
       {
         governor: gov,
         now: clock.now,
@@ -351,7 +351,7 @@ test('ACCEPTANCE P-022 — a 429 on ONE agent backs off the WHOLE fleet via the 
     const pauseSetAt = clock.t;
     let bRan = 0;
     const b = await runAgentTurn<string>(
-      { backend: 'meridian', maxAttempts: 2 },
+      { backend: 'anthropic-direct', maxAttempts: 2 },
       {
         governor: gov, // the SAME shared bucket
         now: clock.now,
