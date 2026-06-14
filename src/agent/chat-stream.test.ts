@@ -54,6 +54,7 @@ test('normalizeModelForClaude — empty in → empty out', () => {
 // count toward ITPM). Off-switch returns the bare string (transport that rejects the field).
 afterEach(() => {
   delete process.env.PAPERCUSP_PROMPT_CACHE;
+  delete process.env.PAPERCUSP_PROMPT_CACHE_TTL;
 });
 test('buildSystemParam — caching on (default) → single ephemeral text block', () => {
   const r = buildSystemParam('frozen rubric', true);
@@ -75,4 +76,14 @@ test('buildSystemParam — honors the env flag when no explicit arg', () => {
   assert.equal(buildSystemParam('x'), 'x');
   process.env.PAPERCUSP_PROMPT_CACHE = '1';
   assert.deepEqual(buildSystemParam('x'), [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral' } }]);
+});
+test('buildSystemParam — PAPERCUSP_PROMPT_CACHE_TTL=1h opts into the 1-hour cache window (P-006)', () => {
+  // default (unset) = 5m, no ttl field → byte-identical to today
+  assert.deepEqual(buildSystemParam('frozen rubric', true), [
+    { type: 'text', text: 'frozen rubric', cache_control: { type: 'ephemeral' } },
+  ]);
+  process.env.PAPERCUSP_PROMPT_CACHE_TTL = '1h';
+  assert.deepEqual(buildSystemParam('frozen rubric', true), [
+    { type: 'text', text: 'frozen rubric', cache_control: { type: 'ephemeral', ttl: '1h' } },
+  ]);
 });

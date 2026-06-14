@@ -624,7 +624,7 @@ export function promptCacheEnabled(): boolean {
 }
 
 /** A cached system text block. */
-type CachedSystemBlock = { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } };
+type CachedSystemBlock = { type: 'text'; text: string; cache_control?: { type: 'ephemeral'; ttl?: '5m' | '1h' } };
 
 /**
  * Build the stateless call's `system` request field (RB-008: prompt caching).
@@ -639,9 +639,23 @@ type CachedSystemBlock = { type: 'text'; text: string; cache_control?: { type: '
  * size, so it's a safe no-op on short prompts; the off-switch covers a transport that rejects
  * the field outright.
  */
+/** Optional extended cache TTL for the shared system prefix (inference-gateway-multi-credential-
+    routing P-006). `PAPERCUSP_PROMPT_CACHE_TTL=1h` opts the large STABLE in-process system prefix
+    into the 1-hour cache window — it survives the longer inter-hit gaps once load spreads across
+    credentials (a 1h-TTL write costs ~2× but breaks even at ~3 reads, easily met for a hot prefix).
+    Unset / any other value = the default 5-minute ephemeral window (byte-identical to today).
+    NOTE: fleet `claude -p` bees manage their own cache_control inside the CLI (out of our control),
+    so this covers the in-process anthropic-direct calls (gym judge / sim-user) — the cache_control
+    we DO own. */
+export function promptCacheTtl(): '1h' | undefined {
+  return process.env.PAPERCUSP_PROMPT_CACHE_TTL === '1h' ? '1h' : undefined;
+}
+
 export function buildSystemParam(systemPromptText: string, cache: boolean = promptCacheEnabled()): string | CachedSystemBlock[] {
   if (!cache) return systemPromptText;
-  return [{ type: 'text', text: systemPromptText, cache_control: { type: 'ephemeral' } }];
+  const ttl = promptCacheTtl();
+  const cache_control = ttl ? ({ type: 'ephemeral', ttl } as const) : ({ type: 'ephemeral' } as const);
+  return [{ type: 'text', text: systemPromptText, cache_control }];
 }
 
 async function* statelessAgentChat(
