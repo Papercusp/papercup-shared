@@ -480,9 +480,31 @@ interface StatelessTransport {
   label: 'anthropic-direct';
 }
 
+/**
+ * Base URL for an in-process anthropic-direct (OAuth) call. Precedence:
+ *   1. `PAPERCUSP_ANTHROPIC_URL` — the papercusp-specific override.
+ *   2. `ANTHROPIC_BASE_URL` — the standard var the inference gateway exports
+ *      for egress (inference-gateway/spawn-env.ts), so an IN-PROCESS call routes
+ *      through the pacing gateway exactly like a spawned `claude -p` bee whenever
+ *      the gateway is up (EI-456). Before this fallback only SPAWNED subprocesses
+ *      were gateway-paced; in-process judge/proposer calls egressed direct.
+ *   3. `https://api.anthropic.com` — direct.
+ * Behavior is unchanged when neither env var is set.
+ * Only for the OAuth/anthropic-direct path — an explicit `ANTHROPIC_API_KEY`
+ * caller must NOT use this (the gateway strips x-api-key and re-auths to the
+ * bound pool account, so a BYO-key call would silently use the pool).
+ */
+export function resolveAnthropicBaseUrl(): string {
+  return (
+    process.env.PAPERCUSP_ANTHROPIC_URL ??
+    process.env.ANTHROPIC_BASE_URL ??
+    'https://api.anthropic.com'
+  );
+}
+
 function anthropicDirectTransport(claudeTok: string): StatelessTransport {
   return {
-    baseURL: process.env.PAPERCUSP_ANTHROPIC_URL ?? 'https://api.anthropic.com',
+    baseURL: resolveAnthropicBaseUrl(),
     token: claudeTok,
     headers: { 'anthropic-beta': 'oauth-2025-04-20' },
     label: 'anthropic-direct',

@@ -14,6 +14,7 @@ export {
   setStatelessUsageSink,
   readClaudeOauthToken,
   invalidateClaudeTokenCache,
+  resolveAnthropicBaseUrl,
   probeStatelessTransport,
   type StatelessTransportProbe,
   AGENT_BACKENDS,

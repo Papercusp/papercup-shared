@@ -12,6 +12,7 @@ import {
   resolveAgentBin,
   tokenIsLive,
   chooseStatelessTransport,
+  resolveAnthropicBaseUrl,
   isConnectionFailure,
   isAuthFailure,
   type AgentBackend,
@@ -148,6 +149,41 @@ describe('chooseStatelessTransport (EI-281 / EI-399)', () => {
 
   it('no usable credential → null', () => {
     expect(chooseStatelessTransport({ claudeTok: null })).toBeNull();
+  });
+});
+
+// EI-456: in-process anthropic-direct calls must route through the inference
+// gateway (which exports ANTHROPIC_BASE_URL) just like spawned `claude -p` bees.
+describe('resolveAnthropicBaseUrl (EI-456)', () => {
+  const URL_KEYS = ['PAPERCUSP_ANTHROPIC_URL', 'ANTHROPIC_BASE_URL'] as const;
+  const savedUrls: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const k of URL_KEYS) {
+      savedUrls[k] = process.env[k];
+      delete process.env[k];
+    }
+  });
+  afterEach(() => {
+    for (const k of URL_KEYS) {
+      if (savedUrls[k] === undefined) delete process.env[k];
+      else process.env[k] = savedUrls[k];
+    }
+  });
+
+  it('defaults to api.anthropic.com when neither var is set (behavior unchanged)', () => {
+    expect(resolveAnthropicBaseUrl()).toBe('https://api.anthropic.com');
+  });
+
+  it('falls back to ANTHROPIC_BASE_URL — the gateway-set var — for in-process calls', () => {
+    process.env.ANTHROPIC_BASE_URL = 'http://127.0.0.1:8788';
+    expect(resolveAnthropicBaseUrl()).toBe('http://127.0.0.1:8788');
+  });
+
+  it('PAPERCUSP_ANTHROPIC_URL takes precedence over ANTHROPIC_BASE_URL', () => {
+    process.env.PAPERCUSP_ANTHROPIC_URL = 'http://override:9999';
+    process.env.ANTHROPIC_BASE_URL = 'http://127.0.0.1:8788';
+    expect(resolveAnthropicBaseUrl()).toBe('http://override:9999');
   });
 });
 
