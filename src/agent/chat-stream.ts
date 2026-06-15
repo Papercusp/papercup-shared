@@ -501,13 +501,6 @@ function loadClaudeCreds(): { access: string; expires: number | null } | null {
 }
 
 export function readClaudeOauthToken(): string | null {
-  // Test/multi-account credential override (env-gated, default OFF): when set,
-  // use THIS OAuth access token instead of ~/.claude. Lets a live-LLM test
-  // (scout/gym quality lanes) draw from a SEPARATE, non-saturated account
-  // credential to dodge a rate-limited shared session — without mutating the
-  // shared ~/.claude file. No effect on normal operation (env unset).
-  const oauthOverride = process.env.PAPERCUSP_ANTHROPIC_OAUTH_TOKEN?.trim();
-  if (oauthOverride) return oauthOverride;
   if (_claudeTokenCache === undefined) _claudeTokenCache = loadClaudeCreds();
   // Self-heal (EI-281, long-lived-process half): Claude OAuth tokens rotate
   // ~2-hourly on disk (claude CLI / credential-sync), so a process that
