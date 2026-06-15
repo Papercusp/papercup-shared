@@ -4,7 +4,7 @@
  */
 import { test, afterEach } from 'vitest';
 import assert from 'node:assert/strict';
-import { normalizeModelForClaude, headersToRecord, buildSystemParam, promptCacheEnabled, claudeSpawnEnvOverrides } from './chat-stream';
+import { normalizeModelForClaude, headersToRecord, buildSystemParam, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent } from './chat-stream';
 
 // claudeSpawnEnvOverrides (voice-persona P-009): disableToolSearch →
 // ENABLE_TOOL_SEARCH=false so the operator brain's caller-shrunk MCP surface
@@ -86,4 +86,50 @@ test('buildSystemParam — PAPERCUSP_PROMPT_CACHE_TTL=1h opts into the 1-hour ca
   assert.deepEqual(buildSystemParam('frozen rubric', true), [
     { type: 'text', text: 'frozen rubric', cache_control: { type: 'ephemeral', ttl: '1h' } },
   ]);
+});
+
+// parseClaudeResultEvent (external-bench native arm, P-007): maps a claude-code
+// `--output-format stream-json` terminal `result` event → the usage slice the
+// subprocess loop folds in, and that the run-result `turns`/cache fields need.
+test('parseClaudeResultEvent — full claude result event maps every reported field', () => {
+  assert.deepEqual(
+    parseClaudeResultEvent({
+      type: 'result',
+      subtype: 'success',
+      num_turns: 14,
+      total_cost_usd: 0.4231,
+      result: 'done — patch applied',
+      usage: {
+        input_tokens: 1200,
+        output_tokens: 3400,
+        cache_read_input_tokens: 55000,
+        cache_creation_input_tokens: 8000,
+      },
+    }),
+    {
+      tokensIn: 1200,
+      tokensOut: 3400,
+      cacheReadTokens: 55000,
+      cacheCreationTokens: 8000,
+      costUsd: 0.4231,
+      numTurns: 14,
+      resultText: 'done — patch applied',
+    },
+  );
+});
+
+test('parseClaudeResultEvent — omits unreported keys (no cache / no turns / no usage)', () => {
+  // A minimal result event (no usage block, no num_turns) returns ONLY what it
+  // carried, so the loop keeps prior streamed accumulators for absent fields.
+  assert.deepEqual(parseClaudeResultEvent({ type: 'result', total_cost_usd: 0.01 }), {
+    costUsd: 0.01,
+  });
+  // A partial usage block surfaces only the present token fields.
+  assert.deepEqual(
+    parseClaudeResultEvent({ type: 'result', usage: { input_tokens: 10, output_tokens: 20 } }),
+    { tokensIn: 10, tokensOut: 20 },
+  );
+  // Non-numeric / missing → empty (never coerces a bogus 0).
+  assert.deepEqual(parseClaudeResultEvent({ type: 'result', num_turns: 'x', usage: {} }), {});
+  assert.deepEqual(parseClaudeResultEvent({}), {});
 });

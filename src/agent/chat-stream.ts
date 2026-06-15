@@ -410,6 +410,45 @@ export type ChatEvent =
       turn?: TurnError;
     };
 
+/** The terminal-usage slice of a claude-code `result` event (see
+    {@link parseClaudeResultEvent}). Only reported keys are present. */
+export interface ClaudeResultUsage {
+  tokensIn?: number;
+  tokensOut?: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
+  costUsd?: number;
+  numTurns?: number;
+  resultText?: string;
+}
+
+/**
+ * Extract the terminal-usage slice from a claude-code `--output-format
+ * stream-json` `result` event (`{type:'result', usage:{input_tokens,
+ * output_tokens, cache_read_input_tokens, cache_creation_input_tokens},
+ * total_cost_usd, num_turns, result}`). Pure (no closure state) so the
+ * subprocess loop folds the returned fields into its accumulators AND a unit
+ * test can assert the mapping without spawning `claude`. Returns ONLY the keys
+ * the event actually reported, so a caller keeps its prior streamed value for
+ * any absent field.
+ */
+export function parseClaudeResultEvent(ev: any): ClaudeResultUsage {
+  const out: ClaudeResultUsage = {};
+  const usage = ev?.usage;
+  if (usage) {
+    if (typeof usage.input_tokens === 'number') out.tokensIn = usage.input_tokens;
+    if (typeof usage.output_tokens === 'number') out.tokensOut = usage.output_tokens;
+    if (typeof usage.cache_read_input_tokens === 'number')
+      out.cacheReadTokens = usage.cache_read_input_tokens;
+    if (typeof usage.cache_creation_input_tokens === 'number')
+      out.cacheCreationTokens = usage.cache_creation_input_tokens;
+  }
+  if (typeof ev?.total_cost_usd === 'number') out.costUsd = ev.total_cost_usd;
+  if (typeof ev?.num_turns === 'number') out.numTurns = ev.num_turns;
+  if (typeof ev?.result === 'string') out.resultText = ev.result;
+  return out;
+}
+
 // ===========================================================================
 // Stateless `anthropic-direct` backend — a single Anthropic-format HTTP
 // round-trip, NO subprocess (~100-300ms vs. ~1-2s for an agent spawn). Use
@@ -1560,20 +1599,17 @@ export async function* runAgentChat(
         queue.push({ type: 'tool_call', name: filtered, input: parsed });
       }
     } else if (ev.type === 'result') {
-      if (ev.usage) {
-        tokensIn = ev.usage.input_tokens ?? tokensIn;
-        tokensOut = ev.usage.output_tokens ?? tokensOut;
-        if (typeof ev.usage.cache_read_input_tokens === 'number')
-          cacheReadTokens = ev.usage.cache_read_input_tokens;
-        if (typeof ev.usage.cache_creation_input_tokens === 'number')
-          cacheCreationTokens = ev.usage.cache_creation_input_tokens;
-      }
-      if (typeof ev.total_cost_usd === 'number') costUsd = ev.total_cost_usd;
-      if (typeof ev.num_turns === 'number') numTurns = ev.num_turns;
+      const u = parseClaudeResultEvent(ev);
+      if (u.tokensIn !== undefined) tokensIn = u.tokensIn;
+      if (u.tokensOut !== undefined) tokensOut = u.tokensOut;
+      if (u.cacheReadTokens !== undefined) cacheReadTokens = u.cacheReadTokens;
+      if (u.cacheCreationTokens !== undefined) cacheCreationTokens = u.cacheCreationTokens;
+      if (u.costUsd !== undefined) costUsd = u.costUsd;
+      if (u.numTurns !== undefined) numTurns = u.numTurns;
       // Sometimes the terminal `result.result` is the most complete
       // assistant text — prefer it if longer than the streamed accum.
-      if (typeof ev.result === 'string' && ev.result.length > finalText.length) {
-        finalText = ev.result;
+      if (u.resultText !== undefined && u.resultText.length > finalText.length) {
+        finalText = u.resultText;
       }
     }
   };
