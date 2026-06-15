@@ -44,6 +44,7 @@ import { basename, join } from 'node:path';
 // import nothing from this file, so there's no cycle and ~no load cost when the flag is off.
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
 import { governorForBackend, BACKEND_PROFILES } from './governor-registry';
+import { ROLLING_WINDOW_REPROBE_MS } from '../resilience/governor';
 import { classifyTurnError, isAccountWide, type TurnBackend, type TurnError } from './turn-error';
 
 /** Default cap on a CLI spawn's wait for a shared-governor permit (RB-012). Long enough to
@@ -1874,10 +1875,17 @@ export async function* runAgentChat(
     );
     if (isAccountWide(cliTurn.class)) {
       // rate_limited/overloaded (transient) AND usage_limit (plan cap) all pause the shared
-      // bucket so concurrent CLI spawns back off together (D-001).
+      // bucket so concurrent CLI spawns back off together (D-001). BUT a Claude Max usage_limit is a
+      // ROLLING 5h/7d window that recovers continuously — pausing the shared bucket to its full
+      // (often hours-away) reset goes stale ("opus paused until 09:10, zero pressure" = the
+      // owner-flagged false exhaustion). So an Anthropic usage_limit is bounded to a re-probe
+      // interval (the fleet resumes the moment the window frees); a non-Anthropic hard quota
+      // (codex/openai daily-weekly) keeps its full reset, and transient classes honor retry-after.
+      const rollingCap = cliTurn.class === 'usage_limit' && cliTurn.provider === 'anthropic';
       governorForBackend(backend as TurnBackend, opts.model ?? '').penalize({
         retryAfterMs: cliTurn.retryAfterMs,
         resetAt: cliTurn.resetAt,
+        ...(rollingCap ? { maxPauseMs: ROLLING_WINDOW_REPROBE_MS } : {}),
       });
     }
   }

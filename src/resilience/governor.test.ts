@@ -12,6 +12,7 @@ import {
   recordPenalty,
   recordHeaders,
   RateLimitGovernor,
+  ROLLING_WINDOW_REPROBE_MS,
   type GovernorState,
   type GovernorLimits,
   type GlobalConcurrencyGate,
@@ -79,6 +80,17 @@ test('recordPenalty — resetAt wins when later than retryAfter; never shrinks a
   recordPenalty(s, 0, { resetAt: 50_000 });
   recordPenalty(s, 0, { retryAfterMs: 1000 }); // shorter — must NOT shrink the pause
   assert.equal(decideAcquire(s, 0, {}).waitMs, 50_000);
+});
+test('recordPenalty — maxPauseMs caps a far-future rolling-window reset to a bounded re-probe (D-003)', () => {
+  const s = initGovernorState({ maxConcurrent: 10 });
+  // A Claude Max usage cap reports a reset hours out, but the rolling window recovers continuously —
+  // maxPauseMs bounds the pause so the bucket re-probes instead of sitting stale for hours.
+  recordPenalty(s, 1000, { resetAt: 1000 + 5 * 60 * 60_000, maxPauseMs: ROLLING_WINDOW_REPROBE_MS });
+  assert.equal(s.pausedUntil, 1000 + ROLLING_WINDOW_REPROBE_MS, 'capped to the re-probe interval');
+  // Without maxPauseMs the precise (short) reset is still honored fully.
+  const s2 = initGovernorState({ maxConcurrent: 10 });
+  recordPenalty(s2, 0, { retryAfterMs: 30_000 });
+  assert.equal(s2.pausedUntil, 30_000);
 });
 
 // --- header-driven sync ---
@@ -456,9 +468,10 @@ test('AIMD hooks — clean release fires noteClean; an in-flight penalty suppres
 });
 
 // --- unified (subscription) dialect: rolling-utilization windows (hive-inference-gateway D-009) ---
-test('recordHeaders — unified 5h rejected hard-pauses to the (unix-seconds) reset', () => {
+test('recordHeaders — unified 5h rejected pauses a BOUNDED re-probe interval, not the full reset (D-003)', () => {
   const s = initGovernorState({ maxConcurrent: 10 });
-  const resetSec = 1_781_076_000; // unix seconds
+  const now = 1_000;
+  const resetSec = 1_781_076_000; // unix seconds — hours out
   recordHeaders(
     s,
     {
@@ -472,15 +485,19 @@ test('recordHeaders — unified 5h rejected hard-pauses to the (unix-seconds) re
       'anthropic-ratelimit-unified-reset': String(resetSec),
       'anthropic-ratelimit-unified-representative-claim': 'five_hour',
     },
-    1_000,
+    now,
   );
-  assert.equal(s.pausedUntil, resetSec * 1000, 'paused to the unix-seconds reset, in ms');
+  // Rolling-utilization windows recover continuously → a bounded re-probe, NOT the multi-hour reset
+  // (which would go stale: "paused until <reset> with zero pressure" = the false-exhaustion bug).
+  assert.equal(s.pausedUntil, now + ROLLING_WINDOW_REPROBE_MS, 'bounded re-probe pause');
+  assert.ok(s.pausedUntil < resetSec * 1000, 'far below the full reset');
   assert.ok(s.unified, 'unified state recorded');
   assert.equal(s.unified!.rejected, true);
   assert.equal(s.unified!.window, '5h'); // 5h binds over the allowed 7d
   assert.equal(s.unified!.utilization, 1.01);
-  assert.equal(decideAcquire(s, 1_000, {}).allowed, false); // blocked until reset
-  assert.equal(decideAcquire(s, resetSec * 1000 + 1, {}).allowed, true);
+  assert.equal(s.unified!.resetAt, resetSec * 1000, 'real reset kept for observability + failover rejoin');
+  assert.equal(decideAcquire(s, now, {}).allowed, false); // blocked during the re-probe pause
+  assert.equal(decideAcquire(s, now + ROLLING_WINDOW_REPROBE_MS + 1, {}).allowed, true); // then re-probes
 });
 
 test('recordHeaders — unified high utilization (allowed) sets pre-emptive pace, not a pause', () => {

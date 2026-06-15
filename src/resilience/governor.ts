@@ -102,6 +102,14 @@ const MAX_PACE_DELAY_MS = 5_000;
 // MAX_PACE_DELAY_MS as utilization → 1, so a 5-hour budget glides toward its reset instead of
 // being burned early then hard-stopping for hours. `status: rejected` still hard-pauses to reset.
 const UNIFIED_PACE_WATERMARK = 0.8;
+// Rolling-utilization (subscription) windows — Claude Max 5h/7d — recover CONTINUOUSLY as old usage
+// ages out, so the window `reset` is when it FULLY clears, NOT when you can next send. Pausing a
+// rejection to the full multi-hour reset therefore goes stale ("paused until 09:10 with zero
+// pressure" long after the window freed = false exhaustion). Instead a rejection backs off this
+// bounded interval then RE-PROBES — the next response's utilization is the truth, so the fleet
+// resumes the moment the window frees. A few extra 429s under genuine sustained exhaustion is the
+// (cheap) cost; the failover/selector route traffic away in the meantime.
+export const ROLLING_WINDOW_REPROBE_MS = 2 * 60_000;
 
 export function initGovernorState(limits: GovernorLimits): GovernorState {
   return {
@@ -192,10 +200,18 @@ export function recordRelease(s: GovernorState): void {
   s.inFlight = Math.max(0, s.inFlight - 1);
 }
 
-/** On a 429: pause the bucket until the server's reset/retry-after. Never SHRINKS an
-    existing pause (the most-conservative reset wins). */
-export function recordPenalty(s: GovernorState, now: number, opts: { retryAfterMs?: number; resetAt?: number }): void {
-  const until = Math.max(opts.resetAt ?? 0, opts.retryAfterMs !== undefined ? now + opts.retryAfterMs : 0);
+/** On a 429: pause the bucket until the server's reset/retry-after. Never SHRINKS an existing pause
+    (the most-conservative reset wins). `maxPauseMs` caps the pause to `now + maxPauseMs` — the caller
+    sets it for a ROLLING-window subscription cap (Claude Max 5h/7d), which recovers continuously, so
+    the bucket re-probes rather than sitting on the full multi-hour reset (the false-exhaustion bug).
+    A classic per-minute 429 / a hard quota omits it and the precise reset is honored. */
+export function recordPenalty(
+  s: GovernorState,
+  now: number,
+  opts: { retryAfterMs?: number; resetAt?: number; maxPauseMs?: number },
+): void {
+  let until = Math.max(opts.resetAt ?? 0, opts.retryAfterMs !== undefined ? now + opts.retryAfterMs : 0);
+  if (opts.maxPauseMs !== undefined && until > now + opts.maxPauseMs) until = now + opts.maxPauseMs;
   if (until > s.pausedUntil) s.pausedUntil = until;
 }
 
@@ -274,7 +290,14 @@ export function recordHeaders(s: GovernorState, headers: Record<string, string |
     if (status === undefined && util === undefined) continue; // window not present
     const resetAt = parseResetToMs(h[w.resetK]);
     const rejected = status === 'rejected';
-    if (rejected && resetAt > s.pausedUntil) s.pausedUntil = resetAt; // hard backpressure to reset
+    // Bounded re-probe, NOT a hard-pause to the full reset: a rolling-utilization window recovers
+    // continuously, so sitting on the multi-hour reset goes stale (false exhaustion). See
+    // ROLLING_WINDOW_REPROBE_MS. The real `resetAt` is still recorded on `s.unified` (observability)
+    // + used by the gateway failover's rejoin time.
+    if (rejected) {
+      const reprobeAt = now + ROLLING_WINDOW_REPROBE_MS;
+      if (reprobeAt > s.pausedUntil) s.pausedUntil = reprobeAt;
+    }
     if (util !== undefined && util > UNIFIED_PACE_WATERMARK && util < 1 && resetAt > now) {
       const gap = Math.min(
         MAX_PACE_DELAY_MS,
@@ -524,7 +547,7 @@ export class RateLimitGovernor {
     if (this.store) void this.store.transact(this.storeKey!, this.floor, (s) => recordHeaders(s, headers, this.now())).catch(() => {});
   }
 
-  penalize(opts: { retryAfterMs?: number; resetAt?: number }): void {
+  penalize(opts: { retryAfterMs?: number; resetAt?: number; maxPauseMs?: number }): void {
     const before = this.state.pausedUntil;
     this.penaltySeq += 1; // any in-flight turn that releases after this is NOT clean (D-005)
     recordPenalty(this.state, this.now(), opts);
