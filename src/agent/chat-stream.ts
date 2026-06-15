@@ -382,6 +382,19 @@ export type ChatEvent =
       tokensIn: number;
       tokensOut: number;
       finalText: string;
+      /** Agent-loop turn count, when the backend reports it (claude-code's
+          terminal `result.num_turns`). Undefined for backends that don't
+          surface it (anthropic-direct/omp/codex). Lets a consumer record the
+          real turn count rather than proxying off tool_call events — the
+          external-bench native arm (P-007) folds it into the run-result. */
+      numTurns?: number;
+      /** Prompt-cache READ / WRITE input tokens when the backend reports them
+          (claude-code/anthropic `cache_read_input_tokens` /
+          `cache_creation_input_tokens`). `tokensIn` stays the backend's
+          headline input count; these are the additive cache-priced inputs
+          (@papercusp/model-pricing). Undefined when not reported. */
+      cacheReadTokens?: number;
+      cacheCreationTokens?: number;
     }
   | {
       type: 'error';
@@ -1499,6 +1512,12 @@ export async function* runAgentChat(
   let costUsd = 0;
   let tokensIn = 0;
   let tokensOut = 0;
+  // Surfaced on the terminal `result` event when the backend reports them
+  // (claude-code: num_turns + cache_read/creation_input_tokens). Undefined
+  // otherwise so a consumer can tell "0 turns" from "not reported".
+  let numTurns: number | undefined;
+  let cacheReadTokens: number | undefined;
+  let cacheCreationTokens: number | undefined;
   // Buffer events from the line-parser; the generator drains this queue.
   const queue: ChatEvent[] = [];
   let resolveTick: (() => void) | null = null;
@@ -1544,8 +1563,13 @@ export async function* runAgentChat(
       if (ev.usage) {
         tokensIn = ev.usage.input_tokens ?? tokensIn;
         tokensOut = ev.usage.output_tokens ?? tokensOut;
+        if (typeof ev.usage.cache_read_input_tokens === 'number')
+          cacheReadTokens = ev.usage.cache_read_input_tokens;
+        if (typeof ev.usage.cache_creation_input_tokens === 'number')
+          cacheCreationTokens = ev.usage.cache_creation_input_tokens;
       }
       if (typeof ev.total_cost_usd === 'number') costUsd = ev.total_cost_usd;
+      if (typeof ev.num_turns === 'number') numTurns = ev.num_turns;
       // Sometimes the terminal `result.result` is the most complete
       // assistant text — prefer it if longer than the streamed accum.
       if (typeof ev.result === 'string' && ev.result.length > finalText.length) {
@@ -1836,6 +1860,9 @@ export async function* runAgentChat(
       tokensIn,
       tokensOut,
       finalText,
+      ...(numTurns !== undefined ? { numTurns } : {}),
+      ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
+      ...(cacheCreationTokens !== undefined ? { cacheCreationTokens } : {}),
     };
   }
   } finally {
