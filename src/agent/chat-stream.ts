@@ -555,11 +555,34 @@ export function resolveAnthropicBaseUrl(): string {
   );
 }
 
+/** The header the inference gateway reads to pin a request to a specific pool account's
+ *  per-credential cache + per-account rate bucket (gateway.ts `ACCOUNT_HEADER`). Duplicated as a
+ *  bare const here because papercup-shared must not import operator-core (dependency direction). */
+export const ROUTE_ACCOUNT_HEADER = 'x-papercusp-account';
+
+/**
+ * The pool account this IN-PROCESS anthropic-direct call should egress through, when the operator has
+ * resolved one (account-aware-rate-governor-routing Phase 2). The operator sets `PAPERCUSP_ROUTE_ACCOUNT`
+ * on its process env (per the per-account drain selector) so a Queen-brain / in-process operator call
+ * spreads across the pool instead of all hammering the gateway's fixed `active()` account → 429-ing it →
+ * poisoning the global opus bucket. Empty/unset ⇒ no header ⇒ the gateway routes to active() (today's
+ * behavior). Env-based to keep this lib free of an operator-core import (mirrors `resolveAnthropicBaseUrl`).
+ */
+export function resolveRouteAccountId(): string | undefined {
+  const v = process.env.PAPERCUSP_ROUTE_ACCOUNT?.trim();
+  return v || undefined;
+}
+
 function anthropicDirectTransport(claudeTok: string): StatelessTransport {
+  const headers: Record<string, string> = { 'anthropic-beta': 'oauth-2025-04-20' };
+  // Phase 2: pin in-process egress to the operator-resolved pool account so the gateway routes it to
+  // that credential's per-account bucket (account-aware) instead of the account-blind active().
+  const routeAccount = resolveRouteAccountId();
+  if (routeAccount) headers[ROUTE_ACCOUNT_HEADER] = routeAccount;
   return {
     baseURL: resolveAnthropicBaseUrl(),
     token: claudeTok,
-    headers: { 'anthropic-beta': 'oauth-2025-04-20' },
+    headers,
     label: 'anthropic-direct',
   };
 }
