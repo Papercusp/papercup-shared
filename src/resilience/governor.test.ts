@@ -93,26 +93,26 @@ test('recordPenalty — maxPauseMs caps a far-future rolling-window reset to a b
   assert.equal(s2.pausedUntil, 30_000);
 });
 
-test('RateLimitGovernor.penalize — auto-caps a far-future reset for a SUBSCRIPTION account (fleet-wide false-pause fix, 2026-06-17)', () => {
-  let clock = 1_000_000;
+test('RateLimitGovernor.penalize — UNCONDITIONALLY caps a far-future reset to the re-probe window (fleet-wide false-pause fix, 2026-06-17)', () => {
+  const clock = 1_000_000;
+  // FRESH process (no unified header seen yet — state.unified undefined): this is the edge that made the
+  // false-pause RECUR under a narrower s.unified-gated fix. A transient 429 carrying the 7d reset boundary
+  // (~16h out) must STILL be capped to the re-probe interval, not pin the bucket for 16h.
   const g = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock });
-  // Make this a rolling-window (Claude Max) account: a unified header populates state.unified.
-  // Window is ALLOWED + low util, so this neither paces nor pauses — it only marks the dialect.
-  g.recordResponse({
-    'anthropic-ratelimit-unified-5h-status': 'allowed',
-    'anthropic-ratelimit-unified-5h-utilization': '0.48',
-    'anthropic-ratelimit-unified-5h-reset': String(Math.round((clock + 16 * 60 * 60_000) / 1000)),
-  });
-  assert.notEqual(g.state.unified, undefined, 'unified dialect detected');
-  // A transient 429 carrying the 7d reset boundary (~16h out). Pre-fix this pinned the bucket for 16h
-  // (the fleet-wide lockout); post-fix penalize() auto-injects maxPauseMs=ROLLING_WINDOW_REPROBE_MS.
+  assert.equal(g.state.unified, undefined, 'fresh process: no unified dialect recorded yet');
   g.penalize({ retryAfterMs: 16 * 60 * 60_000, resetAt: clock + 16 * 60 * 60_000 });
-  assert.equal(g.state.pausedUntil, clock + ROLLING_WINDOW_REPROBE_MS, 'subscription pause capped to the re-probe interval, NOT the 16h reset');
+  assert.equal(g.state.pausedUntil, clock + ROLLING_WINDOW_REPROBE_MS, 'far-future reset capped to the re-probe interval even with no unified header');
 
-  // Contrast: a CLASSIC (per-minute, no unified header) account is untouched — its precise reset is honored.
+  // A SHORT (per-minute / API-key) reset is still honored fully — it is below the re-probe window, so the
+  // cap never bites and the precise reset wins.
   const g2 = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock });
   g2.penalize({ retryAfterMs: 30_000 });
-  assert.equal(g2.state.pausedUntil, clock + 30_000, 'classic per-minute reset honored fully (no cap)');
+  assert.equal(g2.state.pausedUntil, clock + 30_000, 'short per-minute reset honored fully (under the cap)');
+
+  // A caller's own TIGHTER cap still wins over the default re-probe ceiling.
+  const g3 = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock });
+  g3.penalize({ resetAt: clock + 16 * 60 * 60_000, maxPauseMs: 10_000 });
+  assert.equal(g3.state.pausedUntil, clock + 10_000, 'tighter caller maxPauseMs wins');
 });
 
 // --- header-driven sync ---
