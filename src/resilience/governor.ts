@@ -550,12 +550,27 @@ export class RateLimitGovernor {
   penalize(opts: { retryAfterMs?: number; resetAt?: number; maxPauseMs?: number }): void {
     const before = this.state.pausedUntil;
     this.penaltySeq += 1; // any in-flight turn that releases after this is NOT clean (D-005)
-    recordPenalty(this.state, this.now(), opts);
+    // ROLLING-WINDOW FALSE-PAUSE FIX: a subscription (Claude Max 5h/7d) account recovers CONTINUOUSLY,
+    // so a 429 carrying the window's multi-hour reset must NOT become a multi-hour hard pause — that is
+    // the fleet-wide false-pause (2026-06-17: a transient 429, util still ALLOWED, pinned EVERY anthropic
+    // bucket to a reset boundary ~16h out, locking the whole fleet out of opus with $0/0-rpm usage). Cap
+    // the pause to a bounded re-probe, mirroring recordHeaders' rejected-unified path. A genuinely
+    // exhausted account just 429s again on the next probe and re-pauses — re-probing beats sitting blind
+    // on a stale multi-hour reset. Detect subscription from the IN-MEMORY state (`this.state.unified`);
+    // the persisted shared row NEVER carries `unified` (rowToState drops it), so the cap MUST be baked
+    // into `opts` HERE so the cross-process write below inherits it too — else PG keeps the 16h pause.
+    // The caller's own (tighter) maxPauseMs still wins; a non-subscription/classic per-minute reset is
+    // untouched (its precise reset is < the reprobe window anyway).
+    const eff =
+      this.state.unified !== undefined
+        ? { ...opts, maxPauseMs: Math.min(opts.maxPauseMs ?? Infinity, ROLLING_WINDOW_REPROBE_MS) }
+        : opts;
+    recordPenalty(this.state, this.now(), eff);
     // AIMD multiplicative decrease (D-005) — once per DISTINCT backpressure event (a pause that
     // actually extends), so N agents co-failing on the same 429 halve the fleet once, not N times.
     if (this.state.pausedUntil > before) this.globalGate?.notePenalty?.();
     this.notifyPauseIfExtended(before, 'penalty');
     // A 429 anywhere pauses the WHOLE account → push to the shared row so every process backs off.
-    if (this.store) void this.store.transact(this.storeKey!, this.floor, (s) => recordPenalty(s, this.now(), opts)).catch(() => {});
+    if (this.store) void this.store.transact(this.storeKey!, this.floor, (s) => recordPenalty(s, this.now(), eff)).catch(() => {});
   }
 }
