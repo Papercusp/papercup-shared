@@ -113,6 +113,13 @@ test('RateLimitGovernor.penalize — UNCONDITIONALLY caps a far-future reset to 
   const g3 = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock });
   g3.penalize({ resetAt: clock + 16 * 60 * 60_000, maxPauseMs: 10_000 });
   assert.equal(g3.state.pausedUntil, clock + 10_000, 'tighter caller maxPauseMs wins');
+
+  // ACCOUNT-KEYED bucket (storeKey carries '@<account>') is NOT capped — a sustained per-account 429
+  // pattern is the scale-out exhaustion signal (account-pool-store P-019/P-021), and a per-account pause
+  // only gates that account (failover routes around it). The cap is fleet-wide-bucket-only.
+  const gAcct = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock, storeKey: 'anthropic:opus@acct-1' });
+  gAcct.penalize({ retryAfterMs: 15 * 60_000, resetAt: clock + 15 * 60_000 });
+  assert.equal(gAcct.state.pausedUntil, clock + 15 * 60_000, 'account-keyed pause left intact (scale-out signal), NOT capped');
 });
 
 // --- header-driven sync ---

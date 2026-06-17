@@ -550,19 +550,22 @@ export class RateLimitGovernor {
   penalize(opts: { retryAfterMs?: number; resetAt?: number; maxPauseMs?: number }): void {
     const before = this.state.pausedUntil;
     this.penaltySeq += 1; // any in-flight turn that releases after this is NOT clean (D-005)
-    // ROLLING-WINDOW FALSE-PAUSE FIX (2026-06-17): a 429 carrying a MULTI-HOUR reset must NEVER become a
-    // multi-hour hard pause. On 2026-06-17 a transient opus 429 (util still ALLOWED) carrying the Claude-Max
-    // 7d rolling-window reset pinned EVERY account-blind anthropic bucket ~16h out, locking the whole fleet
-    // out of opus with $0/0-rpm — and it RECURRED from the fresh-process edge of an earlier, narrower fix
-    // (gated on `state.unified`, which is empty until a process has seen a unified header, so a post-restart
-    // process that 429s first skipped the cap). The cap is therefore UNCONDITIONAL: every provider this
-    // governor fronts is either a rolling-utilization subscription (recovers continuously → re-probe is the
-    // correct behavior, mirroring recordHeaders' rejected-unified path) or a per-minute API key (reset < the
-    // re-probe window, so the cap never bites — the precise short reset is still honored). There is no
-    // legitimate multi-hour pause from a single 429. The cap MUST be baked into `opts` HERE so the
-    // cross-process PG write below inherits it (the persisted row never carries `unified`/dialect, so an
-    // in-memory-only cap would still write the full reset). A caller's own TIGHTER maxPauseMs still wins.
-    const eff = { ...opts, maxPauseMs: Math.min(opts.maxPauseMs ?? Infinity, ROLLING_WINDOW_REPROBE_MS) };
+    // ROLLING-WINDOW FALSE-PAUSE FIX (2026-06-17): a 429 carrying a MULTI-HOUR reset must NEVER pause the
+    // FLEET-WIDE bucket for hours. On 2026-06-17 a transient opus 429 (util still ALLOWED) carrying the
+    // Claude-Max 7d rolling-window reset pinned every ACCOUNT-BLIND anthropic bucket ~16h out, locking the
+    // whole fleet out of opus with $0/0-rpm (and it recurred from a fresh process that 429s before recording
+    // a unified header). Cap the pause to a bounded re-probe — but ONLY for the account-blind (fleet-wide)
+    // bucket. An ACCOUNT-KEYED bucket (`storeKey` carries '@<accountId>') is ONE account's state: there a
+    // SUSTAINED 429 pattern is the genuine exhaustion signal the account-scale-out observer needs (each
+    // penalty EXTENDS the pause → onPause re-fires → scale out — account-pool-store P-019/P-021), and a
+    // per-account pause only gates that account (gateway failover routes around it), so it is left intact.
+    // A governor with no key (direct construction / pre-store) is treated as fleet-wide → capped. The cap
+    // is baked into `opts` HERE so the cross-process PG write below inherits it (the persisted row carries
+    // no dialect). A caller's own TIGHTER maxPauseMs still wins.
+    const accountKeyed = this.storeKey?.includes('@') ?? false;
+    const eff = accountKeyed
+      ? opts
+      : { ...opts, maxPauseMs: Math.min(opts.maxPauseMs ?? Infinity, ROLLING_WINDOW_REPROBE_MS) };
     recordPenalty(this.state, this.now(), eff);
     // AIMD multiplicative decrease (D-005) — once per DISTINCT backpressure event (a pause that
     // actually extends), so N agents co-failing on the same 429 halve the fleet once, not N times.

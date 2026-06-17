@@ -228,8 +228,13 @@ export function getGovernor(provider: TurnProvider, modelClass: string, deps?: G
         ...deps,
         // Fleet-wide cap (D-004): share the registry's one global gate unless a test injects its own.
         globalGate: deps?.globalGate ?? globalGate,
+        // ALWAYS tag the governor with its bucket key (account-blind `provider:class` vs `@<account>`-keyed)
+        // — penalize() scopes the rolling-window false-pause cap to the FLEET-WIDE bucket only (an
+        // account-keyed pause is the scale-out exhaustion signal, left uncapped). Needed even with no PG
+        // store (in-memory tests), so it can't live behind the `sharedStore` branch below.
+        storeKey: deps?.storeKey ?? key,
         // Bind the cross-process store (RB-007) unless the caller injected its own (tests do).
-        ...(deps?.store ? {} : sharedStore ? { store: sharedStore, storeKey: key } : {}),
+        ...(deps?.store ? {} : sharedStore ? { store: sharedStore } : {}),
         onPause: (ev) => {
           emitGovernorPause({ ...ev, key });
           deps?.onPause?.(ev);
