@@ -565,6 +565,56 @@ test('recordHeaders — unified utilization below the watermark paces 0 (healthy
   assert.equal(s.unified!.utilization, 0.2);
 });
 
+// --- PREDICTIVE pre-emptive pause (owner-requested 2026-06-18, UNIFIED_PREDICT_PAUSE_WATERMARK 0.95) ---
+// A rolling window at/over 0.95 utilization will almost certainly 429 the NEXT request even though THIS
+// response was `allowed` — so the governor proactively pauses the account for the bounded re-probe so
+// routing/failover SKIPS it before it 429s, then re-probes once the window ages back below the cap.
+test('recordHeaders — unified util ≥ 0.95 (allowed, future reset) PROACTIVELY pauses the re-probe window before it 429s', () => {
+  const s = initGovernorState({ maxConcurrent: 10 });
+  const now = 1_000;
+  const resetSec = Math.round(now / 1000) + 3_600; // a FUTURE reset (window still live)
+  recordHeaders(
+    s,
+    {
+      // 7-day Claude Max budget effectively spent (0.97 ≥ 0.95) but NOT yet rejected — the next request
+      // would tip it over. The governor predicts the 429 and backs off NOW rather than routing into it.
+      'anthropic-ratelimit-unified-7d-status': 'allowed',
+      'anthropic-ratelimit-unified-7d-utilization': '0.97',
+      'anthropic-ratelimit-unified-7d-reset': String(resetSec),
+    },
+    now,
+  );
+  assert.equal(s.pausedUntil, now + ROLLING_WINDOW_REPROBE_MS, 'predictive pause = bounded re-probe interval, not the multi-hour reset');
+  assert.ok(s.pausedUntil < resetSec * 1000, 'far below the full window reset (re-probe, not hard-pause to reset)');
+  assert.equal(s.unified!.rejected, false, 'the window was ALLOWED — the pause is predictive, not a rejection');
+  assert.equal(s.unified!.utilization, 0.97);
+  // The account is skipped during the predictive pause, then re-probes once it elapses.
+  assert.equal(decideAcquire(s, now, {}).allowed, false, 'blocked during the predictive pause');
+  assert.equal(decideAcquire(s, now + ROLLING_WINDOW_REPROBE_MS + 1, {}).allowed, true, 'then re-probes the freed window');
+});
+
+test('recordHeaders — unified util 0.85 (below the 0.95 predict watermark, allowed) PACES but does NOT pause', () => {
+  const s = initGovernorState({ maxConcurrent: 10 });
+  const now = 1_000;
+  const resetSec = Math.round(now / 1000) + 3_600;
+  recordHeaders(
+    s,
+    {
+      // Above the 0.8 pace watermark but below the 0.95 predict watermark → still serve, just slow.
+      'anthropic-ratelimit-unified-7d-status': 'allowed',
+      'anthropic-ratelimit-unified-7d-utilization': '0.85',
+      'anthropic-ratelimit-unified-7d-reset': String(resetSec),
+    },
+    now,
+  );
+  assert.equal(s.pausedUntil, 0, 'below the predict watermark → no proactive pause (it only paces)');
+  assert.ok(s.paceDelayMs > 0, 'still over the pace watermark → a soft pace gap is set (not a pause)');
+  // The decideAcquire denial here would be reason:'pace' (the soft gap), never reason:'paused' — the
+  // distinction the test guards: a 0.85 window slows the account, it does not skip it out of rotation.
+  assert.notEqual(decideAcquire(s, now, {}).reason, 'paused', 'not paused (at most paced)');
+  assert.equal(s.unified!.utilization, 0.85);
+});
+
 test('recordHeaders — classic and unified dialects are independent; absent unified leaves s.unified undefined', () => {
   const s = initGovernorState({ maxConcurrent: 10 });
   recordHeaders(s, { 'anthropic-ratelimit-requests-limit': '1000' }, 1_000);
