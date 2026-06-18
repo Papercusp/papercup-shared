@@ -102,6 +102,12 @@ const MAX_PACE_DELAY_MS = 5_000;
 // MAX_PACE_DELAY_MS as utilization → 1, so a 5-hour budget glides toward its reset instead of
 // being burned early then hard-stopping for hours. `status: rejected` still hard-pauses to reset.
 const UNIFIED_PACE_WATERMARK = 0.8;
+// PREDICTIVE pre-emptive pause (owner-requested 2026-06-18): at/above this utilization of a rolling
+// window, the NEXT request will almost certainly 429 (the window is effectively spent — e.g. a 7-day
+// opus budget at 0.97). Rather than route into it and learn via the rejection, pause the account for
+// the bounded re-probe so the failover/walk SKIPS it until the next probe shows the window freed.
+// Distinct from the soft pace (0.8–0.95: still serve, just slow): ≥ this is "predict the 429, back off".
+const UNIFIED_PREDICT_PAUSE_WATERMARK = 0.95;
 // Rolling-utilization (subscription) windows — Claude Max 5h/7d — recover CONTINUOUSLY as old usage
 // ages out, so the window `reset` is when it FULLY clears, NOT when you can next send. Pausing a
 // rejection to the full multi-hour reset therefore goes stale ("paused until 09:10 with zero
@@ -295,6 +301,16 @@ export function recordHeaders(s: GovernorState, headers: Record<string, string |
     // ROLLING_WINDOW_REPROBE_MS. The real `resetAt` is still recorded on `s.unified` (observability)
     // + used by the gateway failover's rejoin time.
     if (rejected) {
+      const reprobeAt = now + ROLLING_WINDOW_REPROBE_MS;
+      if (reprobeAt > s.pausedUntil) s.pausedUntil = reprobeAt;
+    }
+    // PREDICTIVE skip: a window already at/over its cap (e.g. a 7-day opus budget at ≥0.95) will 429
+    // the next request — pause it NOW so routing/failover walks around it, instead of routing in and
+    // learning via the rejection (the owner-reported "fully-used account should be predicted to 429,
+    // not hit" gap). Same bounded re-probe as the `rejected` branch, so the account rejoins the moment
+    // the rolling window ages back below the cap. Skipped on a stale reset (resetAt 0/past): without a
+    // fresh window we can't trust the utilization fraction.
+    else if (util !== undefined && util >= UNIFIED_PREDICT_PAUSE_WATERMARK && resetAt > now) {
       const reprobeAt = now + ROLLING_WINDOW_REPROBE_MS;
       if (reprobeAt > s.pausedUntil) s.pausedUntil = reprobeAt;
     }
