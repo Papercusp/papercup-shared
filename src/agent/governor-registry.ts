@@ -160,6 +160,23 @@ export function effectiveConcurrencySnapshot(): { effective: number | null; floo
   return { effective: aimdEff ?? null, floor: globalFloor, cleanStreak: aimdCleanStreak };
 }
 
+/** P5-2 (operator-scalability-event-loop-2026-06-16): apply an EXTERNAL backpressure
+ *  penalty to the global AIMD concurrency — a signal that is NOT a provider 429 but
+ *  LOCAL saturation (event-loop pressure) the fleet should shed for. Multiplicative-
+ *  decrease of the effective concurrency toward the floor, identical to a 429 penalty.
+ *  No-op while AIMD is inactive (no finite cap installed). */
+export function recordGlobalConcurrencyPenalty(): void {
+  globalGate.notePenalty?.();
+}
+
+/** P5-2: record an external CLEAN signal — the local pressure cleared — nudging the
+ *  AIMD effective concurrency back up one clean step. Mirrors a clean turn but is
+ *  tick-driven, so eff recovers even when the fleet is idle (no turns to ramp it).
+ *  No-op while AIMD is inactive. */
+export function recordGlobalConcurrencyClean(): void {
+  globalGate.noteClean?.();
+}
+
 // Cross-process shared-budget store (RB-007). When set (by the operator at boot, behind a flag),
 // every NEW governor routes its rate+pause budget through it so the whole fleet + gym + this dev
 // session share ONE account budget. Concurrency stays per-process. Default unset = in-memory.

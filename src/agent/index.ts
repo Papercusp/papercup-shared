@@ -57,6 +57,8 @@ export {
   setGlobalConcurrencyFloor,
   globalConcurrencySnapshot,
   effectiveConcurrencySnapshot,
+  recordGlobalConcurrencyPenalty,
+  recordGlobalConcurrencyClean,
   AIMD_CLEAN_TURNS_PER_STEP,
   type BackendProfile,
   type LimitModel,
