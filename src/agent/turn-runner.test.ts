@@ -7,9 +7,16 @@ import assert from 'node:assert/strict';
 import { RateLimitGovernor } from '../resilience/governor';
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
 
-function fakeGovernor() {
+// storeKey: an ACCOUNT-KEYED key (contains '@<accountId>') models one account's bucket,
+// which HONORS a multi-hour reset (governor.ts rolling-window false-pause fix, 2026-06-17);
+// a keyless/fleet-wide bucket instead CAPS the pause at a 2-min re-probe so one account's
+// long reset can't lock the whole fleet out. A plan/usage cap is account-scoped → keyed.
+function fakeGovernor(storeKey?: string) {
   let clock = 0;
-  const g = new RateLimitGovernor({ maxConcurrent: 4 }, { now: () => clock, sleep: async (ms) => { clock += ms; } });
+  const g = new RateLimitGovernor(
+    { maxConcurrent: 4 },
+    { now: () => clock, sleep: async (ms) => { clock += ms; }, ...(storeKey ? { storeKey } : {}) },
+  );
   return { g, advance: (ms: number) => { clock += ms; }, get clock() { return clock; } };
 }
 const deps = (g: RateLimitGovernor) => ({ governor: g, sleep: async () => {}, now: () => 0 });
@@ -62,7 +69,7 @@ test('runAgentTurn — a non-retryable class (auth) returns the error immediatel
 });
 
 test('runAgentTurn — usage_limit (plan cap) returns immediately, does NOT retry, parks the fleet (D-001)', async () => {
-  const { g } = fakeGovernor();
+  const { g } = fakeGovernor('acct@plan-cap'); // account-keyed: a plan cap is one account's bucket → honors the full reset
   const resetAt = Date.parse('2026-06-05T12:00:00Z');
   let calls = 0;
   const r = await runAgentTurn<string>(

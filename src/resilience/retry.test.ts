@@ -7,10 +7,19 @@ import assert from 'node:assert/strict';
 import { RateLimitGovernor } from './governor';
 import { runWithRetry, type AttemptOutcome } from './retry';
 
-function gov() {
+// storeKey: pass an ACCOUNT-KEYED key (contains '@<accountId>') to model a single
+// account's bucket. Per the rolling-window false-pause fix (governor.ts, 2026-06-17),
+// an account-keyed bucket HONORS a multi-hour reset (sustained 429 = genuine exhaustion
+// → drives scale-out), whereas a keyless/fleet-wide bucket CAPS the pause at a 2-min
+// re-probe (so one account's long reset can't lock the whole fleet out). A plan/usage
+// cap is account-scoped, so those tests use an account-keyed governor.
+function gov(storeKey?: string) {
   let clock = 0;
   const sleep = async (ms: number) => { clock += ms; };
-  const g = new RateLimitGovernor({ maxConcurrent: 4 }, { now: () => clock, sleep });
+  const g = new RateLimitGovernor(
+    { maxConcurrent: 4 },
+    { now: () => clock, sleep, ...(storeKey ? { storeKey } : {}) },
+  );
   return { g, sleep, now: () => clock, get clock() { return clock; } };
 }
 
@@ -55,7 +64,7 @@ test('runWithRetry — non-retryable returns the verdict immediately', async () 
 });
 
 test('runWithRetry — account-wide NON-retryable with a reset (usage cap) parks the FLEET, no retry (D-001)', async () => {
-  const c = gov();
+  const c = gov('acct@plan-cap'); // account-keyed: a plan cap is one account's bucket → honors the full reset
   let n = 0;
   const resetAt = c.now() + 3 * 60 * 60 * 1000; // 3h off (a plan cap)
   const r = await runWithRetry<string>({ maxAttempts: 5 }, {
