@@ -42,3 +42,8 @@ export {
   type PriorityAdmissionOptions,
   type AdmissionSnapshot,
 } from './priority-admission';
+export {
+  AimdConcurrencyController,
+  type AimdConcurrencyOptions,
+  type AimdSnapshot,
+} from './aimd-concurrency';
