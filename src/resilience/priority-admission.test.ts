@@ -1,7 +1,7 @@
 /** Tests for the PriorityAdmissionQueue (hive-inference-gateway P-011). */
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { PriorityAdmissionQueue, priorityFromLabel } from './priority-admission';
+import { PriorityAdmissionQueue, QueueFullError, priorityFromLabel } from './priority-admission';
 
 const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
@@ -69,6 +69,36 @@ test('a task that throws rejects its run() and frees the slot', async () => {
   let ran = false;
   await q.run(0, async () => { ran = true; });
   assert.equal(ran, true);
+});
+
+test('maxQueued — sheds load (QueueFullError) when slots busy AND queue at cap; frees up after drain', async () => {
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 1, maxQueued: 2 });
+  let release: () => void = () => {};
+  const blocker = q.run(0, () => new Promise<void>((r) => { release = r; })); // occupies the single slot
+  await tick();
+  const w1 = q.run(0, async () => 'w1'); // queued (1/2)
+  const w2 = q.run(0, async () => 'w2'); // queued (2/2 — at cap)
+  assert.equal(q.snapshot().queued, 2);
+  // 3rd waiter exceeds the cap → synchronous load-shed, NOT a silent unbounded enqueue
+  await assert.rejects(
+    q.run(0, async () => 'w3'),
+    (e: unknown) => e instanceof QueueFullError && (e as QueueFullError).code === 'ADMISSION_QUEUE_FULL',
+  );
+  assert.equal(q.snapshot().queued, 2, 'shed request was never enqueued');
+  // draining the slot runs the queued ones and re-opens admission
+  release();
+  assert.equal(await w1, 'w1');
+  assert.equal(await w2, 'w2');
+  let ran = false;
+  await q.run(0, async () => { ran = true; });
+  assert.equal(ran, true);
+});
+
+test('maxQueued — a free slot always runs (the cap only sheds when every slot is busy)', async () => {
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 2, maxQueued: 1 });
+  // 2 free slots → both admitted immediately even though maxQueued=1 (cap governs WAITERS, not runners)
+  assert.equal(await q.run(0, async () => 'a'), 'a');
+  assert.equal(await q.run(0, async () => 'b'), 'b');
 });
 
 test('snapshot reports running + queued by priority', async () => {

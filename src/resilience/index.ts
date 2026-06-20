@@ -37,6 +37,7 @@ export {
 } from './retry';
 export {
   PriorityAdmissionQueue,
+  QueueFullError,
   priorityFromLabel,
   type PriorityAdmissionOptions,
   type AdmissionSnapshot,
