@@ -12,7 +12,7 @@
  * (not needlessly throttled) — proven by contrast with an effectively-ungoverned caller.
  *
  * Zero-LLM, fake clock — deterministic. Run:
- *   npx vitest run libs/papercup-shared/src/agent/turn-robustness.fault-injection.test.ts
+ *   npx vitest run libs/papercusp-shared/src/agent/turn-robustness.fault-injection.test.ts
  */
 import { test } from 'vitest';
 import assert from 'node:assert/strict';

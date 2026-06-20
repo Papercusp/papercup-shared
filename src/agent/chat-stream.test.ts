@@ -1,6 +1,6 @@
 /**
  * Tests for chat-stream pure helpers.
- * Run with: npx vitest run libs/papercup-shared/src/agent/chat-stream.test.ts
+ * Run with: npx vitest run libs/papercusp-shared/src/agent/chat-stream.test.ts
  */
 import { test, afterEach } from 'vitest';
 import assert from 'node:assert/strict';

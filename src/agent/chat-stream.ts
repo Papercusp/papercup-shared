@@ -557,7 +557,7 @@ export function resolveAnthropicBaseUrl(): string {
 
 /** The header the inference gateway reads to pin a request to a specific pool account's
  *  per-credential cache + per-account rate bucket (gateway.ts `ACCOUNT_HEADER`). Duplicated as a
- *  bare const here because papercup-shared must not import operator-core (dependency direction). */
+ *  bare const here because papercusp-shared must not import operator-core (dependency direction). */
 export const ROUTE_ACCOUNT_HEADER = 'x-papercusp-account';
 
 /**

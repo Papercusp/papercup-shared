@@ -1,6 +1,6 @@
 /**
  * Tests for backend profiles + the shared governor registry (robustness P-011).
- * Run: npx vitest run libs/papercup-shared/src/agent/governor-registry.test.ts
+ * Run: npx vitest run libs/papercusp-shared/src/agent/governor-registry.test.ts
  */
 import { test, beforeEach } from 'vitest';
 import assert from 'node:assert/strict';

@@ -1,6 +1,6 @@
 /**
  * Tests for the generic runWithRetry policy loop (resilience, RB-013).
- * Run: npx vitest run libs/papercup-shared/src/resilience/retry.test.ts
+ * Run: npx vitest run libs/papercusp-shared/src/resilience/retry.test.ts
  */
 import { test } from 'vitest';
 import assert from 'node:assert/strict';

@@ -1,6 +1,6 @@
 /**
  * Tests for runAgentTurn — the governed, retrying turn wrapper (robustness P-003).
- * Run: npx vitest run libs/papercup-shared/src/agent/turn-runner.test.ts
+ * Run: npx vitest run libs/papercusp-shared/src/agent/turn-runner.test.ts
  */
 import { test } from 'vitest';
 import assert from 'node:assert/strict';

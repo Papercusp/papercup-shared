@@ -1,6 +1,6 @@
 /**
  * Server-only entry point. Pull this from API routes / server modules
- * via `@papercusp/papercup-shared/agent`. Don't import from a client
+ * via `@papercusp/papercusp-shared/agent`. Don't import from a client
  * component — this module reaches `node:child_process` and Turbopack
  * will refuse to bundle it for the client. (We don't pull in the
  * `server-only` marker package since it isn't a workspace dep; the

@@ -1,4 +1,4 @@
-# TESTING — @restart/papercup-shared
+# TESTING — @restart/papercusp-shared
 
 ## What this project's tests cover
 
@@ -30,7 +30,7 @@
 
 | Edit touches                        | Run                                                   |
 | ----------------------------------- | ----------------------------------------------------- |
-| Anything in this workspace          | `npm test --workspace @restart/papercup-shared`       |
+| Anything in this workspace          | `npm test --workspace @restart/papercusp-shared`       |
 | Code that other workspaces depend on| `npm run test:affected` from repo root                |
 | Briefings / plugin-config schema    | `npm run test:all:integration` (operator suite picks it up) |
 

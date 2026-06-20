@@ -7,7 +7,7 @@
 // (and never reached by fetch).
 //
 // This file is the single point of admin-URL containment. It is the only file
-// in libs/papercup-shared/ exempt from the admin-fetch lint rule. New uses
+// in libs/papercusp-shared/ exempt from the admin-fetch lint rule. New uses
 // must come through these helpers; the lint will catch direct literals
 // elsewhere in the lib.
 

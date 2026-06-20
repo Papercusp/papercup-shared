@@ -1,6 +1,6 @@
 /**
  * Tests for the unified agent turn-error taxonomy (agent-turn-robustness P-001).
- * Run: npx vitest run libs/papercup-shared/src/agent/turn-error.test.ts
+ * Run: npx vitest run libs/papercusp-shared/src/agent/turn-error.test.ts
  */
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
