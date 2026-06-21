@@ -7,7 +7,7 @@
  * Used by:
  *   - /oracle/chat               (Oracle tab, with MCP config + 6 oracle tools)
  *   - /:slug/agent-chats/:id/messages   (per-harness agent chat tabs)
- *   - /api/agent-mcp/operator-scan, /api/agent-mcp/delegate-chat
+ *   - /api/agent-mcp/operator-scan
  *
  * Backends:
  *   - 'claude-code': claude-cli with `--output-format stream-json`. MCP
@@ -326,7 +326,7 @@ export interface RunAgentChatOptions {
   /**
    * Resume a specific claude session by id. When set, claude continues the
    * existing conversation; when null/undefined, claude starts a fresh one.
-   * Voice's delegate_to_claude uses this to route each delegation to either
+   * Historical delegate code used this to route each delegation to either
    * a picked existing claude-session or a brand-new one.
    */
   sessionId?: string;
@@ -334,7 +334,7 @@ export interface RunAgentChatOptions {
    * When `sessionId` is set, controls which flag to use:
    *   - 'resume' → `-r <id>` (fail if no such session in claude's store)
    *   - 'force' → `--session-id <uuid>` (create-or-resume; uuid must be valid)
-   * Default: 'force' (create-or-resume) — what delegate_to_claude wants since
+   * Default: 'force' (create-or-resume) — used by historical delegate sessions since
    * we manage the session id ourselves.
    */
   sessionMode?: 'resume' | 'force';
