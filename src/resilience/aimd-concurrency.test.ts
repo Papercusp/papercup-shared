@@ -82,6 +82,29 @@ test('a throttle-DOMINANT mixed window still trips (robust to interleaved succes
   assert.ok(c.current < 16, 'a partial (throttle-dominant) storm still shrinks concurrency');
 });
 
+test('recovery is NOT stalled by absorbed (sub-threshold) throttles that INTERRUPT a success streak (2026-06-21)', () => {
+  // The inference-gateway's steady state with a few maxed accounts: a churn of transient 429s — each routed
+  // around to a healthy account + ABSORBED by the leaky bucket — interleaved with successes, where the
+  // throttle lands mid-streak. The effective concurrency MUST still climb back toward the cap. Pre-fix every
+  // throttle reset the clean-streak, so a throttle landing before `increaseEvery` successes completed pinned
+  // the gate low FOREVER (the owner's "gate stuck at the floor under load despite headroom").
+  const c = new AimdConcurrencyController({ cap: 16, floor: 1, decreaseThreshold: 4, increaseEvery: 3 });
+  for (let i = 0; i < 4; i++) c.recordThrottle(); // drive it down: 16 → 8
+  assert.equal(c.current, 8);
+  assert.equal(c.snapshot().decreases, 1);
+  // 2 successes, then an absorbed throttle mid-streak, then 1 success — repeatedly. Success-dominant, so the
+  // bucket stays below threshold (no further decrease); the absorbed throttle no longer kills the streak, so
+  // the 3 successes still accumulate across it → +1 per round.
+  for (let round = 0; round < 12; round++) {
+    c.recordSuccess();
+    c.recordSuccess();
+    c.recordThrottle(); // interrupts the streak — pre-fix this reset it to 0, stalling recovery forever
+    c.recordSuccess();
+  }
+  assert.ok(c.current > 8, `effective concurrency recovered under streak-interrupting churn (got ${c.current})`);
+  assert.equal(c.snapshot().decreases, 1, 'every churn throttle was absorbed by the bucket — no extra decrease');
+});
+
 test('floor is clamped to ≥1 and to ≤cap', () => {
   assert.equal(new AimdConcurrencyController({ cap: 10, floor: 0 }).snapshot().floor, 1, 'floor ≥ 1');
   assert.equal(new AimdConcurrencyController({ cap: 4, floor: 99 }).snapshot().floor, 4, 'floor ≤ cap');
