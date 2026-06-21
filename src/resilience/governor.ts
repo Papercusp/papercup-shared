@@ -607,4 +607,18 @@ export class RateLimitGovernor {
     // A 429 anywhere pauses the WHOLE account → push to the shared row so every process backs off.
     if (this.store) void this.store.transact(this.storeKey!, this.floor, (s) => recordPenalty(s, this.now(), eff)).catch(() => {});
   }
+
+  /** Lift a TRANSPORT pause (an egress-proxy circuit pause) the MOMENT the proxy recovers — the dual of the
+   *  egress circuit's `penalize`. A transport failure is NOT a budget/rate signal, so unlike a 429 pause
+   *  (take-MAX, never shortened — it tracks real exhaustion) a transport pause MUST clear as soon as the
+   *  proxy is healthy again, or a token-healthy account sits needlessly out of rotation for the full circuit
+   *  window (owner-reported 2026-06-21: a flaky proxy recovering in seconds kept its account out 60s →
+   *  empty-pool "all throttled" sheds). `setUntil` is the pause the egress circuit set; we only lift if the
+   *  current pause is still ≤ that (i.e. a longer REAL rate-limit pause hasn't superseded it since). */
+  liftTransportPause(setUntil: number): void {
+    const now = this.now();
+    if (this.state.pausedUntil > now && this.state.pausedUntil <= setUntil) {
+      this.state.pausedUntil = now;
+    }
+  }
 }
