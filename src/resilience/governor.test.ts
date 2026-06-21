@@ -94,6 +94,30 @@ test('recordPenalty — maxPauseMs caps a far-future rolling-window reset to a b
   assert.equal(s2.pausedUntil, 30_000);
 });
 
+test('liftTransportPause — clears an egress-circuit transport pause on proxy recovery, but NEVER a longer real 429 pause (2026-06-21)', () => {
+  const clock = 1_000_000;
+  // Case 1: the egress circuit set a transport pause; the proxy recovers → lift it exactly → account readmits NOW.
+  const g = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock });
+  g.penalize({ resetAt: clock + 10_000 }); // transport pause (10s, under the fleet re-probe cap)
+  assert.equal(g.state.pausedUntil, clock + 10_000, 'transport pause set');
+  g.liftTransportPause(clock + 10_000);
+  assert.equal(g.state.pausedUntil, clock, 'transport pause lifted on recovery → readmit immediately');
+
+  // Case 2: a LONGER real 429 pause was set AFTER the transport one → transport recovery must NOT shorten it.
+  const g2 = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock });
+  g2.penalize({ resetAt: clock + 10_000 }); // transport pause (10s)
+  g2.penalize({ resetAt: clock + 100_000 }); // a later, longer real 429 (100s, under the 2-min fleet cap → kept)
+  const after429 = g2.state.pausedUntil;
+  assert.equal(after429, clock + 100_000, 'the longer 429 pause is the binding one');
+  g2.liftTransportPause(clock + 10_000); // try to lift the OLD (shorter) transport pause
+  assert.equal(g2.state.pausedUntil, after429, 'a longer real 429 pause set since is NOT shortened by transport recovery');
+
+  // Case 3: already expired → no-op (never pushes the pause backwards / negative).
+  const g3 = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock });
+  g3.liftTransportPause(clock + 10_000);
+  assert.ok(g3.state.pausedUntil <= clock, 'no pause to lift → no-op');
+});
+
 test('RateLimitGovernor.penalize — UNCONDITIONALLY caps a far-future reset to the re-probe window (fleet-wide false-pause fix, 2026-06-17)', () => {
   const clock = 1_000_000;
   // FRESH process (no unified header seen yet — state.unified undefined): this is the edge that made the
