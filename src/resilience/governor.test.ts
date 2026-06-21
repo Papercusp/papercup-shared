@@ -13,6 +13,7 @@ import {
   recordHeaders,
   RateLimitGovernor,
   ROLLING_WINDOW_REPROBE_MS,
+  ROLLING_WINDOW_REPROBE_MAX_MS,
   type GovernorState,
   type GovernorLimits,
   type GlobalConcurrencyGate,
@@ -517,8 +518,10 @@ test('recordHeaders — unified 5h rejected pauses a BOUNDED re-probe interval, 
     now,
   );
   // Rolling-utilization windows recover continuously → a bounded re-probe, NOT the multi-hour reset
-  // (which would go stale: "paused until <reset> with zero pressure" = the false-exhaustion bug).
-  assert.equal(s.pausedUntil, now + ROLLING_WINDOW_REPROBE_MS, 'bounded re-probe pause');
+  // (which would go stale: "paused until <reset> with zero pressure" = the false-exhaustion bug). The
+  // re-probe is SCALED to the window's recovery (2026-06-21): with a far reset like this one the scale
+  // saturates at ROLLING_WINDOW_REPROBE_MAX_MS — still bounded, still far below the full reset.
+  assert.equal(s.pausedUntil, now + ROLLING_WINDOW_REPROBE_MAX_MS, 'bounded, scaled re-probe (capped at the max for a far reset)');
   assert.ok(s.pausedUntil < resetSec * 1000, 'far below the full reset');
   assert.ok(s.unified, 'unified state recorded');
   assert.equal(s.unified!.rejected, true);
@@ -526,7 +529,33 @@ test('recordHeaders — unified 5h rejected pauses a BOUNDED re-probe interval, 
   assert.equal(s.unified!.utilization, 1.01);
   assert.equal(s.unified!.resetAt, resetSec * 1000, 'real reset kept for observability + failover rejoin');
   assert.equal(decideAcquire(s, now, {}).allowed, false); // blocked during the re-probe pause
-  assert.equal(decideAcquire(s, now + ROLLING_WINDOW_REPROBE_MS + 1, {}).allowed, true); // then re-probes
+  assert.equal(decideAcquire(s, now + ROLLING_WINDOW_REPROBE_MAX_MS + 1, {}).allowed, true); // then re-probes
+});
+
+test('recordHeaders — a 7d-exhausted window parks FAR longer than the flat 2-min re-probe (owner 2026-06-21: agents pinned to a 97%-7d account 429ing while its 5h read empty)', () => {
+  const s = initGovernorState({ maxConcurrent: 10 });
+  const now = 1_700_000_000_000;
+  const reset7dSec = Math.round((now + 27 * 60 * 60_000) / 1000); // ~27h out — like the reported aviynw8/aviynw
+  const reset5hSec = Math.round((now + 3 * 60 * 60_000) / 1000);
+  recordHeaders(
+    s,
+    {
+      'anthropic-ratelimit-unified-5h-status': 'allowed',
+      'anthropic-ratelimit-unified-5h-utilization': '0.0', // the 5h window reads EMPTY — the misleading "current usage"
+      'anthropic-ratelimit-unified-5h-reset': String(reset5hSec),
+      'anthropic-ratelimit-unified-7d-status': 'allowed',
+      'anthropic-ratelimit-unified-7d-utilization': '0.97', // …but the 7-DAY budget is spent → predictive-pause
+      'anthropic-ratelimit-unified-7d-reset': String(reset7dSec),
+    },
+    now,
+  );
+  const pausedFor = s.pausedUntil - now;
+  // The fix: a 7d-exhausted account is parked ~its real recovery (tens of minutes), NOT re-probed every 2 min
+  // (which re-lured pinned agents back onto it into a 429 every 2 min). Bounded by the max so it re-checks.
+  assert.ok(pausedFor > ROLLING_WINDOW_REPROBE_MS, `parked far longer than the flat 2-min re-probe (got ${Math.round(pausedFor / 1000)}s)`);
+  assert.ok(pausedFor <= ROLLING_WINDOW_REPROBE_MAX_MS, 'still bounded by the max re-probe (never the full multi-day reset)');
+  assert.equal(s.unified!.window, '7d', 'the 7-day window binds (the 5h reads empty)');
+  assert.equal(s.unified!.utilization, 0.97);
 });
 
 test('recordHeaders — unified high utilization (allowed) sets pre-emptive pace, not a pause', () => {

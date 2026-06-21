@@ -318,7 +318,7 @@ export function recordHeaders(s: GovernorState, headers: Record<string, string |
     // ROLLING_WINDOW_REPROBE_MS. The real `resetAt` is still recorded on `s.unified` (observability)
     // + used by the gateway failover's rejoin time.
     if (rejected) {
-      const reprobeAt = now + ROLLING_WINDOW_REPROBE_MS;
+      const reprobeAt = scaledReprobeAt(now, util ?? 1, resetAt);
       if (reprobeAt > s.pausedUntil) s.pausedUntil = reprobeAt;
     }
     // PREDICTIVE skip: a window already at/over its cap (e.g. a 7-day opus budget at ≥0.95) will 429
@@ -328,7 +328,7 @@ export function recordHeaders(s: GovernorState, headers: Record<string, string |
     // the rolling window ages back below the cap. Skipped on a stale reset (resetAt 0/past): without a
     // fresh window we can't trust the utilization fraction.
     else if (util !== undefined && util >= UNIFIED_PREDICT_PAUSE_WATERMARK && resetAt > now) {
-      const reprobeAt = now + ROLLING_WINDOW_REPROBE_MS;
+      const reprobeAt = scaledReprobeAt(now, util, resetAt);
       if (reprobeAt > s.pausedUntil) s.pausedUntil = reprobeAt;
     }
     if (util !== undefined && util > UNIFIED_PACE_WATERMARK && util < 1 && resetAt > now) {
