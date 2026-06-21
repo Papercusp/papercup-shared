@@ -116,6 +116,23 @@ const UNIFIED_PREDICT_PAUSE_WATERMARK = 0.95;
 // resumes the moment the window frees. A few extra 429s under genuine sustained exhaustion is the
 // (cheap) cost; the failover/selector route traffic away in the meantime.
 export const ROLLING_WINDOW_REPROBE_MS = 2 * 60_000;
+/** Upper bound on the SCALED predictive re-probe (below). Even a fully-spent window re-probes at least this
+ *  often, so a faster-than-estimated recovery (the fleet stopped using the account) is still caught. Env-tunable. */
+export const ROLLING_WINDOW_REPROBE_MAX_MS = Number(process.env.PAPERCUSP_ROLLING_REPROBE_MAX_MS) || 30 * 60_000;
+
+/** Re-probe horizon SCALED to a rolling window's recovery (owner-reported 2026-06-21: agents pinned to a
+ *  97%-7d account 429'd repeatedly while that account's 5h window read empty). A rolling-utilization window
+ *  recovers ~linearly toward 0 by `resetAt`, so the time for it to drop back below the predict-pause
+ *  watermark is ≈ (resetAt - now) × (util - watermark) / util. The 5h window (reset minutes-to-hours out)
+ *  re-probes in minutes; a 7d window AT its cap (reset ~a day out) re-probes in ~tens of minutes — instead of
+ *  the flat 2-min cadence, which on the 7d window just re-lured requests into a 429 every 2 minutes and never
+ *  let the account stay parked so routing/failover could walk to one with weekly headroom. Clamped to
+ *  [REPROBE_MS, REPROBE_MAX_MS]. */
+function scaledReprobeAt(now: number, util: number, resetAt: number): number {
+  const recover = Math.max(0, util - UNIFIED_PREDICT_PAUSE_WATERMARK) / Math.max(util, 0.01);
+  const scaled = resetAt > now ? (resetAt - now) * recover : 0;
+  return now + Math.min(ROLLING_WINDOW_REPROBE_MAX_MS, Math.max(ROLLING_WINDOW_REPROBE_MS, scaled));
+}
 
 export function initGovernorState(limits: GovernorLimits): GovernorState {
   return {
