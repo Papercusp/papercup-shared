@@ -94,6 +94,35 @@ test('recordPenalty — maxPauseMs caps a far-future rolling-window reset to a b
   assert.equal(s2.pausedUntil, 30_000);
 });
 
+test('SOFT (predictive) pause is serviceable — acquire({allowSoftPaused}) admits it; a HARD rejected pause never is (2026-06-21)', async () => {
+  const clock = 2_000_000;
+  const resetSec = Math.round((clock + 5 * 60 * 60_000) / 1000);
+  // SOFT: util 0.97 but the window is still ALLOWED → predictive pause, yet Anthropic would serve it.
+  const g = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock });
+  g.recordResponse({
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+    'anthropic-ratelimit-unified-5h-utilization': '0.97',
+    'anthropic-ratelimit-unified-5h-reset': String(resetSec),
+  });
+  assert.ok(g.state.pausedUntil > clock, 'predictively paused (routes around it when a healthier account exists)');
+  assert.equal(g.softPaused(clock), true, 'allowed-but-paused = SOFT / serviceable');
+  assert.equal(await g.acquire({}, { maxWaitMs: 0 }), null, 'a normal acquire is blocked by the pause');
+  const rel = await g.acquire({}, { maxWaitMs: 0, allowSoftPaused: true });
+  assert.ok(rel, 'allowSoftPaused ADMITS the serviceable soft-paused account (serve residual, do not shed)');
+  rel?.();
+
+  // HARD: status rejected → genuinely down → allowSoftPaused must NOT admit it.
+  const g2 = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock });
+  g2.recordResponse({
+    'anthropic-ratelimit-unified-5h-status': 'rejected',
+    'anthropic-ratelimit-unified-5h-utilization': '1.01',
+    'anthropic-ratelimit-unified-5h-reset': String(resetSec),
+  });
+  assert.ok(g2.state.pausedUntil > clock, 'hard-paused');
+  assert.equal(g2.softPaused(clock), false, 'rejected = HARD, not serviceable');
+  assert.equal(await g2.acquire({}, { maxWaitMs: 0, allowSoftPaused: true }), null, 'allowSoftPaused does NOT admit a hard-rejected account');
+});
+
 test('liftTransportPause — clears an egress-circuit transport pause on proxy recovery, but NEVER a longer real 429 pause (2026-06-21)', () => {
   const clock = 1_000_000;
   // Case 1: the egress circuit set a transport pause; the proxy recovers → lift it exactly → account readmits NOW.

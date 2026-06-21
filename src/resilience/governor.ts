@@ -164,8 +164,13 @@ export function decideConcurrency(s: GovernorState): AcquireDecision {
 
 /** PURE: the RATE + PAUSE + pacing gate (everything except concurrency) — the account-wide
     budget that RB-007 shares cross-process. */
-export function decideRate(s: GovernorState, now: number, est: TokenEstimate = {}): AcquireDecision {
-  if (now < s.pausedUntil) return { allowed: false, waitMs: s.pausedUntil - now, reason: 'paused' };
+export function decideRate(s: GovernorState, now: number, est: TokenEstimate = {}, allowSoftPaused = false): AcquireDecision {
+  // A pause blocks admission — UNLESS the caller will accept a SOFT (predictive) pause (the gateway's
+  // last-resort fallback: serve a serviceable near-cap account rather than shed). A HARD pause (real 429 /
+  // rejected window) always blocks. The pace below still applies, so a soft-paused account serves SLOWLY.
+  if (now < s.pausedUntil && !(allowSoftPaused && isSoftPause(s))) {
+    return { allowed: false, waitMs: s.pausedUntil - now, reason: 'paused' };
+  }
 
   const u = windowUsage(s, now);
   const msToWindowReset = now - s.windowStart >= WINDOW_MS ? 0 : s.windowStart + WINDOW_MS - now;
@@ -192,10 +197,23 @@ export function decideRate(s: GovernorState, now: number, est: TokenEstimate = {
 
 /** PURE: may this turn proceed at `now`? Concurrency first, then the rate/pause budget. If not,
     how long to wait before re-checking. */
-export function decideAcquire(s: GovernorState, now: number, est: TokenEstimate = {}): AcquireDecision {
+/**
+ * SOFT (predictive) pause vs HARD (rejected) pause (owner-reported 2026-06-21). A predictive pause (util ≥
+ * 0.95 but the window is still ALLOWED — util < 1, status not `rejected`) means Anthropic would STILL serve
+ * this account; we paused it only to ROUTE AROUND it when a healthier account exists. A HARD pause (an actual
+ * 429 / `rejected` window) means the account genuinely cannot serve. This predicate lets routing SERVE a
+ * soft-paused account as a last-resort fallback (`allowSoftPaused`) instead of treating "near the cap" as
+ * "down" and shedding — which manufactured "all accounts throttled" from accounts that still had residual
+ * budget. No `unified` recorded yet ⇒ treat as HARD (conservative: don't override an unexplained pause).
+ */
+export function isSoftPause(s: GovernorState): boolean {
+  return s.unified !== undefined && !s.unified.rejected && s.unified.utilization < 1;
+}
+
+export function decideAcquire(s: GovernorState, now: number, est: TokenEstimate = {}, allowSoftPaused = false): AcquireDecision {
   const c = decideConcurrency(s);
   if (!c.allowed) return c;
-  return decideRate(s, now, est);
+  return decideRate(s, now, est, allowSoftPaused);
 }
 
 /** Commit the RATE side of an acquisition: roll the window if stale, then charge req/token usage
@@ -413,6 +431,10 @@ export interface AcquireOpts {
   signal?: AbortSignal;
   /** Give up (resolve null) rather than wait longer than this in total. */
   maxWaitMs?: number;
+  /** Admit through a SOFT (predictive) pause — the bucket is paused but its window is still ALLOWED (see
+   *  isSoftPause). The gateway sets this in its last-resort fallback to SERVE a serviceable near-cap account
+   *  rather than shed (a HARD/rejected pause still blocks). The pace still applies, so it serves slowly. */
+  allowSoftPaused?: boolean;
 }
 
 /** Async façade over the pure core: `acquire()` blocks until allowed, then returns a
@@ -508,7 +530,7 @@ export class RateLimitGovernor {
       if (!this.store) {
         // IN-MEMORY fast path: decide + record SYNCHRONOUSLY (no await between the check and the
         // increment) so concurrency stays atomic under many interleaved callers.
-        d = decideAcquire(this.state, this.now(), est);
+        d = decideAcquire(this.state, this.now(), est, opts.allowSoftPaused);
         if (d.allowed) {
           // Fleet-wide cap (D-004): this bucket has room AND rate budget — now take a global slot.
           // If the fleet is at its cap, wait + re-poll (don't charge the bucket). Released in mkRelease.
@@ -533,7 +555,7 @@ export class RateLimitGovernor {
           let rateReason: AcquireDecision['reason'];
           try {
             const shared = await this.store.transact(this.storeKey!, this.floor, (s) => {
-              const rd = decideRate(s, this.now(), est);
+              const rd = decideRate(s, this.now(), est, opts.allowSoftPaused);
               rateAllowed = rd.allowed;
               rateWait = rd.waitMs;
               rateReason = rd.reason;
@@ -620,5 +642,13 @@ export class RateLimitGovernor {
     if (this.state.pausedUntil > now && this.state.pausedUntil <= setUntil) {
       this.state.pausedUntil = now;
     }
+  }
+
+  /** Is this bucket SOFT-paused right now — paused, but its last-seen window was still ALLOWED (a predictive
+   *  pause, not a real 429)? The gateway routes traffic AWAY from a soft-paused account when a healthier one
+   *  exists, but SERVES it (via `acquire({allowSoftPaused:true})`) as a last resort instead of shedding —
+   *  it still has residual budget Anthropic will honor. See {@link isSoftPause}. */
+  softPaused(now: number = this.now()): boolean {
+    return this.state.pausedUntil > now && isSoftPause(this.state);
   }
 }
