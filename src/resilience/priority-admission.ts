@@ -10,6 +10,34 @@
  * runs the per-request forward inside `run()`; the rate/pause budget is the governor's job, layered
  * inside the task. Pure-ish + fake-clock-testable (`now` injected).
  */
+/**
+ * Optional PRIORITY-TIER admission layer (gateway-priority-tiers-2026-06-22), gated entirely by the
+ * caller — when `tiers` is OMITTED the queue behaves EXACTLY as before (a flat priority+aging gate).
+ *
+ * A tier is a small integer where 1 is the HIGHEST band (the interactive/Queen lane) and larger
+ * numbers are progressively more sheddable batch bands. The tier layer adds two starvation guarantees
+ * a flat priority queue can't make:
+ *  - a PER-TIER in-flight cap (`caps`): a flood of one tier can't consume every slot,
+ *  - a RESERVED tier-1 FLOOR (`tier1Reserve`): a fixed number of slots only tier 1 may ever occupy,
+ *    so the interactive lane is never fully crowded out by a saturated batch backlog — the
+ *    un-starving piece. Tier > 1 admits only while `running < maxConcurrent - tier1Reserve`; tier 1
+ *    may use all `maxConcurrent`.
+ *
+ * Aging still applies WITHIN the queue's priority ordering (its starvation guard for the FIFO pick);
+ * the tier layer adds the cross-tier capacity guarantees on top. All domain-free: the gateway maps a
+ * role → tier and passes it on `run()`.
+ */
+export interface TierAdmissionConfig {
+  /** Max IN-FLIGHT tasks per tier (key = tier number). A tier absent from the map is uncapped
+   *  (bounded only by `maxConcurrent` and the reserved-floor rule). Values are clamped to ≥1. */
+  caps?: Record<number, number>;
+  /** Slots RESERVED for tier 1 — tier > 1 is refused admission once `running` reaches
+   *  `maxConcurrent - tier1Reserve`, holding that many slots open for the interactive lane even under
+   *  a saturated batch backlog. Clamped to [0, maxConcurrent-1] so at least one slot is always shared.
+   *  Default 0 (no reservation). */
+  tier1Reserve?: number;
+}
+
 export interface PriorityAdmissionOptions {
   /** Max tasks running concurrently. */
   maxConcurrent: number;
@@ -23,6 +51,9 @@ export interface PriorityAdmissionOptions {
    *  process is effectively wedged — load-shedding keeps it responsive + self-recovering.
    *  0/undefined = unbounded (legacy behavior). */
   maxQueued?: number;
+  /** OPTIONAL priority-tier layer (per-tier caps + a reserved tier-1 floor). OMIT for the flat
+   *  legacy behavior — when absent the queue is byte-identical to a plain priority+aging gate. */
+  tiers?: TierAdmissionConfig;
   now?: () => number;
 }
 
@@ -38,11 +69,25 @@ export class QueueFullError extends Error {
 
 interface Waiter<T> {
   priority: number;
+  /** Tier band (1 = highest). Defaults to 1 when the caller omits it, so an untagged waiter is
+   *  treated as the privileged lane (it competes on raw priority as before). */
+  tier: number;
   enqueuedAt: number;
   task: () => Promise<T>;
   resolve: (v: T) => void;
   reject: (e: unknown) => void;
   seq: number;
+}
+
+/** Per-tier admission breakdown (priority-tiers /stats). */
+export interface TierSnapshot {
+  tier: number;
+  /** Configured per-tier in-flight cap, or null when uncapped. */
+  cap: number | null;
+  /** Tasks of this tier running right now. */
+  inFlight: number;
+  /** Tasks of this tier waiting in the queue. */
+  queued: number;
 }
 
 export interface AdmissionSnapshot {
@@ -51,6 +96,11 @@ export interface AdmissionSnapshot {
   maxConcurrent: number;
   /** Queued counts bucketed by raw priority (highest first). */
   byPriority: { priority: number; count: number }[];
+  /** Per-tier {cap,inFlight,queued} — present only when the tier layer is configured (else undefined,
+   *  so flag-OFF stats are byte-identical to the legacy snapshot). Ascending by tier. */
+  byTier?: TierSnapshot[];
+  /** Slots reserved for tier 1 (the un-starving floor). Present only with the tier layer. */
+  tier1Reserve?: number;
 }
 
 export class PriorityAdmissionQueue {
@@ -62,12 +112,48 @@ export class PriorityAdmissionQueue {
   private seq = 0;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly waiters: Waiter<any>[] = [];
+  /** Tier layer (null when not configured → legacy flat behavior). */
+  private readonly tierCaps: Map<number, number> | null;
+  private tier1Reserve = 0;
+  /** Live in-flight count per tier (only maintained when the tier layer is on). */
+  private readonly inFlightByTier = new Map<number, number>();
 
   constructor(opts: PriorityAdmissionOptions) {
     this.maxConcurrent = Math.max(1, opts.maxConcurrent);
     this.agingIntervalMs = opts.agingIntervalMs ?? 1000;
     this.maxQueued = opts.maxQueued && opts.maxQueued > 0 ? Math.floor(opts.maxQueued) : 0;
     this.now = opts.now ?? (() => Date.now());
+    if (opts.tiers) {
+      this.tierCaps = new Map();
+      for (const [k, v] of Object.entries(opts.tiers.caps ?? {})) {
+        const tier = Number(k);
+        if (Number.isFinite(tier) && Number.isFinite(v)) this.tierCaps.set(tier, Math.max(1, Math.floor(v)));
+      }
+      this.tier1Reserve = this.clampReserve(opts.tiers.tier1Reserve ?? 0);
+    } else {
+      this.tierCaps = null;
+    }
+  }
+
+  /** A reserve must leave ≥1 shared slot, and never exceed the live cap. */
+  private clampReserve(n: number): number {
+    return Math.min(Math.max(0, Math.floor(n)), Math.max(0, this.maxConcurrent - 1));
+  }
+
+  /** Whether the tier layer is active (per-tier caps + reserved tier-1 floor). */
+  private get tiered(): boolean {
+    return this.tierCaps !== null;
+  }
+
+  /** Can a waiter of `tier` be admitted RIGHT NOW given live in-flight + the reserved floor + its cap?
+   *  Only consulted when the tier layer is on. */
+  private canAdmitTier(tier: number): boolean {
+    // Per-tier in-flight cap.
+    const cap = this.tierCaps!.get(tier);
+    if (cap !== undefined && (this.inFlightByTier.get(tier) ?? 0) >= cap) return false;
+    // Reserved tier-1 floor: tier > 1 may not occupy the slots held open for tier 1.
+    if (tier > 1 && this.running >= this.maxConcurrent - this.tier1Reserve) return false;
+    return true;
   }
 
   /** Effective priority at `t` — raw priority plus one point per aging interval waited. */
@@ -78,14 +164,18 @@ export class PriorityAdmissionQueue {
 
   /** Admit a task at `priority` (higher = sooner). Resolves/rejects with the task's result.
    *  Rejects synchronously with `QueueFullError` when all slots are busy AND the queue is at
-   *  `maxQueued` (load-shed) — a free slot always runs the task regardless of the cap. */
-  run<T>(priority: number, task: () => Promise<T>): Promise<T> {
+   *  `maxQueued` (load-shed) — a free slot always runs the task regardless of the cap.
+   *
+   *  `opts.tier` (1 = highest band) drives the optional tier layer; it is IGNORED when the queue was
+   *  constructed without `tiers` (legacy behavior). Omitting it ⇒ tier 1 (the privileged lane). */
+  run<T>(priority: number, task: () => Promise<T>, opts?: { tier?: number }): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       if (this.maxQueued > 0 && this.running >= this.maxConcurrent && this.waiters.length >= this.maxQueued) {
         reject(new QueueFullError(this.waiters.length, this.maxQueued));
         return;
       }
-      this.waiters.push({ priority, enqueuedAt: this.now(), task, resolve, reject, seq: this.seq++ });
+      const tier = this.tiered ? Math.max(1, Math.floor(opts?.tier ?? 1)) : 1;
+      this.waiters.push({ priority, tier, enqueuedAt: this.now(), task, resolve, reject, seq: this.seq++ });
       this.pump();
     });
   }
@@ -93,29 +183,41 @@ export class PriorityAdmissionQueue {
   private pump(): void {
     while (this.running < this.maxConcurrent && this.waiters.length > 0) {
       const t = this.now();
-      // Pick the highest effective priority; ties broken by earliest arrival (FIFO, stable).
-      let bestIdx = 0;
-      let bestEff = this.effective(this.waiters[0], t);
-      for (let i = 1; i < this.waiters.length; i++) {
-        const eff = this.effective(this.waiters[i], t);
-        if (eff > bestEff || (eff === bestEff && this.waiters[i].seq < this.waiters[bestIdx].seq)) {
+      // Pick the highest effective priority; ties broken by earliest arrival (FIFO, stable). With the
+      // tier layer on, ONLY consider waiters their tier can admit right now — so a saturated low tier
+      // (or a tier > 1 blocked by the reserved tier-1 floor) is SKIPPED rather than head-of-line-
+      // blocking an admissible higher tier behind it. When no waiter is admissible, stop (the slot is
+      // held open — for tier 1, that is exactly the reserved-floor guarantee).
+      let bestIdx = -1;
+      let bestEff = -Infinity;
+      for (let i = 0; i < this.waiters.length; i++) {
+        const w = this.waiters[i];
+        if (this.tiered && !this.canAdmitTier(w.tier)) continue;
+        const eff = this.effective(w, t);
+        if (bestIdx === -1 || eff > bestEff || (eff === bestEff && w.seq < this.waiters[bestIdx].seq)) {
           bestEff = eff;
           bestIdx = i;
         }
       }
+      if (bestIdx === -1) break; // nothing admissible (e.g. only tier > 1 waiters left, reserve held)
       const w = this.waiters.splice(bestIdx, 1)[0];
       this.running++;
+      if (this.tiered) this.inFlightByTier.set(w.tier, (this.inFlightByTier.get(w.tier) ?? 0) + 1);
+      const onSettle = () => {
+        this.running--;
+        if (this.tiered) this.inFlightByTier.set(w.tier, Math.max(0, (this.inFlightByTier.get(w.tier) ?? 0) - 1));
+      };
       // Run outside the loop's sync frame; settle → free the slot → pump again.
       void Promise.resolve()
         .then(() => w.task())
         .then(
           (v) => {
-            this.running--;
+            onSettle();
             w.resolve(v);
             this.pump();
           },
           (e) => {
-            this.running--;
+            onSettle();
             w.reject(e);
             this.pump();
           },
@@ -125,7 +227,36 @@ export class PriorityAdmissionQueue {
 
   setMaxConcurrent(n: number): void {
     this.maxConcurrent = Math.max(1, Math.floor(n));
+    // Keep the reserve valid against the new cap (it can never strand the last shared slot).
+    if (this.tiered) this.tier1Reserve = this.clampReserve(this.tier1Reserve);
     this.pump();
+  }
+
+  /** Adjust the reserved tier-1 floor live (tier-aware shedding shrinks/grows it). No-op without the
+   *  tier layer. Clamped so ≥1 slot always stays shared. */
+  setTier1Reserve(n: number): void {
+    if (!this.tiered) return;
+    this.tier1Reserve = this.clampReserve(n);
+    this.pump();
+  }
+
+  /** Adjust a single tier's in-flight cap live (tier-aware shedding shrinks tier 4→3→2 under 429
+   *  pressure, holding tier 1). No-op without the tier layer. `cap` is clamped to ≥1. */
+  setTierCap(tier: number, cap: number): void {
+    if (!this.tiered) return;
+    this.tierCaps!.set(tier, Math.max(1, Math.floor(cap)));
+    // A raised cap may newly admit; a lowered cap can't evict an already-running task (it only gates
+    // future admission), so pump() is safe + sufficient.
+    this.pump();
+  }
+
+  /** The configured cap for a tier, or null when uncapped / no tier layer. */
+  tierCap(tier: number): number | null {
+    return this.tierCaps?.get(tier) ?? null;
+  }
+
+  get reservedTier1(): number {
+    return this.tiered ? this.tier1Reserve : 0;
   }
 
   get size(): number {
@@ -138,12 +269,28 @@ export class PriorityAdmissionQueue {
   snapshot(): AdmissionSnapshot {
     const byPriority = new Map<number, number>();
     for (const w of this.waiters) byPriority.set(w.priority, (byPriority.get(w.priority) ?? 0) + 1);
-    return {
+    const base: AdmissionSnapshot = {
       running: this.running,
       queued: this.waiters.length,
       maxConcurrent: this.maxConcurrent,
       byPriority: [...byPriority.entries()].sort((a, b) => b[0] - a[0]).map(([priority, count]) => ({ priority, count })),
     };
+    if (!this.tiered) return base; // flag-OFF: byte-identical to the legacy snapshot
+    const queuedByTier = new Map<number, number>();
+    for (const w of this.waiters) queuedByTier.set(w.tier, (queuedByTier.get(w.tier) ?? 0) + 1);
+    // Union of every tier that has a cap, an in-flight task, or a waiter — so /stats shows a known
+    // tier even at zero load.
+    const tiers = new Set<number>([...this.tierCaps!.keys(), ...this.inFlightByTier.keys(), ...queuedByTier.keys()]);
+    base.byTier = [...tiers]
+      .sort((a, b) => a - b)
+      .map((tier) => ({
+        tier,
+        cap: this.tierCaps!.get(tier) ?? null,
+        inFlight: this.inFlightByTier.get(tier) ?? 0,
+        queued: queuedByTier.get(tier) ?? 0,
+      }));
+    base.tier1Reserve = this.tier1Reserve;
+    return base;
   }
 }
 
