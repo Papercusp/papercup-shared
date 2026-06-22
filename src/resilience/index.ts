@@ -39,8 +39,15 @@ export {
   PriorityAdmissionQueue,
   QueueFullError,
   priorityFromLabel,
+  tierOf,
+  parsePriorityTierMap,
+  DEFAULT_GATEWAY_PRIORITY_MAP,
+  DEFAULT_TIER,
   type PriorityAdmissionOptions,
   type AdmissionSnapshot,
+  type TierAdmissionConfig,
+  type TierSnapshot,
+  type PriorityTierMap,
 } from './priority-admission';
 export {
   AimdConcurrencyController,

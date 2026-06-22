@@ -315,3 +315,65 @@ export function priorityFromLabel(label: string | number | undefined): number {
     }
   }
 }
+
+// ── Priority TIER mapping (gateway-priority-tiers-2026-06-22) ───────────────────────────────────────
+//
+// A TIER is the small admission band a role belongs to (1 = the highest, most-protected interactive
+// lane; larger = more sheddable batch). Distinct from the `priorityFromLabel` number, which still
+// orders WITHIN the queue; the tier drives the per-tier caps + the reserved tier-1 floor. Lower tier
+// number = higher protection — the inverse of the priority number's "higher = sooner".
+
+/** A role/label → tier map. Lower tier = more protected. */
+export type PriorityTierMap = Record<string, number>;
+
+/** The fallback band for any role not named in the map (the most-sheddable lane). */
+export const DEFAULT_TIER = 4;
+
+/** Default role → tier map (gateway-priority-tiers-2026-06-22). Env-overridable via
+ *  `GATEWAY_PRIORITY_MAP` (a JSON object of `role: tier`, merged over these defaults), parsed by
+ *  `parsePriorityTierMap`. The `default` key sets the fallback band for unnamed roles. */
+export const DEFAULT_GATEWAY_PRIORITY_MAP: PriorityTierMap = {
+  queen: 1,
+  scout: 1,
+  overwatch: 1,
+  operator: 1,
+  interactive: 1,
+  su: 2,
+  bee: 3,
+  default: DEFAULT_TIER,
+};
+
+/** Parse a `GATEWAY_PRIORITY_MAP` JSON env value, MERGED over the defaults. Invalid JSON / non-numeric
+ *  entries are ignored (fail-safe to the defaults). Keys are lower-cased so the lookup is
+ *  case-insensitive. */
+export function parsePriorityTierMap(raw: string | undefined, base: PriorityTierMap = DEFAULT_GATEWAY_PRIORITY_MAP): PriorityTierMap {
+  const map: PriorityTierMap = {};
+  for (const [k, v] of Object.entries(base)) map[k.toLowerCase()] = v;
+  if (!raw) return map;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    for (const [k, v] of Object.entries(parsed)) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n >= 1) map[k.toLowerCase()] = Math.floor(n);
+    }
+  } catch {
+    /* malformed env → keep the defaults (fail-safe) */
+  }
+  return map;
+}
+
+/** Resolve the admission TIER for a request's priority label / caller role. `label` is the
+ *  `x-papercusp-priority` header value (a role name like `queen`/`bee`/`su`, an interactive alias, or
+ *  a bare tier number). A numeric label is taken as the tier directly (clamped to ≥1); an unknown
+ *  label falls back to the map's `default` band. */
+export function tierOf(label: string | number | undefined, map: PriorityTierMap = DEFAULT_GATEWAY_PRIORITY_MAP): number {
+  const fallback = map.default ?? DEFAULT_TIER;
+  if (typeof label === 'number') return Number.isFinite(label) ? Math.max(1, Math.floor(label)) : fallback;
+  const key = (label ?? '').trim().toLowerCase();
+  if (key === '') return fallback;
+  if (key in map && key !== 'default') return map[key];
+  // A bare numeric string ("2") is an explicit tier.
+  const n = Number(key);
+  if (Number.isFinite(n) && n >= 1) return Math.floor(n);
+  return fallback;
+}
