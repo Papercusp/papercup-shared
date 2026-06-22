@@ -1274,6 +1274,7 @@ export async function* runAgentChat(
     args.push('--allow-home');
 
     if (opts.mcpConfig) {
+      const mcpConfig = opts.mcpConfig as ClaudeShapeMcpConfig;
       // Translate claude-shape mcp-config into a per-spawn omp agent dir.
       // omp loads PI_CODING_AGENT_DIR/mcp.json on startup; PI_CODING_AGENT_DIR
       // is the FULL agent state directory, NOT just an mcp.json holder
@@ -1386,7 +1387,7 @@ export async function* runAgentChat(
       // --allow-home made mcp.json actually load (2026-05-21 P5).
       writeFileSync(
         join(ompAgentDir, 'mcp.json'),
-        JSON.stringify({ mcpServers: opts.mcpConfig.mcpServers ?? {} }),
+        JSON.stringify({ mcpServers: mcpConfig.mcpServers ?? {} }),
         'utf8',
       );
 
