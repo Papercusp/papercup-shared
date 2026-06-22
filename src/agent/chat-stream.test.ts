@@ -4,7 +4,7 @@
  */
 import { test, afterEach } from 'vitest';
 import assert from 'node:assert/strict';
-import { normalizeModelForClaude, headersToRecord, buildSystemParam, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml } from './chat-stream';
+import { normalizeModelForClaude, headersToRecord, buildSystemParam, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml } from './chat-stream';
 
 // claudeSpawnEnvOverrides (voice-persona P-009): disableToolSearch →
 // ENABLE_TOOL_SEARCH=false so the operator brain's caller-shrunk MCP surface
@@ -36,6 +36,16 @@ test('codexMcpConfigToml — bakes HTTP MCP Authorization headers, never bearer_
   assert.match(toml, /http_headers = \{ "Authorization" = "Bearer TESTBEARER", "x-extra" = "one" \}/);
   assert.doesNotMatch(toml, /bearer_token_env_var/);
   assert.doesNotMatch(toml, /AGENTMCP_BEARER/);
+});
+
+test('codexGatewayConfigToml — routes Codex model traffic through the account-pinned gateway provider', () => {
+  process.env.PAPERCUSP_GATEWAY_PORT = '9898';
+  const toml = codexGatewayConfigToml('codex-main');
+  assert.match(toml, /model_provider = "papercusp-codex-gateway"/);
+  assert.match(toml, /\[model_providers\.papercusp-codex-gateway\]/);
+  assert.match(toml, /base_url = "http:\/\/127\.0\.0\.1:9898\/v1"/);
+  assert.match(toml, /wire_api = "responses"/);
+  assert.match(toml, /http_headers = \{ "x-papercusp-account" = "codex-main" \}/);
 });
 
 // headersToRecord (P-004): SDK error `.headers` → a lowercased record so the TurnError

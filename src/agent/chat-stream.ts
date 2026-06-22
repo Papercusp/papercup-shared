@@ -271,6 +271,27 @@ export function codexMcpConfigToml(mcpConfig: ClaudeShapeMcpConfig): string {
   return tomlLines.join('\n') + '\n';
 }
 
+function gatewayPort(): number {
+  const p = Number(process.env.PAPERCUSP_GATEWAY_PORT);
+  return Number.isFinite(p) && p > 0 ? p : 8788;
+}
+
+export function codexGatewayConfigToml(accountId: string): string {
+  const providerId = 'papercusp-codex-gateway';
+  return [
+    '# Per-spawn codex model provider config (managed by chat-stream.ts).',
+    `model_provider = "${providerId}"`,
+    '',
+    `[model_providers.${providerId}]`,
+    'name = "Papercusp Codex Gateway"',
+    `base_url = "http://127.0.0.1:${gatewayPort()}/v1"`,
+    'wire_api = "responses"',
+    'experimental_bearer_token = "papercusp-gateway"',
+    `http_headers = { "${ROUTE_ACCOUNT_HEADER}" = "${tomlStr(accountId)}" }`,
+    '',
+  ].join('\n');
+}
+
 export interface RunAgentChatOptions {
   /** The full assembled prompt sent to claude on stdin. */
   promptText: string;
@@ -1211,14 +1232,21 @@ export async function* runAgentChat(
 
       spawnEnv = { ...process.env, CODEX_HOME: codexHome };
 
-      if (opts.mcpConfig) {
+      const codexGatewayAccountId = process.env.PAPERCUSP_ACCOUNT_ID?.trim();
+      const configParts = [
+        codexGatewayAccountId ? codexGatewayConfigToml(codexGatewayAccountId) : '',
+        opts.mcpConfig ? codexMcpConfigToml(opts.mcpConfig as ClaudeShapeMcpConfig) : '',
+      ].filter(Boolean);
+      if (configParts.length > 0) {
         // Translate the claude-shape mcpConfig ({ mcpServers: { <name>:
         // { type:'http', url, headers:{Authorization:'Bearer <tok>'} } } })
         // into codex's config.toml [mcp_servers.<name>] blocks. codex does
         // NOT reliably deliver `bearer_token_env_var` for HTTP MCP on the
         // Codex versions Papercusp runs, so bake the exact headers into the
-        // per-spawn 0600 config, matching writeSuCodexHome.
-        writeFileSync(join(codexHome, 'config.toml'), codexMcpConfigToml(opts.mcpConfig as ClaudeShapeMcpConfig), 'utf8');
+        // per-spawn 0600 config, matching writeSuCodexHome. When the spawn
+        // chokepoint selected a Codex pool account, include the matching
+        // model_provider so Codex model traffic routes through the gateway too.
+        writeFileSync(join(codexHome, 'config.toml'), configParts.join('\n'), 'utf8');
       }
     }
 
