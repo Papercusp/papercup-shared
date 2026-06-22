@@ -4,7 +4,7 @@
  */
 import { test, afterEach } from 'vitest';
 import assert from 'node:assert/strict';
-import { normalizeModelForClaude, headersToRecord, buildSystemParam, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent } from './chat-stream';
+import { normalizeModelForClaude, headersToRecord, buildSystemParam, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml } from './chat-stream';
 
 // claudeSpawnEnvOverrides (voice-persona P-009): disableToolSearch →
 // ENABLE_TOOL_SEARCH=false so the operator brain's caller-shrunk MCP surface
@@ -16,6 +16,26 @@ test('claudeSpawnEnvOverrides — disableToolSearch sets ENABLE_TOOL_SEARCH=fals
 test('claudeSpawnEnvOverrides — default / false → no env override', () => {
   assert.deepEqual(claudeSpawnEnvOverrides({}), {});
   assert.deepEqual(claudeSpawnEnvOverrides({ disableToolSearch: false }), {});
+});
+
+test('codexMcpConfigToml — bakes HTTP MCP Authorization headers, never bearer_token_env_var', () => {
+  const toml = codexMcpConfigToml({
+    mcpServers: {
+      'papercusp-su': {
+        type: 'http',
+        url: 'http://127.0.0.1:3070/api/mcp?superuser=1',
+        headers: {
+          Authorization: 'Bearer TESTBEARER',
+          'x-extra': 'one',
+        },
+      },
+    },
+  });
+  assert.match(toml, /\[mcp_servers\.papercusp-su\]/);
+  assert.match(toml, /url = "http:\/\/127\.0\.0\.1:3070\/api\/mcp\?superuser=1"/);
+  assert.match(toml, /http_headers = \{ "Authorization" = "Bearer TESTBEARER", "x-extra" = "one" \}/);
+  assert.doesNotMatch(toml, /bearer_token_env_var/);
+  assert.doesNotMatch(toml, /AGENTMCP_BEARER/);
 });
 
 // headersToRecord (P-004): SDK error `.headers` → a lowercased record so the TurnError

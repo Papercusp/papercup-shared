@@ -232,6 +232,45 @@ function tomlKey(s: string): string {
   return /^[A-Za-z0-9_-]+$/.test(s) ? s : `"${tomlStr(s)}"`;
 }
 
+type ClaudeShapeMcpConfig = {
+  mcpServers?: Record<string, {
+    type?: string;
+    url?: string;
+    command?: string;
+    args?: string[];
+    headers?: Record<string, string>;
+    env?: Record<string, string>;
+  }>;
+};
+
+export function codexMcpConfigToml(mcpConfig: ClaudeShapeMcpConfig): string {
+  const servers = mcpConfig.mcpServers ?? {};
+  const tomlLines: string[] = [
+    '# Per-spawn codex MCP config (managed by chat-stream.ts).',
+  ];
+  for (const [name, srv] of Object.entries(servers)) {
+    tomlLines.push('', `[mcp_servers.${tomlKey(name)}]`);
+    if (srv.url) {
+      tomlLines.push(`url = "${tomlStr(srv.url)}"`);
+      const headers = Object.entries(srv.headers ?? {});
+      if (headers.length > 0) {
+        const hdrInline = headers
+          .map(([h, v]) => `"${tomlStr(h)}" = "${tomlStr(v)}"`)
+          .join(', ');
+        tomlLines.push(`http_headers = { ${hdrInline} }`);
+      }
+    } else if (srv.command) {
+      tomlLines.push(`command = "${tomlStr(srv.command)}"`);
+      if (srv.args && srv.args.length > 0) {
+        tomlLines.push(
+          `args = [${srv.args.map((a) => `"${tomlStr(a)}"`).join(', ')}]`,
+        );
+      }
+    }
+  }
+  return tomlLines.join('\n') + '\n';
+}
+
 export interface RunAgentChatOptions {
   /** The full assembled prompt sent to claude on stdin. */
   promptText: string;
@@ -1176,57 +1215,10 @@ export async function* runAgentChat(
         // Translate the claude-shape mcpConfig ({ mcpServers: { <name>:
         // { type:'http', url, headers:{Authorization:'Bearer <tok>'} } } })
         // into codex's config.toml [mcp_servers.<name>] blocks. codex does
-        // NOT env-expand inside config.toml, so the bearer token is passed
-        // via an env var (bearer_token_env_var) and exported in spawnEnv —
-        // exactly the pattern install-standalone-mcp.sh uses for
-        // papercusp-su. We strip the `Bearer ` prefix for the env value.
-        const servers = (opts.mcpConfig as { mcpServers?: Record<string, unknown> }).mcpServers ?? {};
-        const tomlLines: string[] = [
-          '# Per-spawn codex MCP config (managed by chat-stream.ts).',
-        ];
-        let bearerIdx = 0;
-        for (const [name, raw] of Object.entries(servers)) {
-          const srv = raw as {
-            type?: string;
-            url?: string;
-            command?: string;
-            args?: string[];
-            headers?: Record<string, string>;
-            env?: Record<string, string>;
-          };
-          tomlLines.push('', `[mcp_servers.${tomlKey(name)}]`);
-          if (srv.url) {
-            // HTTP transport (our agentmcp server).
-            tomlLines.push(`url = "${tomlStr(srv.url)}"`);
-            const auth = srv.headers?.Authorization ?? srv.headers?.authorization;
-            if (auth) {
-              const tok = auth.replace(/^Bearer\s+/i, '');
-              const envName = `AGENTMCP_BEARER${bearerIdx === 0 ? '' : `_${bearerIdx}`}`;
-              bearerIdx += 1;
-              tomlLines.push(`bearer_token_env_var = "${envName}"`);
-              (spawnEnv as Record<string, string>)[envName] = tok;
-            }
-            // Any non-Authorization headers pass through verbatim.
-            const extra = Object.entries(srv.headers ?? {}).filter(
-              ([h]) => h.toLowerCase() !== 'authorization',
-            );
-            if (extra.length > 0) {
-              const hdrInline = extra
-                .map(([h, v]) => `"${tomlStr(h)}" = "${tomlStr(v)}"`)
-                .join(', ');
-              tomlLines.push(`http_headers = { ${hdrInline} }`);
-            }
-          } else if (srv.command) {
-            // stdio transport (forward-compat; agentmcp is HTTP).
-            tomlLines.push(`command = "${tomlStr(srv.command)}"`);
-            if (srv.args && srv.args.length > 0) {
-              tomlLines.push(
-                `args = [${srv.args.map((a) => `"${tomlStr(a)}"`).join(', ')}]`,
-              );
-            }
-          }
-        }
-        writeFileSync(join(codexHome, 'config.toml'), tomlLines.join('\n') + '\n', 'utf8');
+        // NOT reliably deliver `bearer_token_env_var` for HTTP MCP on the
+        // Codex versions Papercusp runs, so bake the exact headers into the
+        // per-spawn 0600 config, matching writeSuCodexHome.
+        writeFileSync(join(codexHome, 'config.toml'), codexMcpConfigToml(opts.mcpConfig as ClaudeShapeMcpConfig), 'utf8');
       }
     }
 
