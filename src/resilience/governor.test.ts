@@ -263,6 +263,13 @@ test('RateLimitGovernor.penalize — UNCONDITIONALLY caps a far-future reset to 
   const gAcct = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock, storeKey: 'anthropic:opus@acct-1' });
   gAcct.penalize({ retryAfterMs: 15 * 60_000, resetAt: clock + 15 * 60_000 });
   assert.equal(gAcct.state.pausedUntil, clock + 15 * 60_000, 'account-keyed pause left intact (scale-out signal), NOT capped');
+
+  // 2026-06-22 over-park fix: a TRANSIENT rate-429 (rateLimited, x-should-retry:true = "retry, capacity exists")
+  // on an account-keyed bucket IS capped to the re-probe window — it must NOT park the account on a far-future
+  // reset it carried (the aviynw 7h over-park while its live 429 was x-should-retry:true).
+  const gTransient = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock, storeKey: 'anthropic:opus@acct-2' });
+  gTransient.penalize({ resetAt: clock + 7 * 3600_000, rateLimited: true });
+  assert.equal(gTransient.state.pausedUntil, clock + ROLLING_WINDOW_REPROBE_MS, 'a transient account-keyed rate-429 is bounded to the re-probe window, NOT parked 7h');
 });
 
 // --- header-driven sync ---

@@ -671,9 +671,16 @@ export class RateLimitGovernor {
     // is baked into `opts` HERE so the cross-process PG write below inherits it (the persisted row carries
     // no dialect). A caller's own TIGHTER maxPauseMs still wins.
     const accountKeyed = this.storeKey?.includes('@') ?? false;
-    const eff = accountKeyed
-      ? opts
-      : { ...opts, maxPauseMs: Math.min(opts.maxPauseMs ?? Infinity, ROLLING_WINDOW_REPROBE_MS) };
+    // Account-keyed buckets stay UNCAPPED for a genuine usage cap (a sustained-exhaustion signal the scale-out
+    // observer needs) — EXCEPT a TRANSIENT rate-429 (`opts.rateLimited`, i.e. x-should-retry:true = "retry,
+    // capacity exists"), which is NOT exhaustion and must re-probe within the bounded window rather than PARK the
+    // account on a far-future rolling-window reset it happened to carry (2026-06-22 aviynw over-park: live 429 is
+    // x-should-retry:true yet pausedUntil was ~7h). penaltyCount still accrues, so the sustained verdict +
+    // scale-out signal are unaffected — only the over-long PARK is bounded. Fleet-wide buckets always cap.
+    const capPause = !accountKeyed || opts.rateLimited === true;
+    const eff = capPause
+      ? { ...opts, maxPauseMs: Math.min(opts.maxPauseMs ?? Infinity, ROLLING_WINDOW_REPROBE_MS) }
+      : opts;
     recordPenalty(this.state, this.now(), eff);
     // AIMD multiplicative decrease (D-005) — once per DISTINCT backpressure event (a pause that
     // actually extends), so N agents co-failing on the same 429 halve the fleet once, not N times.
