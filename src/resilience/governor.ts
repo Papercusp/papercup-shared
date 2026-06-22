@@ -49,6 +49,12 @@ export interface GovernorState {
    */
   paceDelayMs: number;
   lastAcquireAt: number; // epoch ms of the last granted acquire (anchors the pace gap)
+  /** ADAPTIVE per-account RPM factor ∈ [RPM_AIMD_MIN_FACTOR, 1] (2026-06-22). Multiplies `limits.rpm` so the
+   *  governor paces to the account's LEARNED sustainable rate, not just the static floor. A rate-429 halves it;
+   *  it recovers linearly to 1 over RPM_AIMD_RECOVER_MS. Optional (undefined ⇒ 1 = the configured floor, legacy
+   *  behaviour). Paired with `rpmFactorAt` (when it was last set) to compute the time-decayed effective value. */
+  rpmFactor?: number;
+  rpmFactorAt?: number; // epoch ms the rpmFactor was last DECREASED (anchors the linear recovery)
   /**
    * The most-constraining UNIFIED window observed from the latest response (Claude
    * Max/Pro subscription dialect — `anthropic-ratelimit-unified-*`). Subscriptions
@@ -97,6 +103,18 @@ const RESUME_STAGGER_MAX_MS = 5_000;
 // soft pacing never becomes a de-facto long pause (that's what a 429 penalty is for).
 const LOW_WATERMARK = 0.2;
 const MAX_PACE_DELAY_MS = 5_000;
+// ADAPTIVE per-account RPM (AIMD-on-rate, 2026-06-22 owner-requested predict→wait→learn→retry). A Claude-Max
+// SUBSCRIPTION account exposes NO per-minute headroom headers, so `limits.rpm` is a STATIC conservative floor
+// the governor can never learn DOWN — an account whose real sustainable rate is below the floor (e.g. Anthropic
+// soft-throttled it) keeps getting paced at the floor and keeps 429ing. This is the per-account-RATE analog of
+// the GLOBAL concurrency AIMD: a learned `rpmFactor∈[MIN,1]` multiplies the floor. A RATE 429 (transient
+// burst-throttle — NOT a 5h/7d usage cap, NOT a transport stall) HALVES it ("the prediction was too high"); it
+// then RECOVERS linearly back to 1 over RECOVER_MS ("probe for more headroom") so a transient throttle doesn't
+// permanently cap the account. decideRate paces to `floor × effectiveRpmFactor`, so the existing rpm wait-gate
+// now holds requests at each account's LEARNED rate → it stops walking into the same 429. Env-tunable.
+const RPM_AIMD_DECREASE = Number(process.env.PAPERCUSP_GATEWAY_RPM_AIMD_DECREASE) || 0.5;
+const RPM_AIMD_MIN_FACTOR = Number(process.env.PAPERCUSP_GATEWAY_RPM_AIMD_MIN) || 0.1;
+const RPM_AIMD_RECOVER_MS = Number(process.env.PAPERCUSP_GATEWAY_RPM_AIMD_RECOVER_MS) || 5 * 60_000;
 // Unified (subscription) dialect: above this utilization fraction of the binding window we start
 // pre-emptively pacing — the per-request gap grows linearly from 0 at the watermark to
 // MAX_PACE_DELAY_MS as utilization → 1, so a 5-hour budget glides toward its reset instead of
@@ -154,6 +172,18 @@ function windowUsage(s: GovernorState, now: number): { req: number; inTok: numbe
   return { req: s.reqInWindow, inTok: s.inTokInWindow, outTok: s.outTokInWindow };
 }
 
+/** The time-decayed adaptive RPM factor at `now` ∈ [RPM_AIMD_MIN_FACTOR, 1] (2026-06-22). A rate-429 dropped
+ *  `rpmFactor` (multiplicative decrease, anchored at `rpmFactorAt`); here it RECOVERS linearly back to 1 over
+ *  RPM_AIMD_RECOVER_MS, so a transient throttle paces the account hard right after the 429 and eases back as it
+ *  proves it can sustain more. Pure (no mutation) — decideRate reads it; penalize anchors a fresh decrease.
+ *  Undefined `rpmFactor` ⇒ 1 (legacy: pace to the configured floor unchanged). */
+export function effectiveRpmFactor(s: GovernorState, now: number): number {
+  const base = s.rpmFactor;
+  if (base === undefined || base >= 1) return 1;
+  const since = Math.max(0, now - (s.rpmFactorAt ?? 0));
+  return Math.min(1, base + since / RPM_AIMD_RECOVER_MS);
+}
+
 /** PURE: the CONCURRENCY gate only (the per-process burst lever). Split out from `decideAcquire`
     so the cross-process store (RB-007) can run the RATE gate against the shared row while keeping
     concurrency local. */
@@ -177,8 +207,11 @@ export function decideRate(s: GovernorState, now: number, est: TokenEstimate = {
   const inTok = est.inTok ?? 0;
   const outTok = est.outTok ?? 0;
 
-  if (s.limits.rpm !== undefined && u.req + 1 > s.limits.rpm) {
-    return { allowed: false, waitMs: Math.max(1, msToWindowReset), reason: 'rpm' };
+  if (s.limits.rpm !== undefined) {
+    // ADAPTIVE rpm (2026-06-22): pace to the account's LEARNED rate (floor × time-decayed factor), not just the
+    // static floor — so a soft-throttled account is held under its real sustainable rate instead of re-429ing.
+    const effRpm = Math.max(1, Math.floor(s.limits.rpm * effectiveRpmFactor(s, now)));
+    if (u.req + 1 > effRpm) return { allowed: false, waitMs: Math.max(1, msToWindowReset), reason: 'rpm' };
   }
   if (s.limits.itpm !== undefined && u.inTok + inTok > s.limits.itpm) {
     return { allowed: false, waitMs: Math.max(1, msToWindowReset), reason: 'itpm' };
@@ -612,8 +645,18 @@ export class RateLimitGovernor {
     if (this.store) void this.store.transact(this.storeKey!, this.floor, (s) => recordHeaders(s, headers, this.now())).catch(() => {});
   }
 
-  penalize(opts: { retryAfterMs?: number; resetAt?: number; maxPauseMs?: number; transport?: boolean }): void {
+  penalize(opts: { retryAfterMs?: number; resetAt?: number; maxPauseMs?: number; transport?: boolean; rateLimited?: boolean }): void {
     const before = this.state.pausedUntil;
+    // ADAPTIVE rpm (2026-06-22): a RATE 429 (a transient per-minute/burst throttle) means the prediction was too
+    // HIGH — multiplicatively DECREASE this account's learned rpm factor so decideRate paces future requests under
+    // its real sustainable rate (and the existing rpm wait-gate retries at that paced rate). Excluded: a usage-CAP
+    // 429 (5h/7d is a token-budget dimension → utilization/switch-account handles it, NOT rpm) and a transport
+    // stall (a proxy fault, not a rate signal). The factor recovers toward 1 over time (effectiveRpmFactor).
+    if (opts.rateLimited && !opts.transport) {
+      const tnow = this.now();
+      this.state.rpmFactor = Math.max(RPM_AIMD_MIN_FACTOR, effectiveRpmFactor(this.state, tnow) * RPM_AIMD_DECREASE);
+      this.state.rpmFactorAt = tnow;
+    }
     this.penaltySeq += 1; // any in-flight turn that releases after this is NOT clean (D-005)
     // ROLLING-WINDOW FALSE-PAUSE FIX (2026-06-17): a 429 carrying a MULTI-HOUR reset must NEVER pause the
     // FLEET-WIDE bucket for hours. On 2026-06-17 a transient opus 429 (util still ALLOWED) carrying the

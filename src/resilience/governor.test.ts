@@ -7,10 +7,13 @@ import assert from 'node:assert/strict';
 import {
   initGovernorState,
   decideAcquire,
+  decideRate,
   recordAcquire,
+  recordRate,
   recordRelease,
   recordPenalty,
   recordHeaders,
+  effectiveRpmFactor,
   RateLimitGovernor,
   ROLLING_WINDOW_REPROBE_MS,
   ROLLING_WINDOW_REPROBE_MAX_MS,
@@ -158,6 +161,51 @@ test('liftTransportPause — clears an egress-circuit transport pause on proxy r
   const g3 = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock });
   g3.liftTransportPause(clock + 10_000);
   assert.ok(g3.state.pausedUntil <= clock, 'no pause to lift → no-op');
+});
+
+test('ADAPTIVE rpm — a RATE 429 multiplicatively decreases the learned factor; usage-cap + transport do NOT (2026-06-22)', () => {
+  let clock = 1_000_000;
+  const mk = () => new RateLimitGovernor({ maxConcurrent: 100, rpm: 40 }, { now: () => clock });
+  // A rate-429 halves the factor (1 → 0.5 → 0.25), floored at the min (default 0.1).
+  const g = mk();
+  g.penalize({ retryAfterMs: 1, rateLimited: true });
+  assert.equal(g.state.rpmFactor, 0.5, 'first rate-429 halves the factor');
+  g.penalize({ retryAfterMs: 1, rateLimited: true });
+  assert.equal(g.state.rpmFactor, 0.25, 'repeated rate-429s keep halving (learning the real rate down)');
+  for (let i = 0; i < 12; i++) g.penalize({ retryAfterMs: 1, rateLimited: true });
+  assert.ok(Math.abs((g.state.rpmFactor ?? 0) - 0.1) < 1e-9, 'floored at the min factor (never fully stalls)');
+  // A usage-cap 429 (no rateLimited) is a token-budget dimension → must NOT touch the rpm factor.
+  const g2 = mk();
+  g2.penalize({ resetAt: clock + 5 * 3600_000 });
+  assert.equal(g2.state.rpmFactor, undefined, 'a 5h/7d usage cap does not adapt rpm');
+  // A transport stall (proxy fault) never adapts rpm — even if rateLimited is also set.
+  const g3 = mk();
+  g3.penalize({ retryAfterMs: 1, transport: true, rateLimited: true });
+  assert.equal(g3.state.rpmFactor, undefined, 'a transport stall never adapts rpm');
+});
+
+test('ADAPTIVE rpm — decideRate paces to floor×factor (a learned-down account is held under its real rate, 2026-06-22)', () => {
+  const now = 1_000_000;
+  const s = initGovernorState({ maxConcurrent: 100, rpm: 40 });
+  for (let i = 0; i < 20; i++) recordRate(s, now); // 20 requests this 60s window
+  assert.equal(decideRate(s, now).allowed, true, 'at the full floor (40rpm) 20 requests leave headroom');
+  // Learn the factor down to 0.5 → effective 20rpm → the same 20 requests are now AT the learned cap.
+  s.rpmFactor = 0.5;
+  s.rpmFactorAt = now;
+  const d = decideRate(s, now);
+  assert.equal(d.allowed, false, 'at factor 0.5 the same load hits the learned 20rpm cap');
+  assert.equal(d.reason, 'rpm', 'and it is the rpm gate that holds it (paced, not failed)');
+});
+
+test('ADAPTIVE rpm — the factor recovers linearly toward 1 (a transient throttle does not permanently cap, 2026-06-22)', () => {
+  const s = initGovernorState({ maxConcurrent: 100, rpm: 40 });
+  s.rpmFactor = 0.1;
+  s.rpmFactorAt = 0;
+  assert.equal(effectiveRpmFactor(s, 0), 0.1, 'starts at the decreased factor');
+  // Recovers +1.0 per RPM_AIMD_RECOVER_MS (default 300_000ms): +150_000ms → 0.1 + 0.5 = 0.6.
+  assert.ok(Math.abs(effectiveRpmFactor(s, 150_000) - 0.6) < 1e-9, 'recovers linearly with elapsed time');
+  assert.equal(effectiveRpmFactor(s, 300_000), 1, 'fully recovered to the floor after the recovery window');
+  assert.equal(effectiveRpmFactor(initGovernorState({ maxConcurrent: 1 }), 999), 1, 'undefined factor reads as 1 (legacy)');
 });
 
 test('penalize({transport:true}) — tags the pause source "transport" and does NOT shrink fleet AIMD (a flaky proxy ≠ rate pressure, 2026-06-22)', () => {
