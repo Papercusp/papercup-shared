@@ -378,7 +378,12 @@ export function recordHeaders(s: GovernorState, headers: Record<string, string |
     domain-free: the governor knows nothing about coord/PG/toasts; the host subscribes. */
 export interface GovernorPauseEvent {
   pausedUntil: number;
-  source: 'penalty' | 'headers';
+  /** What drove the pause: a real rate `penalty` (429/usage-cap), the provider's window `headers`, or a
+   *  `transport` failure (egress-proxy circuit). `transport` is NOT a budget/rate signal — it pauses the
+   *  account only to route around a bad PROXY (the gateway's pin-yield reads pausedUntil) — so rate-limit
+   *  consumers (account-pool exhaustion/scale-out, the "rate-limited" toast) MUST skip it, else a flaky
+   *  proxy falsely reads as the account being rate-exhausted (2026-06-22 healthy-account-marked-exhausted bug). */
+  source: 'penalty' | 'headers' | 'transport';
 }
 
 /**
@@ -607,7 +612,7 @@ export class RateLimitGovernor {
     if (this.store) void this.store.transact(this.storeKey!, this.floor, (s) => recordHeaders(s, headers, this.now())).catch(() => {});
   }
 
-  penalize(opts: { retryAfterMs?: number; resetAt?: number; maxPauseMs?: number }): void {
+  penalize(opts: { retryAfterMs?: number; resetAt?: number; maxPauseMs?: number; transport?: boolean }): void {
     const before = this.state.pausedUntil;
     this.penaltySeq += 1; // any in-flight turn that releases after this is NOT clean (D-005)
     // ROLLING-WINDOW FALSE-PAUSE FIX (2026-06-17): a 429 carrying a MULTI-HOUR reset must NEVER pause the
@@ -629,8 +634,12 @@ export class RateLimitGovernor {
     recordPenalty(this.state, this.now(), eff);
     // AIMD multiplicative decrease (D-005) — once per DISTINCT backpressure event (a pause that
     // actually extends), so N agents co-failing on the same 429 halve the fleet once, not N times.
-    if (this.state.pausedUntil > before) this.globalGate?.notePenalty?.();
-    this.notifyPauseIfExtended(before, 'penalty');
+    // A TRANSPORT pause is exempt: a flaky egress PROXY on one account is not provider rate pressure,
+    // so it must not shrink the WHOLE fleet's concurrency (which would punish every healthy account for
+    // one bad Rayobyte proxy). The pause is still set on this account's state (recordPenalty above) so
+    // the gateway's pin-yield routes around the proxy; it just isn't a fleet-wide rate signal.
+    if (!opts.transport && this.state.pausedUntil > before) this.globalGate?.notePenalty?.();
+    this.notifyPauseIfExtended(before, opts.transport ? 'transport' : 'penalty');
     // A 429 anywhere pauses the WHOLE account → push to the shared row so every process backs off.
     if (this.store) void this.store.transact(this.storeKey!, this.floor, (s) => recordPenalty(s, this.now(), eff)).catch(() => {});
   }
