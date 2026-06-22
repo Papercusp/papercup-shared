@@ -377,3 +377,57 @@ export function tierOf(label: string | number | undefined, map: PriorityTierMap 
   if (Number.isFinite(n) && n >= 1) return Math.floor(n);
   return fallback;
 }
+
+/** The set of distinct tiers a map can produce (every value + the `default` fallback), ascending. */
+export function tiersOfMap(map: PriorityTierMap = DEFAULT_GATEWAY_PRIORITY_MAP): number[] {
+  const tiers = new Set<number>();
+  for (const [k, v] of Object.entries(map)) {
+    if (Number.isFinite(v) && v >= 1) tiers.add(Math.floor(v));
+    if (k === 'default' && Number.isFinite(v)) tiers.add(Math.floor(v));
+  }
+  if (tiers.size === 0) tiers.add(DEFAULT_TIER);
+  return [...tiers].sort((a, b) => a - b);
+}
+
+/** Steady-state per-tier in-flight caps for a pool of `poolSlots`. Tier 1 may use the WHOLE pool (it is
+ *  the protected interactive lane); every tier > 1 is capped at `poolSlots - reserve` so it can never
+ *  consume the slots held open for tier 1. `reserve = max(1, ceil(poolSlots * reserveFrac))`. The caps
+ *  are a *ceiling* — the reserved-floor rule in the queue is the hard tier-1 guarantee; these caps just
+ *  stop a single non-tier-1 band from monopolising the shared pool. */
+export function defaultTierCaps(poolSlots: number, tiers: number[], reserveFrac = 0.15): { caps: Record<number, number>; reserve: number } {
+  const slots = Math.max(1, Math.floor(poolSlots));
+  const reserve = Math.max(1, Math.ceil(slots * Math.max(0, reserveFrac)));
+  const sharedCap = Math.max(1, slots - reserve);
+  const caps: Record<number, number> = {};
+  for (const t of tiers) caps[t] = t <= 1 ? slots : sharedCap;
+  return { caps, reserve };
+}
+
+/** TIER-AWARE LOAD-SHEDDING (gateway-priority-tiers-2026-06-22, step 4). Given the steady-state `base`
+ *  caps and how many concurrency slots have been lost (`shed = cap - effective`, the AIMD shrink),
+ *  shrink the MOST-SHEDDABLE bands FIRST — the highest tier number down to (but never including) tier 1 —
+ *  by removing `shed` units of headroom bottom-up. Tier 1 is NEVER reduced (the interactive lane is held
+ *  whole even under a full storm); a band can be squeezed to a floor of 1. Returns the adjusted caps.
+ *
+ *  Bottom-up ordering ("4 → 3 → 2 first, hold tier 1") means a partial storm degrades batch throughput
+ *  before it ever touches su (tier 2), and only an extreme storm pins every non-tier-1 band at 1 — tier 1
+ *  still admits at full pool width. Pure + deterministic (no clock / no queue mutation): the gateway calls
+ *  it on each AIMD change and applies the result via `queue.setTierCap`. */
+export function shedTierCaps(base: Record<number, number>, shed: number): Record<number, number> {
+  const out: Record<number, number> = { ...base };
+  let remaining = Math.max(0, Math.floor(shed));
+  if (remaining === 0) return out;
+  // Most-sheddable first: highest tier number down to 2 (tier 1 is held).
+  const order = Object.keys(out)
+    .map(Number)
+    .filter((t) => t > 1)
+    .sort((a, b) => b - a);
+  for (const t of order) {
+    if (remaining <= 0) break;
+    const headroom = Math.max(0, out[t] - 1); // never below 1
+    const take = Math.min(headroom, remaining);
+    out[t] -= take;
+    remaining -= take;
+  }
+  return out;
+}

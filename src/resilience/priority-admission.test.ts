@@ -1,7 +1,18 @@
 /** Tests for the PriorityAdmissionQueue (hive-inference-gateway P-011). */
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { PriorityAdmissionQueue, QueueFullError, priorityFromLabel } from './priority-admission';
+import {
+  PriorityAdmissionQueue,
+  QueueFullError,
+  priorityFromLabel,
+  tierOf,
+  tiersOfMap,
+  defaultTierCaps,
+  shedTierCaps,
+  parsePriorityTierMap,
+  DEFAULT_GATEWAY_PRIORITY_MAP,
+  DEFAULT_TIER,
+} from './priority-admission';
 
 const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
@@ -115,4 +126,179 @@ test('snapshot reports running + queued by priority', async () => {
   assert.deepEqual(s.byPriority, [{ priority: 100, count: 2 }, { priority: 0, count: 1 }]);
   release();
   await blocker;
+});
+
+// ── Priority TIER layer (gateway-priority-tiers-2026-06-22) ─────────────────────────────────────────
+
+test('tier layer OMITTED → snapshot byte-identical to legacy (no byTier / tier1Reserve fields)', async () => {
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 1 });
+  let release: () => void = () => {};
+  const blocker = q.run(0, () => new Promise<void>((r) => { release = r; }));
+  await tick();
+  // a tier passed on run() is IGNORED with no tier config
+  void q.run(0, async () => {}, { tier: 3 });
+  const s = q.snapshot();
+  assert.equal(s.byTier, undefined, 'no byTier without the tier layer');
+  assert.equal(s.tier1Reserve, undefined, 'no tier1Reserve without the tier layer');
+  release();
+  await blocker;
+});
+
+test('tierOf — role map, numeric label, bare-numeric string, unknown → default', () => {
+  assert.equal(tierOf('queen'), 1);
+  assert.equal(tierOf('scout'), 1);
+  assert.equal(tierOf('overwatch'), 1);
+  assert.equal(tierOf('su'), 2);
+  assert.equal(tierOf('bee'), 3);
+  assert.equal(tierOf('worker'), DEFAULT_TIER, 'unknown role → default band');
+  assert.equal(tierOf(undefined), DEFAULT_TIER);
+  assert.equal(tierOf(''), DEFAULT_TIER);
+  assert.equal(tierOf(2), 2, 'numeric label is the tier directly');
+  assert.equal(tierOf('2'), 2, 'bare-numeric string is an explicit tier');
+  assert.equal(tierOf(0), 1, 'tier clamped to ≥1');
+  assert.equal(tierOf('QUEEN'), 1, 'case-insensitive');
+});
+
+test('parsePriorityTierMap — merges over defaults; ignores malformed / non-numeric', () => {
+  assert.deepEqual(parsePriorityTierMap(undefined), { ...mapLower(DEFAULT_GATEWAY_PRIORITY_MAP) });
+  const merged = parsePriorityTierMap('{"bee":4,"newrole":2}');
+  assert.equal(merged.bee, 4, 'override applied');
+  assert.equal(merged.newrole, 2, 'new key added');
+  assert.equal(merged.queen, 1, 'untouched defaults remain');
+  // malformed JSON → fall back to defaults (fail-safe)
+  assert.deepEqual(parsePriorityTierMap('{not json'), mapLower(DEFAULT_GATEWAY_PRIORITY_MAP));
+  // non-numeric / <1 entries ignored
+  const bad = parsePriorityTierMap('{"bee":"x","scout":0}');
+  assert.equal(bad.bee, 3, 'non-numeric ignored → default');
+  assert.equal(bad.scout, 1, '<1 ignored → default');
+});
+
+function mapLower(m: Record<string, number>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(m)) out[k.toLowerCase()] = v;
+  return out;
+}
+
+test('tiersOfMap — distinct tiers incl. default, ascending', () => {
+  assert.deepEqual(tiersOfMap(DEFAULT_GATEWAY_PRIORITY_MAP), [1, 2, 3, 4]);
+});
+
+test('defaultTierCaps — tier 1 gets the whole pool; tier>1 capped to pool-reserve; reserve=ceil(slots*frac), min 1', () => {
+  const { caps, reserve } = defaultTierCaps(20, [1, 2, 3, 4], 0.15);
+  assert.equal(reserve, 3, 'ceil(20*0.15)=3');
+  assert.equal(caps[1], 20, 'tier 1 may use the whole pool');
+  assert.equal(caps[2], 17, 'tier>1 capped at pool - reserve');
+  assert.equal(caps[3], 17);
+  assert.equal(caps[4], 17);
+  // reserve floored at 1 even for a tiny pool / tiny frac
+  assert.equal(defaultTierCaps(2, [1, 2], 0).reserve, 1, 'reserve never below 1');
+  assert.equal(defaultTierCaps(2, [1, 2], 0).caps[2], 1, 'shared cap never below 1');
+});
+
+test('shedTierCaps — sheds the bottom band(s) first, holds tier 1, floor of 1', () => {
+  const base = { 1: 20, 2: 17, 3: 17, 4: 17 };
+  // shed 0 → unchanged
+  assert.deepEqual(shedTierCaps(base, 0), base);
+  // shed 5 → all from tier 4 (most sheddable) first
+  assert.deepEqual(shedTierCaps(base, 5), { 1: 20, 2: 17, 3: 17, 4: 12 });
+  // shed 20 → tier 4 to floor 1 (−16), then tier 3 (−4)
+  assert.deepEqual(shedTierCaps(base, 20), { 1: 20, 2: 17, 3: 13, 4: 1 });
+  // an extreme shed pins every non-tier-1 band at 1 but NEVER touches tier 1
+  const extreme = shedTierCaps(base, 1000);
+  assert.equal(extreme[1], 20, 'tier 1 is never reduced');
+  assert.equal(extreme[2], 1);
+  assert.equal(extreme[3], 1);
+  assert.equal(extreme[4], 1);
+});
+
+test('reserved tier-1 FLOOR holds — a saturated low tier cannot crowd out tier 1', async () => {
+  // 4 slots, reserve 1 for tier 1. Fill 3 slots with tier-3 work (≤ maxConcurrent-reserve=3), then a
+  // tier-1 request must still be admittable into the held-open 4th slot.
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 4, agingIntervalMs: 0, tiers: { tier1Reserve: 1 } });
+  const releases: Array<() => void> = [];
+  const block = (tier: number) => q.run(0, () => new Promise<void>((r) => releases.push(r)), { tier });
+  void block(3); void block(3); void block(3);
+  await tick();
+  // a 4th tier-3 must NOT be admitted (reserve holds the last slot for tier 1)
+  void block(3);
+  await tick();
+  assert.equal(q.inFlight, 3, 'tier>1 blocked at maxConcurrent - reserve');
+  // tier 1 jumps straight into the reserved slot
+  let t1ran = false;
+  const t1 = q.run(0, async () => { t1ran = true; }, { tier: 1 });
+  await tick();
+  assert.equal(t1ran, true, 'tier 1 admitted into the reserved floor while tier 3 is held');
+  releases.forEach((r) => r());
+  await Promise.all([t1]);
+});
+
+test('tier 1 jumps ahead of a saturated tier 3 (un-starving core)', async () => {
+  // 2 slots. Tier 3 is capped at 1 in-flight. A held tier-3 task SATURATES that cap, so the only
+  // admissible band for the second free slot is the lower-seq tier-3 backlog *or* tier 1 — and because
+  // tier 3's cap is full, ONLY tier 1 (and any uncapped band) can take that slot. Tier 1 wins even
+  // though the tier-3 waiters arrived first (lower seq) — the un-starving guarantee.
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 2, agingIntervalMs: 0, tiers: { caps: { 3: 1 }, tier1Reserve: 0 } });
+  const order: string[] = [];
+  let releaseHeld: () => void = () => {};
+  const held = q.run(0, () => new Promise<void>((r) => { releaseHeld = r; }), { tier: 3 }); // saturates tier-3 cap
+  await tick();
+  assert.equal(q.inFlight, 1, 'one tier-3 holds the cap; a slot is free');
+  // queue a flood of tier-3 work (arriving FIRST) + one tier-1 at the SAME raw priority.
+  const b1 = q.run(0, async () => { order.push('t3a'); }, { tier: 3 });
+  const b2 = q.run(0, async () => { order.push('t3b'); }, { tier: 3 });
+  const t1 = q.run(0, async () => { order.push('t1'); }, { tier: 1 });
+  await tick();
+  // the free slot went to tier 1 — the tier-3 backlog is blocked by its own saturated cap, NOT served
+  // ahead of the higher band just because it enqueued earlier.
+  assert.deepEqual(order, ['t1'], 'tier 1 served into the free slot; the capped tier-3 backlog waits');
+  releaseHeld();
+  await Promise.all([held, b1, b2, t1]);
+  assert.equal(order[0], 't1', 'tier 1 served first, ahead of the earlier-arriving saturated tier-3 backlog');
+});
+
+test('per-tier cap — a tier cannot exceed its in-flight cap even with free slots', async () => {
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 4, agingIntervalMs: 0, tiers: { caps: { 3: 1 }, tier1Reserve: 0 } });
+  let peak3 = 0, cur3 = 0;
+  const mk = (tier: number) => q.run(0, async () => {
+    if (tier === 3) { cur3++; peak3 = Math.max(peak3, cur3); }
+    await tick();
+    if (tier === 3) cur3--;
+  }, { tier });
+  await Promise.all([mk(3), mk(3), mk(3), mk(3)]);
+  assert.equal(peak3, 1, 'tier 3 never exceeded its cap of 1 despite 4 free slots');
+});
+
+test('snapshot byTier — {cap, inFlight, queued} per tier + tier1Reserve', async () => {
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 2, agingIntervalMs: 0, tiers: { caps: { 1: 2, 3: 1 }, tier1Reserve: 1 } });
+  const releases: Array<() => void> = [];
+  const block = (tier: number) => q.run(0, () => new Promise<void>((r) => releases.push(r)), { tier });
+  void block(3); // runs (1 in-flight, ≤ maxConcurrent-reserve=1)
+  await tick();
+  void block(3); // queued (tier-3 cap=1 reached)
+  void block(1); // runs into the reserved tier-1 slot
+  await tick();
+  const s = q.snapshot();
+  assert.ok(s.byTier, 'byTier present with the tier layer');
+  assert.equal(s.tier1Reserve, 1);
+  const t1 = s.byTier!.find((t) => t.tier === 1)!;
+  const t3 = s.byTier!.find((t) => t.tier === 3)!;
+  assert.deepEqual({ cap: t1.cap, inFlight: t1.inFlight }, { cap: 2, inFlight: 1 });
+  assert.deepEqual({ cap: t3.cap, inFlight: t3.inFlight, queued: t3.queued }, { cap: 1, inFlight: 1, queued: 1 });
+  releases.forEach((r) => r());
+});
+
+test('setTierCap raises admission live (tier-aware un-shed)', async () => {
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 4, agingIntervalMs: 0, tiers: { caps: { 3: 1 }, tier1Reserve: 0 } });
+  const releases: Array<() => void> = [];
+  void q.run(0, () => new Promise<void>((r) => releases.push(r)), { tier: 3 });
+  await tick();
+  let secondRan = false;
+  const second = q.run(0, async () => { secondRan = true; }, { tier: 3 });
+  await tick();
+  assert.equal(secondRan, false, 'tier-3 cap=1 holds the second');
+  q.setTierCap(3, 2); // raise the cap → the queued tier-3 admits now
+  await tick();
+  assert.equal(secondRan, true, 'raised cap admitted the queued tier-3');
+  releases.forEach((r) => r());
+  await second;
 });

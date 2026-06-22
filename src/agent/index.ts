@@ -74,5 +74,29 @@ export {
   type RunAgentTurnDeps,
 } from './turn-runner';
 // Generic resilience primitives (domain-independent) — re-exported for convenience.
-export { RateLimitGovernor, runWithRetry, initGovernorState, PriorityAdmissionQueue, QueueFullError, priorityFromLabel, AimdConcurrencyController } from '../resilience';
-export type { AdmissionSnapshot, PriorityAdmissionOptions, UnifiedWindowState, AimdConcurrencyOptions, AimdSnapshot } from '../resilience';
+export {
+  RateLimitGovernor,
+  runWithRetry,
+  initGovernorState,
+  PriorityAdmissionQueue,
+  QueueFullError,
+  priorityFromLabel,
+  tierOf,
+  tiersOfMap,
+  defaultTierCaps,
+  shedTierCaps,
+  parsePriorityTierMap,
+  DEFAULT_GATEWAY_PRIORITY_MAP,
+  DEFAULT_TIER,
+  AimdConcurrencyController,
+} from '../resilience';
+export type {
+  AdmissionSnapshot,
+  PriorityAdmissionOptions,
+  UnifiedWindowState,
+  AimdConcurrencyOptions,
+  AimdSnapshot,
+  TierAdmissionConfig,
+  TierSnapshot,
+  PriorityTierMap,
+} from '../resilience';
