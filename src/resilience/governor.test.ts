@@ -17,6 +17,7 @@ import {
   type GovernorState,
   type GovernorLimits,
   type GlobalConcurrencyGate,
+  type GovernorPauseEvent,
 } from './governor';
 
 const MIN = 60_000;
@@ -157,6 +158,34 @@ test('liftTransportPause — clears an egress-circuit transport pause on proxy r
   const g3 = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock });
   g3.liftTransportPause(clock + 10_000);
   assert.ok(g3.state.pausedUntil <= clock, 'no pause to lift → no-op');
+});
+
+test('penalize({transport:true}) — tags the pause source "transport" and does NOT shrink fleet AIMD (a flaky proxy ≠ rate pressure, 2026-06-22)', () => {
+  let clock = 1_000_000;
+  const sources: GovernorPauseEvent['source'][] = [];
+  let notePenaltyCalls = 0;
+  const gate: GlobalConcurrencyGate = {
+    tryAcquire: () => true,
+    release: () => {},
+    noteClean: () => {},
+    notePenalty: () => {
+      notePenaltyCalls += 1;
+    },
+  };
+  const g = new RateLimitGovernor(
+    { maxConcurrent: 10 },
+    { now: () => clock, globalGate: gate, onPause: (ev) => sources.push(ev.source) },
+  );
+  // A REAL rate penalty: source 'penalty' + the AIMD multiplicative-decrease fires.
+  g.penalize({ retryAfterMs: 30_000 });
+  assert.deepEqual(sources, ['penalty']);
+  assert.equal(notePenaltyCalls, 1, 'a real 429 shrinks fleet concurrency');
+  // A TRANSPORT penalty that EXTENDS the pause (60s > 30s) → onPause fires with source 'transport',
+  // but the fleet AIMD must NOT shrink (one account's bad egress proxy is not provider rate pressure).
+  g.penalize({ retryAfterMs: 60_000, transport: true });
+  assert.deepEqual(sources, ['penalty', 'transport'], 'the transport pause is tagged source:transport');
+  assert.equal(notePenaltyCalls, 1, 'a transport pause does NOT trigger the AIMD penalty');
+  assert.equal(g.state.pausedUntil, clock + 60_000, 'the pause is still SET (so the gateway routes around the proxy)');
 });
 
 test('RateLimitGovernor.penalize — UNCONDITIONALLY caps a far-future reset to the re-probe window (fleet-wide false-pause fix, 2026-06-17)', () => {
