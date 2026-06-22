@@ -207,7 +207,12 @@ export function decideRate(s: GovernorState, now: number, est: TokenEstimate = {
  * budget. No `unified` recorded yet ⇒ treat as HARD (conservative: don't override an unexplained pause).
  */
 export function isSoftPause(s: GovernorState): boolean {
-  return s.unified !== undefined && !s.unified.rejected && s.unified.utilization < 1;
+  // `rejected` is the AUTHORITATIVE "this window is over its cap / will 429" signal — trust it over the
+  // utilization FRACTION. An account at util EXACTLY 1.0 but rejected:false is still ALLOWED by Anthropic
+  // (the fraction rounded up / lagged a response), so it's serviceable — the old `utilization < 1` guard
+  // wrongly excluded it and SHED an account Anthropic would still serve (owner-reported 2026-06-21). When it
+  // genuinely tips over, the response carries status:rejected → isSoftPause flips false → hard pause.
+  return s.unified !== undefined && !s.unified.rejected;
 }
 
 export function decideAcquire(s: GovernorState, now: number, est: TokenEstimate = {}, allowSoftPaused = false): AcquireDecision {

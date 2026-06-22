@@ -121,6 +121,18 @@ test('SOFT (predictive) pause is serviceable — acquire({allowSoftPaused}) admi
   assert.ok(g2.state.pausedUntil > clock, 'hard-paused');
   assert.equal(g2.softPaused(clock), false, 'rejected = HARD, not serviceable');
   assert.equal(await g2.acquire({}, { maxWaitMs: 0, allowSoftPaused: true }), null, 'allowSoftPaused does NOT admit a hard-rejected account');
+
+  // EDGE: util EXACTLY 1.0 but status STILL allowed (rejected:false) → Anthropic would still serve it, so it
+  // is SERVICEABLE (trust `rejected`, not the fraction). The old `util < 1` guard shed this (owner 2026-06-21).
+  const g3 = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock });
+  g3.recordResponse({
+    'anthropic-ratelimit-unified-7d-status': 'allowed',
+    'anthropic-ratelimit-unified-7d-utilization': '1',
+    'anthropic-ratelimit-unified-7d-reset': String(resetSec),
+  });
+  assert.ok(g3.state.pausedUntil > clock, 'predictively paused at the cap');
+  assert.equal(g3.softPaused(clock), true, 'util 1.0 but allowed = SERVICEABLE (rejected is authoritative, not the fraction)');
+  assert.ok(await g3.acquire({}, { maxWaitMs: 0, allowSoftPaused: true }), 'allowSoftPaused serves the at-cap-but-allowed account instead of shedding');
 });
 
 test('liftTransportPause — clears an egress-circuit transport pause on proxy recovery, but NEVER a longer real 429 pause (2026-06-21)', () => {
