@@ -521,6 +521,11 @@ export class RateLimitGovernor {
     this.state.pausedUntil = shared.pausedUntil;
     this.state.paceDelayMs = shared.paceDelayMs;
     this.state.lastAcquireAt = shared.lastAcquireAt;
+    // C1 (inference-gateway-audit-2026-06-23): carry the persisted adaptive-RPM learned factor back into the
+    // local snapshot, so decideRate paces at the LEARNED rate cross-process (not the static floor) — the whole
+    // point of persisting it. The pair (factor + its decrease anchor) always moves together.
+    this.state.rpmFactor = shared.rpmFactor;
+    this.state.rpmFactorAt = shared.rpmFactorAt;
     this.state.limits = { ...this.state.limits, ...shared.limits, maxConcurrent: this.state.limits.maxConcurrent };
     this.notifyPauseIfExtended(before, 'penalty');
   }
@@ -695,7 +700,20 @@ export class RateLimitGovernor {
     if (!opts.transport && this.state.pausedUntil > before) this.globalGate?.notePenalty?.();
     this.notifyPauseIfExtended(before, opts.transport ? 'transport' : 'penalty');
     // A 429 anywhere pauses the WHOLE account → push to the shared row so every process backs off.
-    if (this.store) void this.store.transact(this.storeKey!, this.floor, (s) => recordPenalty(s, this.now(), eff)).catch(() => {});
+    // The cross-process write must ALSO replay the rpmFactor multiplicative-decrease onto the SHARED row (C1,
+    // 2026-06-23): recordPenalty alone carries only window/pause, so without this the persisted rpmFactor never
+    // moves and every transact-loaded gate keeps reading factor 1 (adaptive-RPM dead in PG mode). Mirrors the
+    // local decrease above; rateLimited-only (a usage-cap / transport is not an rpm signal).
+    if (this.store)
+      void this.store
+        .transact(this.storeKey!, this.floor, (s) => {
+          if (opts.rateLimited && !opts.transport) {
+            s.rpmFactor = Math.max(RPM_AIMD_MIN_FACTOR, effectiveRpmFactor(s, this.now()) * RPM_AIMD_DECREASE);
+            s.rpmFactorAt = this.now();
+          }
+          recordPenalty(s, this.now(), eff);
+        })
+        .catch(() => {});
   }
 
   /** Lift a TRANSPORT pause (an egress-proxy circuit pause) the MOMENT the proxy recovers — the dual of the

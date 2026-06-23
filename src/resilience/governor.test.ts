@@ -207,6 +207,38 @@ test('ADAPTIVE rpm — a RATE 429 multiplicatively decreases the learned factor;
   assert.equal(g3.state.rpmFactor, undefined, 'a transport stall never adapts rpm');
 });
 
+test('ADAPTIVE rpm cross-process (C1, 2026-06-23): a rate-429 writes the decreased rpmFactor onto the SHARED store row, so the gate survives the PG round-trip', async () => {
+  const clock = 1_000_000;
+  // A fake store holding ONE shared state + running the mutate against it (mirrors PgGovernorStore.transact).
+  const shared = initGovernorState({ maxConcurrent: 100, rpm: 40 });
+  const store = {
+    async transact(_k: string, _f: GovernorLimits, mutate: (s: GovernorState) => void) {
+      mutate(shared);
+      return shared;
+    },
+  };
+  const g = new RateLimitGovernor({ maxConcurrent: 100, rpm: 40 }, { now: () => clock, store, storeKey: 'anthropic:sonnet@aviynw' });
+  g.penalize({ retryAfterMs: 1, rateLimited: true });
+  await Promise.resolve(); // flush the fire-and-forget store.transact
+  // BEFORE C1 the rpmFactor decrease hit ONLY this.state, never the store row → a PEER process reloading the
+  // row saw factor 1 and re-walked into the same 429 (adaptive-RPM dead in PG mode). Now the SHARED row carries
+  // the learned factor + its anchor, so decideRate paces at the learned rate across processes.
+  assert.equal(shared.rpmFactor, 0.5, 'the shared store row carries the decreased rpmFactor');
+  assert.equal(shared.rpmFactorAt, clock, 'and its decrease anchor (the pair moves together)');
+  // A usage-cap penalize must NOT touch the shared rpm factor (a token-budget dimension, not a rate signal).
+  const shared2 = initGovernorState({ maxConcurrent: 100, rpm: 40 });
+  const store2 = {
+    async transact(_k: string, _f: GovernorLimits, m: (s: GovernorState) => void) {
+      m(shared2);
+      return shared2;
+    },
+  };
+  const g2 = new RateLimitGovernor({ maxConcurrent: 100, rpm: 40 }, { now: () => clock, store: store2, storeKey: 'anthropic:sonnet@aviynw' });
+  g2.penalize({ resetAt: clock + 5 * 3600_000 });
+  await Promise.resolve();
+  assert.equal(shared2.rpmFactor, undefined, 'a usage cap does not adapt the shared rpm factor');
+});
+
 test('ADAPTIVE rpm — decideRate paces to floor×factor (a learned-down account is held under its real rate, 2026-06-22)', () => {
   const now = 1_000_000;
   const s = initGovernorState({ maxConcurrent: 100, rpm: 40 });
