@@ -671,16 +671,20 @@ export class RateLimitGovernor {
     // is baked into `opts` HERE so the cross-process PG write below inherits it (the persisted row carries
     // no dialect). A caller's own TIGHTER maxPauseMs still wins.
     const accountKeyed = this.storeKey?.includes('@') ?? false;
-    // Account-keyed buckets stay UNCAPPED for a genuine usage cap (a sustained-exhaustion signal the scale-out
-    // observer needs) — EXCEPT a TRANSIENT rate-429 (`opts.rateLimited`, i.e. x-should-retry:true = "retry,
-    // capacity exists"), which is NOT exhaustion and must re-probe within the bounded window rather than PARK the
-    // account on a far-future rolling-window reset it happened to carry (2026-06-22 aviynw over-park: live 429 is
-    // x-should-retry:true yet pausedUntil was ~7h). penaltyCount still accrues, so the sustained verdict +
-    // scale-out signal are unaffected — only the over-long PARK is bounded. Fleet-wide buckets always cap.
-    const capPause = !accountKeyed || opts.rateLimited === true;
-    const eff = capPause
-      ? { ...opts, maxPauseMs: Math.min(opts.maxPauseMs ?? Infinity, ROLLING_WINDOW_REPROBE_MS) }
-      : opts;
+    // RE-PROBE HORIZON for the PARK — two tiers, NEVER uncapped (2026-06-23 aviynw 12h over-park fix).
+    //  • FAST (ROLLING_WINDOW_REPROBE_MS ~2min): a TRANSIENT rate-429 (`opts.rateLimited`, x-should-retry:true =
+    //    "capacity exists, retry") OR a fleet-wide bucket. Not exhaustion → re-probe quickly.
+    //  • SLOW (ROLLING_WINDOW_REPROBE_MAX_MS ~30min): an account-keyed USAGE-CAP (a genuine 5h/7d token-budget
+    //    exhaustion). This used to be UNCAPPED — parked to the full multi-hour reset — which STRANDED an account
+    //    whose rolling window had since aged back under cap, OR that was mis-classified as a hard cap, for up to
+    //    12h despite having live budget (aviynw: a bare x-should-retry 429 yet pausedUntil ~12h out). A genuine
+    //    cap simply re-penalizes on the ~30min re-probe (it 429s again → another ≤30min park), so penaltyCount
+    //    still accrues and the sustained-exhaustion scale-out signal is preserved (it fires on each re-extend) —
+    //    only the over-long PARK is bounded, reclaiming a recovered account's capacity within ~30min. A caller's
+    //    own TIGHTER maxPauseMs still wins (the Math.min). Disable by raising PAPERCUSP_ROLLING_REPROBE_MAX_MS.
+    const reprobeCapMs =
+      !accountKeyed || opts.rateLimited === true ? ROLLING_WINDOW_REPROBE_MS : ROLLING_WINDOW_REPROBE_MAX_MS;
+    const eff = { ...opts, maxPauseMs: Math.min(opts.maxPauseMs ?? Infinity, reprobeCapMs) };
     recordPenalty(this.state, this.now(), eff);
     // AIMD multiplicative decrease (D-005) — once per DISTINCT backpressure event (a pause that
     // actually extends), so N agents co-failing on the same 429 halve the fleet once, not N times.

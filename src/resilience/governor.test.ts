@@ -163,6 +163,29 @@ test('liftTransportPause — clears an egress-circuit transport pause on proxy r
   assert.ok(g3.state.pausedUntil <= clock, 'no pause to lift → no-op');
 });
 
+test('USAGE-CAP re-probe cap (2026-06-23 aviynw 12h over-park fix): an account-keyed usage-cap 429 PARKS for the SLOW re-probe (30min), not the full multi-hour reset', () => {
+  const clock = 1_000_000;
+  const FAR = clock + 12 * 60 * 60_000; // a 12h reset (the aviynw over-park)
+  // Account-keyed governor (storeKey carries '@<accountId>') = ONE account's bucket. A USAGE-CAP 429 (NOT
+  // rateLimited) used to park it UNCAPPED to the full reset → stranded a since-recovered account up to 12h.
+  // Now bounded to the SLOW re-probe (ROLLING_WINDOW_REPROBE_MAX_MS) so it re-probes + rejoins within ~30min.
+  const usageCap = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock, storeKey: 'anthropic:opus@aviynw' });
+  usageCap.penalize({ resetAt: FAR });
+  assert.equal(
+    usageCap.state.pausedUntil,
+    clock + ROLLING_WINDOW_REPROBE_MAX_MS,
+    'account-keyed usage-cap park bounded to the 30min slow re-probe, not the 12h reset',
+  );
+  // A TRANSIENT rate-429 on the same account still caps to the FAST re-probe (2min) — unchanged.
+  const rate = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock, storeKey: 'anthropic:opus@aviynw' });
+  rate.penalize({ resetAt: FAR, rateLimited: true });
+  assert.equal(rate.state.pausedUntil, clock + ROLLING_WINDOW_REPROBE_MS, 'a transient rate-429 still re-probes fast (2min)');
+  // A genuine cap simply re-penalizes on the re-probe (it 429s again) — penaltyCount still accrues, so the
+  // sustained-exhaustion scale-out signal the account-pool observer keys on is preserved.
+  usageCap.penalize({ resetAt: FAR });
+  assert.equal(usageCap.state.pausedUntil, clock + ROLLING_WINDOW_REPROBE_MAX_MS, 're-penalize re-parks to the bounded re-probe');
+});
+
 test('ADAPTIVE rpm — a RATE 429 multiplicatively decreases the learned factor; usage-cap + transport do NOT (2026-06-22)', () => {
   let clock = 1_000_000;
   const mk = () => new RateLimitGovernor({ maxConcurrent: 100, rpm: 40 }, { now: () => clock });
