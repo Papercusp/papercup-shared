@@ -56,6 +56,17 @@ export interface GovernorState {
   rpmFactor?: number;
   rpmFactorAt?: number; // epoch ms the rpmFactor was last DECREASED (anchors the linear recovery)
   /**
+   * SMOOTH the per-minute RPM allowance into an even inter-request pace (opt-in; the inference gateway
+   * sets it on its per-account governors). A SUBSCRIPTION account exposes no per-minute headers, so
+   * `paceDelayMs` stays 0 at low utilization — the per-minute COUNT gate then lets the WHOLE `effRpm`
+   * allowance fire as an INSTANT BURST at each window start, which trips Anthropic's sub-minute burst
+   * limit (the `x-should-retry:true` bare-burst 429 storm, 2026-06-23) even though the per-minute
+   * average is fine. With this on, decideRate floors the pace at WINDOW_MS/effRpm so the allowance is
+   * spread evenly across the minute — throughput-NEUTRAL (the same ≤effRpm/min still passes the count
+   * gate) but burst-safe. Undefined ⇒ off (legacy: the fleet concurrency governor is byte-identical).
+   */
+  smoothRpm?: boolean;
+  /**
    * The most-constraining UNIFIED window observed from the latest response (Claude
    * Max/Pro subscription dialect — `anthropic-ratelimit-unified-*`). Subscriptions
    * expose a rolling-UTILIZATION budget (a 5-hour + 7-day window), NOT the per-minute
@@ -221,8 +232,19 @@ export function decideRate(s: GovernorState, now: number, est: TokenEstimate = {
   }
   // Pre-emptive pacing: when remaining is low (header-driven mode) we hold a small gap between
   // acquisitions so we glide to the reset instead of slamming into remaining=0 (review #7/#8).
-  if (s.paceDelayMs > 0) {
-    const nextAllowedAt = s.lastAcquireAt + s.paceDelayMs;
+  // SMOOTHING (smoothRpm, 2026-06-23): the header-driven `paceDelayMs` is only set when a TOKEN window
+  // is near its cap — at low utilization it is 0, so the per-minute COUNT gate above lets the whole
+  // `effRpm` allowance fire as an instant burst at window start, tripping Anthropic's sub-minute burst
+  // limit (the bare-burst 429 storm). When smoothRpm is on, floor the pace at WINDOW_MS/effRpm so the
+  // SAME per-minute allowance is spread evenly. Throughput-neutral (the count gate still caps the rate);
+  // it only reshapes the burst. effRpm follows the learned rpmFactor, so 429-learning tightens it too.
+  let pace = s.paceDelayMs;
+  if (s.smoothRpm && s.limits.rpm !== undefined) {
+    const effRpm = Math.max(1, Math.floor(s.limits.rpm * effectiveRpmFactor(s, now)));
+    pace = Math.max(pace, Math.ceil(WINDOW_MS / effRpm));
+  }
+  if (pace > 0) {
+    const nextAllowedAt = s.lastAcquireAt + pace;
     if (now < nextAllowedAt) return { allowed: false, waitMs: nextAllowedAt - now, reason: 'pace' };
   }
   return { allowed: true, waitMs: 0 };

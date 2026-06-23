@@ -263,6 +263,33 @@ test('ADAPTIVE rpm — the factor recovers linearly toward 1 (a transient thrott
   assert.equal(effectiveRpmFactor(initGovernorState({ maxConcurrent: 1 }), 999), 1, 'undefined factor reads as 1 (legacy)');
 });
 
+test('SMOOTHING (smoothRpm) — spaces the per-minute allowance so it cannot fire as a sub-minute BURST (bare-burst 429 fix, 2026-06-23)', () => {
+  const now = 1_000_000;
+  // Legacy (smoothRpm undefined): a subscription account has paceDelayMs=0, so a second request can fire
+  // back-to-back with the first — the whole rpm allowance bursts at window start (what trips Anthropic's
+  // sub-minute burst limit → the x-should-retry:true bare-burst 429 storm).
+  const burst = initGovernorState({ maxConcurrent: 100, rpm: 60 }); // 60rpm → 1000ms/req when smoothed
+  recordRate(burst, now); // one request just went out (lastAcquireAt = now)
+  assert.equal(decideRate(burst, now + 1).allowed, true, 'legacy: a back-to-back request is allowed — bursts freely');
+
+  // With smoothRpm: the same allowance is SPREAD to WINDOW_MS/effRpm spacing — a back-to-back request is paced.
+  const smooth = initGovernorState({ maxConcurrent: 100, rpm: 60 });
+  smooth.smoothRpm = true;
+  recordRate(smooth, now);
+  const d = decideRate(smooth, now + 1);
+  assert.equal(d.allowed, false, 'smoothRpm: a back-to-back request is PACED, not bursted');
+  assert.equal(d.reason, 'pace', 'held by the pace gate (not the count cap)');
+  assert.ok(d.waitMs >= 900 && d.waitMs <= 1000, `paced ~WINDOW/effRpm = 1000ms apart (got ${d.waitMs})`);
+  // THROUGHPUT-NEUTRAL: once the pace gap elapses the request proceeds — the allowance is spread, not reduced.
+  assert.equal(decideRate(smooth, now + 1000).allowed, true, 'after the pace gap the request proceeds — same per-minute throughput, just evenly spaced');
+  // The learned rpmFactor tightens the spacing too: factor 0.5 → effective 30rpm → 2000ms spacing.
+  smooth.rpmFactor = 0.5;
+  smooth.rpmFactorAt = now;
+  recordRate(smooth, now + 1000);
+  const d2 = decideRate(smooth, now + 1001);
+  assert.ok(d2.waitMs >= 1900 && d2.waitMs <= 2000, `a learned-down account paces wider (~2000ms; got ${d2.waitMs})`);
+});
+
 test('penalize({transport:true}) — tags the pause source "transport" and does NOT shrink fleet AIMD (a flaky proxy ≠ rate pressure, 2026-06-22)', () => {
   let clock = 1_000_000;
   const sources: GovernorPauseEvent['source'][] = [];
