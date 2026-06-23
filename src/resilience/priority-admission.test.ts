@@ -183,6 +183,17 @@ test('tiersOfMap — distinct tiers incl. default, ascending', () => {
   assert.deepEqual(tiersOfMap(DEFAULT_GATEWAY_PRIORITY_MAP), [1, 2, 3, 4]);
 });
 
+test('H11 (2026-06-23): setMaxConcurrent RESCALES the tier-1 reserve proportionally — the AIMD floor no longer starves tiers >1', () => {
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 24, tiers: { caps: { 1: 24, 2: 20, 3: 20, 4: 8 }, tier1Reserve: 4 } });
+  assert.equal(q.snapshot().tier1Reserve, 4, 'full pool: the configured ~15% reserve = 4');
+  // AIMD shrinks the cap to the floor. OLD bug: clampReserve(4) → maxConcurrent-1 = 3, i.e. 3-of-4 slots (75%)
+  // reserved for tier 1, leaving su + every bee tier ONE shared slot. Now it rescales to round(4 × 4/24) = 1.
+  q.setMaxConcurrent(4);
+  assert.equal(q.snapshot().tier1Reserve, 1, 'floor: reserve rescaled to 1 → tiers >1 keep 3 of 4 slots, not 1');
+  q.setMaxConcurrent(24); // recovery restores the proportional reserve
+  assert.equal(q.snapshot().tier1Reserve, 4, 'recovery: reserve scales back to 4');
+});
+
 test('defaultTierCaps — tier 1 gets the whole pool; tier>1 capped to pool-reserve; reserve=ceil(slots*frac), min 1', () => {
   const { caps, reserve } = defaultTierCaps(20, [1, 2, 3, 4], 0.15);
   assert.equal(reserve, 3, 'ceil(20*0.15)=3');

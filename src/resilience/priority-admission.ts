@@ -115,6 +115,10 @@ export class PriorityAdmissionQueue {
   /** Tier layer (null when not configured → legacy flat behavior). */
   private readonly tierCaps: Map<number, number> | null;
   private tier1Reserve = 0;
+  /** H11 (inference-gateway-audit-2026-06-23): the ORIGINAL tier-1 reserve FRACTION (reserve÷cap at construction)
+   *  so setMaxConcurrent can rescale the reserve PROPORTIONALLY as the AIMD shrinks the live cap — instead of
+   *  re-clamping the absolute reserve, which swelled a 15%-of-24 reserve to 75% of a 4-slot floor. */
+  private reserveFrac = 0;
   /** Live in-flight count per tier (only maintained when the tier layer is on). */
   private readonly inFlightByTier = new Map<number, number>();
 
@@ -130,6 +134,7 @@ export class PriorityAdmissionQueue {
         if (Number.isFinite(tier) && Number.isFinite(v)) this.tierCaps.set(tier, Math.max(1, Math.floor(v)));
       }
       this.tier1Reserve = this.clampReserve(opts.tiers.tier1Reserve ?? 0);
+      this.reserveFrac = this.maxConcurrent > 0 ? (opts.tiers.tier1Reserve ?? 0) / this.maxConcurrent : 0;
     } else {
       this.tierCaps = null;
     }
@@ -227,8 +232,11 @@ export class PriorityAdmissionQueue {
 
   setMaxConcurrent(n: number): void {
     this.maxConcurrent = Math.max(1, Math.floor(n));
-    // Keep the reserve valid against the new cap (it can never strand the last shared slot).
-    if (this.tiered) this.tier1Reserve = this.clampReserve(this.tier1Reserve);
+    // H11 (2026-06-23): RESCALE the reserve proportionally to the new live cap (round(cap × reserveFrac)), not
+    // just re-clamp the absolute reserve — else when the AIMD shrinks the cap to the floor, a 15%-of-24 reserve
+    // (=4) stays ~4 and becomes 3-of-4 live slots (75%), starving su + every bee tier to ONE shared slot exactly
+    // when the fleet most needs throughput. clampReserve still guarantees ≥1 shared slot stays open.
+    if (this.tiered) this.tier1Reserve = this.clampReserve(Math.round(this.maxConcurrent * this.reserveFrac));
     this.pump();
   }
 
