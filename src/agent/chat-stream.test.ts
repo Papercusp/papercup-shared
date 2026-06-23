@@ -4,7 +4,22 @@
  */
 import { test, afterEach } from 'vitest';
 import assert from 'node:assert/strict';
-import { normalizeModelForClaude, headersToRecord, buildSystemParam, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml } from './chat-stream';
+import { normalizeModelForClaude, headersToRecord, buildSystemParam, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, GATEWAY_PRIORITY_HEADER } from './chat-stream';
+
+// priorityTierHeaders (gateway-priority-tiers): the in-process anthropic-direct call
+// stamps `x-papercusp-priority: <role>` so the pacing gateway tiers it (scout/queen=1)
+// instead of the lowest first-shed default band. A blank/absent label → no header
+// (untiered). This is the seam that ended the scout's 12-day ideation outage.
+test('priorityTierHeaders — a role label becomes the x-papercusp-priority header', () => {
+  assert.deepEqual(priorityTierHeaders('scout'), { [GATEWAY_PRIORITY_HEADER]: 'scout' });
+  assert.deepEqual(priorityTierHeaders('queen'), { 'x-papercusp-priority': 'queen' });
+  assert.deepEqual(priorityTierHeaders('  bee  '), { 'x-papercusp-priority': 'bee' });
+});
+test('priorityTierHeaders — absent/blank label → no header (untiered call)', () => {
+  assert.deepEqual(priorityTierHeaders(undefined), {});
+  assert.deepEqual(priorityTierHeaders(''), {});
+  assert.deepEqual(priorityTierHeaders('   '), {});
+});
 
 // claudeSpawnEnvOverrides (voice-persona P-009): disableToolSearch →
 // ENABLE_TOOL_SEARCH=false so the operator brain's caller-shrunk MCP surface

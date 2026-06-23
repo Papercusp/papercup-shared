@@ -219,6 +219,26 @@ export function normalizeModelForClaude(model: string): string {
   return slash > 0 ? model.slice(slash + 1) : model;
 }
 
+/** The standard request header carrying a caller's inference-gateway admission-tier
+ *  label — the in-process counterpart of the spawn chokepoint's `ANTHROPIC_CUSTOM_HEADERS`
+ *  priority line (gateway-priority-tiers-2026-06-22). Mirrors `PRIORITY_HEADER` in the
+ *  gateway (kept as a literal here so this shared lib stays free of the operator import). */
+export const GATEWAY_PRIORITY_HEADER = 'x-papercusp-priority';
+
+/**
+ * The inference-gateway admission-tier headers for an in-process `anthropic-direct`
+ * call. Returns `{ 'x-papercusp-priority': <role> }` when a non-blank priority/role
+ * label is supplied, else `{}` (an untiered call). Trimming + the blank→none collapse
+ * live here so the SDK-client construction is a one-liner and the rule is unit-tested
+ * without standing up the Anthropic SDK. The gateway maps the role → a tier
+ * (scout/queen/overwatch/interactive = 1, bee = 3, unknown → the lowest default band);
+ * omitting the header lands the request in that first-shed default band.
+ */
+export function priorityTierHeaders(priority: string | undefined): Record<string, string> {
+  const label = priority?.trim();
+  return label ? { [GATEWAY_PRIORITY_HEADER]: label } : {};
+}
+
 /** Escape a string for a double-quoted TOML basic value. */
 function tomlStr(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
@@ -432,6 +452,20 @@ export interface RunAgentChatOptions {
    * retry-after is waited out. Default `DEFAULT_CLI_GOVERNOR_MAX_WAIT_MS`.
    */
   governorMaxWaitMs?: number;
+  /**
+   * Priority/role LABEL for the inference-gateway admission tier
+   * (gateway-priority-tiers-2026-06-22). For the in-process `anthropic-direct`
+   * backend this is attached as the `x-papercusp-priority` request header so the
+   * localhost pacing gateway maps it → an admission TIER
+   * (queen/scout/overwatch/interactive = 1, bee = 3, unknown → the lowest
+   * `default` band). Subprocess backends carry the SAME label via the spawn
+   * chokepoint's `ANTHROPIC_CUSTOM_HEADERS`; this field is the IN-PROCESS
+   * counterpart. WITHOUT it an in-process caller (the scout's ideators, the gym
+   * judge) is untiered → lands in the first-shed default band and is starved
+   * under fleet load (root cause of the scout's 12-day ideation outage). Omit
+   * for an untiered call.
+   */
+  priority?: string;
 }
 
 export type ChatEvent =
@@ -823,11 +857,19 @@ async function* statelessAgentChat(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const Anthropic: any = (sdkMod as { default?: unknown }).default ?? sdkMod;
 
+  // Gateway admission-tier label (gateway-priority-tiers-2026-06-22): attach the
+  // caller's role as `x-papercusp-priority` so the localhost pacing gateway tiers
+  // THIS in-process request (the subprocess path carries the same header via
+  // ANTHROPIC_CUSTOM_HEADERS). Without it the request is untiered → the gateway's
+  // lowest `default` band (first-shed under AIMD shrink) and starves under fleet
+  // load — the root cause of the scout's 12-day ideation outage (it routed through
+  // the gateway via gatewayLlmEnv but never identified itself as `scout`).
+  const tierHeaders = priorityTierHeaders(opts.priority);
   const mkClient = (t: StatelessTransport) =>
     new Anthropic({
       baseURL: t.baseURL,
       authToken: t.token,
-      defaultHeaders: t.headers,
+      defaultHeaders: { ...t.headers, ...tierHeaders },
       maxRetries: 2,
     });
   let client = mkClient(transport);
