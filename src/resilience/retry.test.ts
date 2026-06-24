@@ -4,15 +4,18 @@
  */
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { RateLimitGovernor } from './governor';
+import { RateLimitGovernor, ROLLING_WINDOW_REPROBE_MAX_MS } from './governor';
 import { runWithRetry, type AttemptOutcome } from './retry';
 
 // storeKey: pass an ACCOUNT-KEYED key (contains '@<accountId>') to model a single
-// account's bucket. Per the rolling-window false-pause fix (governor.ts, 2026-06-17),
-// an account-keyed bucket HONORS a multi-hour reset (sustained 429 = genuine exhaustion
-// → drives scale-out), whereas a keyless/fleet-wide bucket CAPS the pause at a 2-min
-// re-probe (so one account's long reset can't lock the whole fleet out). A plan/usage
-// cap is account-scoped, so those tests use an account-keyed governor.
+// account's bucket. A plan/usage cap is account-scoped, so those tests use an
+// account-keyed governor. Per the 2026-06-23 "12h over-park" fix (governor.ts
+// recordPenalty; covered authoritatively by governor.test.ts "USAGE-CAP re-probe cap"),
+// an account-keyed USAGE-cap pause is BOUNDED to a ~30-min re-probe
+// (ROLLING_WINDOW_REPROBE_MAX_MS) — NOT parked to the full multi-hour reset, which
+// stranded a since-recovered account for up to 12h. The sustained-exhaustion scale-out
+// signal is preserved by re-penalizing on each re-probe. A keyless/fleet-wide bucket
+// caps even tighter (a 2-min re-probe) so one account's long reset can't lock out the fleet.
 function gov(storeKey?: string) {
   let clock = 0;
   const sleep = async (ms: number) => { clock += ms; };
@@ -76,7 +79,10 @@ test('runWithRetry — account-wide NON-retryable with a reset (usage cap) parks
   });
   assert.equal(r.ok, false);
   assert.equal(n, 1); // did NOT retry into the wall
-  assert.equal(c.g.state.pausedUntil, resetAt); // but DID pause the shared bucket so the fleet backs off
+  // The over-park fix bounds an account-keyed usage-cap pause to the 30-min re-probe (NOT the
+  // full 3h reset) so a since-recovered account isn't stranded; it still parks the bucket so the
+  // fleet backs off, and re-penalizes on each re-probe to keep the scale-out signal (D-001).
+  assert.equal(c.g.state.pausedUntil, c.now() + ROLLING_WINDOW_REPROBE_MAX_MS);
 });
 
 test('runWithRetry — per-call (not account-wide) retryable uses local backoff', async () => {

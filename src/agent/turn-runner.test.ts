@@ -4,13 +4,16 @@
  */
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { RateLimitGovernor } from '../resilience/governor';
+import { RateLimitGovernor, ROLLING_WINDOW_REPROBE_MAX_MS } from '../resilience/governor';
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
 
-// storeKey: an ACCOUNT-KEYED key (contains '@<accountId>') models one account's bucket,
-// which HONORS a multi-hour reset (governor.ts rolling-window false-pause fix, 2026-06-17);
-// a keyless/fleet-wide bucket instead CAPS the pause at a 2-min re-probe so one account's
-// long reset can't lock the whole fleet out. A plan/usage cap is account-scoped → keyed.
+// storeKey: an ACCOUNT-KEYED key (contains '@<accountId>') models one account's bucket.
+// A plan/usage cap is account-scoped → keyed. Per the 2026-06-23 "12h over-park" fix
+// (governor.ts recordPenalty; covered authoritatively by governor.test.ts "USAGE-CAP
+// re-probe cap"), an account-keyed USAGE-cap pause is BOUNDED to a ~30-min re-probe
+// (ROLLING_WINDOW_REPROBE_MAX_MS), NOT parked to the full multi-hour reset (which stranded
+// a since-recovered account for up to 12h); the scale-out signal is kept by re-penalizing on
+// each re-probe. A keyless/fleet-wide bucket caps even tighter (a 2-min re-probe).
 function fakeGovernor(storeKey?: string) {
   let clock = 0;
   const g = new RateLimitGovernor(
@@ -69,7 +72,7 @@ test('runAgentTurn — a non-retryable class (auth) returns the error immediatel
 });
 
 test('runAgentTurn — usage_limit (plan cap) returns immediately, does NOT retry, parks the fleet (D-001)', async () => {
-  const { g } = fakeGovernor('acct@plan-cap'); // account-keyed: a plan cap is one account's bucket → honors the full reset
+  const { g } = fakeGovernor('acct@plan-cap'); // account-keyed: a plan cap is one account's bucket
   const resetAt = Date.parse('2026-06-05T12:00:00Z');
   let calls = 0;
   const r = await runAgentTurn<string>(
@@ -87,9 +90,13 @@ test('runAgentTurn — usage_limit (plan cap) returns immediately, does NOT retr
   if (!r.ok) {
     assert.equal(r.error.class, 'usage_limit');
     assert.equal(r.error.surfaceToUser, true);
-    assert.equal(r.error.resetAt, resetAt);
+    assert.equal(r.error.resetAt, resetAt); // the error still reports the PRECISE reset…
   }
-  assert.equal(g.state.pausedUntil, resetAt); // fleet parked until reset
+  // …but the governor PARK is bounded to the 30-min re-probe (over-park fix), not the full
+  // multi-hour reset — so a since-recovered account isn't stranded. The fleet still backs off
+  // (pausedUntil > 0) and re-penalizes on each re-probe to keep the scale-out signal (D-001).
+  // governor `now` is 0 here, so the bounded park == ROLLING_WINDOW_REPROBE_MAX_MS.
+  assert.equal(g.state.pausedUntil, ROLLING_WINDOW_REPROBE_MAX_MS);
 });
 
 test('runAgentTurn — exhausts maxAttempts and returns the last classified error', async () => {
