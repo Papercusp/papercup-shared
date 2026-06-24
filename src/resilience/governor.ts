@@ -577,6 +577,27 @@ export class RateLimitGovernor {
     return { ...this.state, limits: { ...this.state.limits } };
   }
 
+  /**
+   * Re-base this bucket's CONSERVATIVE cold-start floor live (live-configurability-audit P-021,
+   * the per-provider `fleet:governor_floors` override). An operator-chosen floor is taken DIRECTLY
+   * into both the stored seed (`this.floor`, the store-transact fallback) and the live `state.limits`
+   * — semantically "use THIS floor now", exactly as a cold start; header auto-tune then re-raises rpm
+   * from here on the next response (recordResponse). `maxConcurrent` is the hard concurrency cap.
+   * Only the provided, valid fields are applied; omitted fields keep their current value.
+   */
+  setFloor(next: Partial<GovernorLimits>): void {
+    if (typeof next.maxConcurrent === 'number' && next.maxConcurrent >= 1) {
+      const mc = Math.floor(next.maxConcurrent);
+      this.floor.maxConcurrent = mc;
+      this.state.limits.maxConcurrent = mc;
+    }
+    if ('rpm' in next) {
+      const rpm = typeof next.rpm === 'number' && next.rpm > 0 ? next.rpm : undefined;
+      this.floor.rpm = rpm;
+      this.state.limits.rpm = rpm;
+    }
+  }
+
   /** Fire onPause iff the pause moved later (a real new/extended backpressure transition). */
   private notifyPauseIfExtended(before: number, source: GovernorPauseEvent['source']): void {
     if (!this.onPause) return;

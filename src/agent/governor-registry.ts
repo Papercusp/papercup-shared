@@ -72,6 +72,17 @@ const DEFAULT_FLOORS: Record<TurnProvider, GovernorLimits> = {
   unknown: { maxConcurrent: 3 },
 };
 
+// P-021 (live-configurability-audit): per-provider runtime FLOOR overrides (the `fleet:governor_floors`
+// dial, host-pushed via operator:rate_limit_config → setProviderFloorOverride). Consulted by
+// effectiveFloor() at governor CREATION and pushed into EXISTING buckets on set (so the knob is fully
+// live, not new-buckets-only). Empty (default) ⇒ DEFAULT_FLOORS ⇒ byte-identical.
+const providerFloorOverrides: Partial<Record<TurnProvider, Partial<GovernorLimits>>> = {};
+
+/** The effective cold-start floor for a provider = baked DEFAULT_FLOORS merged with any runtime override. */
+function effectiveFloor(provider: TurnProvider): GovernorLimits {
+  return { ...DEFAULT_FLOORS[provider], ...(providerFloorOverrides[provider] ?? {}) };
+}
+
 const registry = new Map<string, RateLimitGovernor>();
 
 // --- Fleet-wide concurrency cap (rate-limit-layer-v2 D-004) ------------------------------------
@@ -94,6 +105,13 @@ export const AIMD_CLEAN_TURNS_PER_STEP = 5;
 let globalFloor = 1;
 let aimdEff: number | undefined;
 let aimdCleanStreak = 0;
+// P-021 (live-configurability-audit): the AIMD response-curve is host-tunable at runtime
+// (operator:rate_limit_config → setAimdTuning). The exported const above stays the DEFAULT/cold value
+// (back-compat + tests); the gate reads these mutable vars. `cleanTurnsPerStep` = additive-increase
+// cadence (+1 eff per N clean turns); `decreaseFactor` ∈ (0,1) = the multiplicative decrease on a
+// penalty (0.5 = halve toward the floor). Defaults reproduce the prior baked behaviour exactly.
+let aimdCleanTurnsPerStep = AIMD_CLEAN_TURNS_PER_STEP;
+let aimdDecreaseFactor = 0.5;
 
 const globalGate: GlobalConcurrencyGate = {
   tryAcquire() {
@@ -108,7 +126,7 @@ const globalGate: GlobalConcurrencyGate = {
   noteClean() {
     if (aimdEff === undefined) return; // AIMD inactive without a finite cap
     aimdCleanStreak += 1;
-    if (aimdCleanStreak >= AIMD_CLEAN_TURNS_PER_STEP) {
+    if (aimdCleanStreak >= aimdCleanTurnsPerStep) {
       aimdCleanStreak = 0;
       if (aimdEff < globalCap) aimdEff += 1; // additive increase, never past the live cap
     }
@@ -116,7 +134,7 @@ const globalGate: GlobalConcurrencyGate = {
   notePenalty() {
     aimdCleanStreak = 0;
     if (aimdEff === undefined) return;
-    aimdEff = Math.max(globalFloor, Math.floor(aimdEff / 2)); // multiplicative decrease to floor
+    aimdEff = Math.max(globalFloor, Math.floor(aimdEff * aimdDecreaseFactor)); // multiplicative decrease to floor
   },
 };
 
@@ -147,6 +165,48 @@ export function setGlobalConcurrencyCap(n: number | undefined): void {
 export function setGlobalConcurrencyFloor(n: number | undefined): void {
   globalFloor = typeof n === 'number' && n >= 1 ? Math.floor(n) : 1;
   if (aimdEff !== undefined && aimdEff < globalFloor) aimdEff = Math.min(globalFloor, globalCap);
+}
+
+/** P-021: tune the AIMD response curve live — the additive-increase cadence (`cleanTurnsPerStep`,
+    +1 eff per N clean turns) and the multiplicative-decrease `decreaseFactor` ∈ (0,1) applied on a
+    penalty. Only valid fields are taken; omitted/invalid keep the current value. Honored by the very
+    next clean turn / penalty across all buckets (the gate reads the live vars). */
+export function setAimdTuning(t: { cleanTurnsPerStep?: number; decreaseFactor?: number } | undefined): void {
+  if (typeof t?.cleanTurnsPerStep === 'number' && t.cleanTurnsPerStep >= 1) {
+    aimdCleanTurnsPerStep = Math.floor(t.cleanTurnsPerStep);
+  }
+  if (typeof t?.decreaseFactor === 'number' && t.decreaseFactor > 0 && t.decreaseFactor < 1) {
+    aimdDecreaseFactor = t.decreaseFactor;
+  }
+}
+
+/** The live AIMD response-curve tuning (for observability / the config readback). */
+export function getAimdTuning(): { cleanTurnsPerStep: number; decreaseFactor: number } {
+  return { cleanTurnsPerStep: aimdCleanTurnsPerStep, decreaseFactor: aimdDecreaseFactor };
+}
+
+/** P-021: override (or clear, when `limits` omits a field / is undefined) a provider's conservative
+    cold-start FLOOR live — applied to new buckets AND pushed into existing ones immediately, so the
+    knob is fully live. Subscriptions expose no per-minute headroom, so this static floor is the only
+    rpm gate they get; raising/lowering it tunes the whole fleet's pace to a provider without a deploy. */
+export function setProviderFloorOverride(provider: TurnProvider, limits: Partial<GovernorLimits> | undefined): void {
+  const next = limits && Object.keys(limits).length > 0 ? { ...limits } : undefined;
+  // UNCHANGED guard: only re-push when the override actually changes. A benign re-apply (e.g. a
+  // maxSimultaneousAgents-only edit re-runs applyCached) must NOT re-seat existing buckets to the
+  // static floor — that would discard each bucket's header-learned rpm (recordResponse auto-tune).
+  if (JSON.stringify(providerFloorOverrides[provider] ?? null) === JSON.stringify(next ?? null)) return;
+  if (!next) delete providerFloorOverrides[provider];
+  else providerFloorOverrides[provider] = next;
+  // Push the new effective floor into every EXISTING bucket of this provider (fully-live, not new-only).
+  const floor = effectiveFloor(provider);
+  for (const [key, g] of registry) {
+    if (parseGovernorKey(key).provider === provider) g.setFloor(floor);
+  }
+}
+
+/** The live per-provider floor overrides (for observability / the config readback). */
+export function getProviderFloorOverrides(): Partial<Record<TurnProvider, Partial<GovernorLimits>>> {
+  return { ...providerFloorOverrides };
 }
 
 /** The live fleet-wide cap + current total in-flight — surfaced by the rate read-model / top-bar. */
@@ -240,7 +300,7 @@ export function getGovernor(provider: TurnProvider, modelClass: string, deps?: G
   let g = registry.get(key);
   if (!g) {
     g = new RateLimitGovernor(
-      { ...DEFAULT_FLOORS[provider] },
+      effectiveFloor(provider), // baked DEFAULT_FLOORS + any runtime per-provider override (P-021)
       {
         ...deps,
         // Fleet-wide cap (D-004): share the registry's one global gate unless a test injects its own.
@@ -306,4 +366,8 @@ export function governorForBackend(backend: TurnBackend, model: string, deps?: G
 export function resetGovernorRegistry(): void {
   registry.clear();
   globalInFlight = 0;
+  // P-021: drop runtime floor overrides + restore the default AIMD curve so a test starts baked.
+  for (const k of Object.keys(providerFloorOverrides)) delete providerFloorOverrides[k as TurnProvider];
+  aimdCleanTurnsPerStep = AIMD_CLEAN_TURNS_PER_STEP;
+  aimdDecreaseFactor = 0.5;
 }
