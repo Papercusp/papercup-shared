@@ -14,6 +14,8 @@ import {
   recordPenalty,
   recordHeaders,
   effectiveRpmFactor,
+  effectiveRpm,
+  effectivePaceMs,
   RateLimitGovernor,
   ROLLING_WINDOW_REPROBE_MS,
   ROLLING_WINDOW_REPROBE_MAX_MS,
@@ -288,6 +290,37 @@ test('SMOOTHING (smoothRpm) — spaces the per-minute allowance so it cannot fir
   recordRate(smooth, now + 1000);
   const d2 = decideRate(smooth, now + 1001);
   assert.ok(d2.waitMs >= 1900 && d2.waitMs <= 2000, `a learned-down account paces wider (~2000ms; got ${d2.waitMs})`);
+});
+
+// P-005 — effectiveRpm + effectivePaceMs are the SINGLE SOURCE OF TRUTH the rate gate enforces AND
+// /stats surfaces, so "is smoothing actually working" is data, not inference.
+test('effectiveRpm — floor(rpm × time-decayed factor); null when no rpm floor', () => {
+  const now = 1_000_000;
+  assert.equal(effectiveRpm(initGovernorState({ maxConcurrent: 10, rpm: 60 }), now), 60, 'at the full floor');
+  assert.equal(effectiveRpm(initGovernorState({ maxConcurrent: 10 }), now), null, 'no rpm floor → null');
+  const learned = initGovernorState({ maxConcurrent: 10, rpm: 60 });
+  learned.rpmFactor = 0.5;
+  learned.rpmFactorAt = now;
+  assert.equal(effectiveRpm(learned, now), 30, 'a learned-down account → floor×factor (60×0.5)');
+});
+
+test('effectivePaceMs — 0 when not smoothing; WINDOW/effRpm once smoothRpm is engaged; matches the gate', () => {
+  const now = 1_000_000;
+  const off = initGovernorState({ maxConcurrent: 100, rpm: 60 });
+  assert.equal(effectivePaceMs(off, now), 0, 'no smoothing, no header pace → 0 (free burst)');
+  const on = initGovernorState({ maxConcurrent: 100, rpm: 60 });
+  on.smoothRpm = true;
+  assert.equal(effectivePaceMs(on, now), 1000, '60rpm smoothed → 1000ms between requests');
+  on.rpmFactor = 0.5;
+  on.rpmFactorAt = now;
+  assert.equal(effectivePaceMs(on, now), 2000, 'learned-down to 30rpm → 2000ms — 429-learning tightens the pace');
+  // The helper IS what decideRate gates on: after a request, a back-to-back call is held by exactly this pace.
+  recordRate(on, now);
+  assert.equal(decideRate(on, now + 1).waitMs, 2000 - 1, 'the gate enforces the same effectivePaceMs value');
+  // A non-smoothing header pace is honored unchanged (the floor only RAISES, never lowers, the pace).
+  const hdr = initGovernorState({ maxConcurrent: 100, rpm: 60 });
+  hdr.paceDelayMs = 250;
+  assert.equal(effectivePaceMs(hdr, now), 250, 'header pace passes through when smoothing is off');
 });
 
 test('penalize({transport:true}) — tags the pause source "transport" and does NOT shrink fleet AIMD (a flaky proxy ≠ rate pressure, 2026-06-22)', () => {

@@ -195,6 +195,30 @@ export function effectiveRpmFactor(s: GovernorState, now: number): number {
   return Math.min(1, base + since / RPM_AIMD_RECOVER_MS);
 }
 
+/** PURE: the effective per-minute REQUEST allowance at `now` = floor(rpm × time-decayed factor), or
+ *  `null` when no rpm floor is configured. The per-minute COUNT gate caps the rate to this; smoothing
+ *  only reshapes WHEN those requests fire within the minute. SINGLE source of truth — decideRate gates
+ *  on it AND /stats surfaces it (hive-inference-gateway P-005). */
+export function effectiveRpm(s: GovernorState, now: number): number | null {
+  if (s.limits.rpm === undefined) return null;
+  return Math.max(1, Math.floor(s.limits.rpm * effectiveRpmFactor(s, now)));
+}
+
+/** PURE: the EFFECTIVE inter-request pace (ms) the rate gate enforces between acquisitions at `now`.
+ *  It is the header-driven `paceDelayMs`, RAISED to the smoothing floor WINDOW_MS/effRpm when smoothRpm
+ *  is engaged (so a subscription account's per-minute allowance is spread evenly instead of firing as an
+ *  instant burst that trips the sub-minute 429). 0 = no pacing enforced. SINGLE source of truth —
+ *  decideRate ENFORCES this value and /stats SURFACES it, so "is pacing actually working?" is data, not
+ *  inference (hive-inference-gateway P-005). */
+export function effectivePaceMs(s: GovernorState, now: number): number {
+  let pace = s.paceDelayMs;
+  const eff = effectiveRpm(s, now);
+  if (s.smoothRpm && eff !== null) {
+    pace = Math.max(pace, Math.ceil(WINDOW_MS / eff));
+  }
+  return pace;
+}
+
 /** PURE: the CONCURRENCY gate only (the per-process burst lever). Split out from `decideAcquire`
     so the cross-process store (RB-007) can run the RATE gate against the shared row while keeping
     concurrency local. */
@@ -221,7 +245,7 @@ export function decideRate(s: GovernorState, now: number, est: TokenEstimate = {
   if (s.limits.rpm !== undefined) {
     // ADAPTIVE rpm (2026-06-22): pace to the account's LEARNED rate (floor × time-decayed factor), not just the
     // static floor — so a soft-throttled account is held under its real sustainable rate instead of re-429ing.
-    const effRpm = Math.max(1, Math.floor(s.limits.rpm * effectiveRpmFactor(s, now)));
+    const effRpm = effectiveRpm(s, now) as number; // non-null: limits.rpm is defined here
     if (u.req + 1 > effRpm) return { allowed: false, waitMs: Math.max(1, msToWindowReset), reason: 'rpm' };
   }
   if (s.limits.itpm !== undefined && u.inTok + inTok > s.limits.itpm) {
@@ -238,11 +262,7 @@ export function decideRate(s: GovernorState, now: number, est: TokenEstimate = {
   // limit (the bare-burst 429 storm). When smoothRpm is on, floor the pace at WINDOW_MS/effRpm so the
   // SAME per-minute allowance is spread evenly. Throughput-neutral (the count gate still caps the rate);
   // it only reshapes the burst. effRpm follows the learned rpmFactor, so 429-learning tightens it too.
-  let pace = s.paceDelayMs;
-  if (s.smoothRpm && s.limits.rpm !== undefined) {
-    const effRpm = Math.max(1, Math.floor(s.limits.rpm * effectiveRpmFactor(s, now)));
-    pace = Math.max(pace, Math.ceil(WINDOW_MS / effRpm));
-  }
+  const pace = effectivePaceMs(s, now);
   if (pace > 0) {
     const nextAllowedAt = s.lastAcquireAt + pace;
     if (now < nextAllowedAt) return { allowed: false, waitMs: nextAllowedAt - now, reason: 'pace' };
