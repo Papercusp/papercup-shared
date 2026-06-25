@@ -352,6 +352,8 @@ export const DEFAULT_GATEWAY_PRIORITY_MAP: PriorityTierMap = {
   interactive: 1,
   su: 2,
   bee: 3,
+  gym: 4,
+  benchmark: 4,
   default: DEFAULT_TIER,
 };
 
@@ -402,16 +404,19 @@ export function tiersOfMap(map: PriorityTierMap = DEFAULT_GATEWAY_PRIORITY_MAP):
 }
 
 /** Steady-state per-tier in-flight caps for a pool of `poolSlots`. Tier 1 may use the WHOLE pool (it is
- *  the protected interactive lane); every tier > 1 is capped at `poolSlots - reserve` so it can never
- *  consume the slots held open for tier 1. `reserve = max(1, ceil(poolSlots * reserveFrac))`. The caps
- *  are a *ceiling* — the reserved-floor rule in the queue is the hard tier-1 guarantee; these caps just
- *  stop a single non-tier-1 band from monopolising the shared pool. */
+ *  the protected interactive lane). Tiers 2-3 may use the shared pool (`poolSlots - reserve`) so SU and
+ *  implementation bees can restore the fleet quickly. Lower bands are progressively bounded so high-volume
+ *  benchmark/gym/default egress has its own frame but cannot occupy every shared slot. */
 export function defaultTierCaps(poolSlots: number, tiers: number[], reserveFrac = 0.15): { caps: Record<number, number>; reserve: number } {
   const slots = Math.max(1, Math.floor(poolSlots));
   const reserve = Math.max(1, Math.ceil(slots * Math.max(0, reserveFrac)));
   const sharedCap = Math.max(1, slots - reserve);
   const caps: Record<number, number> = {};
-  for (const t of tiers) caps[t] = t <= 1 ? slots : sharedCap;
+  for (const t of tiers) {
+    if (t <= 1) caps[t] = slots;
+    else if (t <= 3) caps[t] = sharedCap;
+    else caps[t] = Math.max(1, Math.ceil(sharedCap / (t - 2)));
+  }
   return { caps, reserve };
 }
 

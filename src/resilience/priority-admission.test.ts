@@ -150,6 +150,8 @@ test('tierOf — role map, numeric label, bare-numeric string, unknown → defau
   assert.equal(tierOf('overwatch'), 1);
   assert.equal(tierOf('su'), 2);
   assert.equal(tierOf('bee'), 3);
+  assert.equal(tierOf('gym'), 4);
+  assert.equal(tierOf('benchmark'), 4);
   assert.equal(tierOf('worker'), DEFAULT_TIER, 'unknown role → default band');
   assert.equal(tierOf(undefined), DEFAULT_TIER);
   assert.equal(tierOf(''), DEFAULT_TIER);
@@ -180,7 +182,7 @@ function mapLower(m: Record<string, number>): Record<string, number> {
 }
 
 test('tiersOfMap — distinct tiers incl. default, ascending', () => {
-  assert.deepEqual(tiersOfMap(DEFAULT_GATEWAY_PRIORITY_MAP), [1, 2, 3, 4]);
+  assert.deepEqual(tiersOfMap(DEFAULT_GATEWAY_PRIORITY_MAP), [1, 2, 3, 4, 5]);
 });
 
 test('H11 (2026-06-23): setMaxConcurrent RESCALES the tier-1 reserve proportionally — the AIMD floor no longer starves tiers >1', () => {
@@ -196,32 +198,34 @@ test('H11 (2026-06-23): setMaxConcurrent RESCALES the tier-1 reserve proportiona
   assert.equal(q.snapshot().tier1Reserve, 4, 'recovery: reserve scales back to 4');
 });
 
-test('defaultTierCaps — tier 1 gets the whole pool; tier>1 capped to pool-reserve; reserve=ceil(slots*frac), min 1', () => {
-  const { caps, reserve } = defaultTierCaps(20, [1, 2, 3, 4], 0.15);
+test('defaultTierCaps — tier 1 gets the whole pool; implementation tiers share; benchmark/default bands are bounded', () => {
+  const { caps, reserve } = defaultTierCaps(20, [1, 2, 3, 4, 5], 0.15);
   assert.equal(reserve, 3, 'ceil(20*0.15)=3');
   assert.equal(caps[1], 20, 'tier 1 may use the whole pool');
-  assert.equal(caps[2], 17, 'tier>1 capped at pool - reserve');
+  assert.equal(caps[2], 17, 'tier 2 may use the shared pool');
   assert.equal(caps[3], 17);
-  assert.equal(caps[4], 17);
+  assert.equal(caps[4], 9, 'benchmark/gym tier gets a bounded frame');
+  assert.equal(caps[5], 6, 'unlabeled/default traffic is more tightly bounded than benchmark/gym');
   // reserve floored at 1 even for a tiny pool / tiny frac
   assert.equal(defaultTierCaps(2, [1, 2], 0).reserve, 1, 'reserve never below 1');
   assert.equal(defaultTierCaps(2, [1, 2], 0).caps[2], 1, 'shared cap never below 1');
 });
 
 test('shedTierCaps — sheds the bottom band(s) first, holds tier 1, floor of 1', () => {
-  const base = { 1: 20, 2: 17, 3: 17, 4: 17 };
+  const base = { 1: 20, 2: 17, 3: 17, 4: 9, 5: 6 };
   // shed 0 → unchanged
   assert.deepEqual(shedTierCaps(base, 0), base);
-  // shed 5 → all from tier 4 (most sheddable) first
-  assert.deepEqual(shedTierCaps(base, 5), { 1: 20, 2: 17, 3: 17, 4: 12 });
-  // shed 20 → tier 4 to floor 1 (−16), then tier 3 (−4)
-  assert.deepEqual(shedTierCaps(base, 20), { 1: 20, 2: 17, 3: 13, 4: 1 });
+  // shed 5 → all from tier 5 (most sheddable) first
+  assert.deepEqual(shedTierCaps(base, 5), { 1: 20, 2: 17, 3: 17, 4: 9, 5: 1 });
+  // shed 12 → tier 5 to floor 1 (−5), then tier 4 (−7)
+  assert.deepEqual(shedTierCaps(base, 12), { 1: 20, 2: 17, 3: 17, 4: 2, 5: 1 });
   // an extreme shed pins every non-tier-1 band at 1 but NEVER touches tier 1
   const extreme = shedTierCaps(base, 1000);
   assert.equal(extreme[1], 20, 'tier 1 is never reduced');
   assert.equal(extreme[2], 1);
   assert.equal(extreme[3], 1);
   assert.equal(extreme[4], 1);
+  assert.equal(extreme[5], 1);
 });
 
 test('reserved tier-1 FLOOR holds — a saturated low tier cannot crowd out tier 1', async () => {
