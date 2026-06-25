@@ -339,7 +339,7 @@ export function priorityFromLabel(label: string | number | undefined): number {
 export type PriorityTierMap = Record<string, number>;
 
 /** The fallback band for any role not named in the map (the most-sheddable lane). */
-export const DEFAULT_TIER = 4;
+export const DEFAULT_TIER = 5;
 
 /** Default role → tier map (gateway-priority-tiers-2026-06-22). Env-overridable via
  *  `GATEWAY_PRIORITY_MAP` (a JSON object of `role: tier`, merged over these defaults), parsed by
