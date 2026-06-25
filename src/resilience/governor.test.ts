@@ -623,6 +623,21 @@ test('RateLimitGovernor[store] — the shared RPM window is enforced across both
   assert.ok(clock - start >= MIN - 1, `expected to wait ~a window, waited ${clock - start}ms`);
 });
 
+test('RateLimitGovernor[store] — local smoothRpm is enforced inside the shared-row decision', async () => {
+  let clock = 1_000;
+  const store = makeMemStore();
+  const deps = { now: () => clock, sleep: async (ms: number) => { clock += ms; }, store, storeKey: 'anthropic:opus@acct' };
+  const g = new RateLimitGovernor({ maxConcurrent: 5, rpm: 60 }, deps);
+  g.state.smoothRpm = true;
+
+  (await g.acquire({}))!();
+  const start = clock;
+  (await g.acquire({}))!();
+
+  assert.ok(clock - start >= 1_000, `smoothRpm should pace the shared acquire by ~1000ms, waited ${clock - start}ms`);
+  assert.equal(store.rows.get('anthropic:opus@acct')!.smoothRpm, true, 'shared decision row carries the runtime smoothing flag');
+});
+
 test('RateLimitGovernor.snapshot — returns an independent copy of the state', () => {
   const g = new RateLimitGovernor({ maxConcurrent: 2, rpm: 10 }, { now: () => 0 });
   g.penalize({ retryAfterMs: 5_000 });

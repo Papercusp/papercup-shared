@@ -666,6 +666,10 @@ export class RateLimitGovernor {
           let rateReason: AcquireDecision['reason'];
           try {
             const shared = await this.store.transact(this.storeKey!, this.floor, (s) => {
+              // Local runtime shaping flags are process configuration, not persisted budget state.
+              // Apply them to the shared row before deciding, or PG-backed gateway governors silently
+              // lose smoothRpm and can still fire a sub-minute burst.
+              s.smoothRpm = this.state.smoothRpm;
               const rd = decideRate(s, this.now(), est, opts.allowSoftPaused);
               rateAllowed = rd.allowed;
               rateWait = rd.waitMs;
