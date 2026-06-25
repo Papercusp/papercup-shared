@@ -190,6 +190,8 @@ test('H11 (2026-06-23): setMaxConcurrent RESCALES the tier-1 reserve proportiona
   // reserved for tier 1, leaving su + every bee tier ONE shared slot. Now it rescales to round(4 × 4/24) = 1.
   q.setMaxConcurrent(4);
   assert.equal(q.snapshot().tier1Reserve, 1, 'floor: reserve rescaled to 1 → tiers >1 keep 3 of 4 slots, not 1');
+  q.setMaxConcurrent(2);
+  assert.equal(q.snapshot().tier1Reserve, 1, 'tiny live pool: reserve remains 1 so tier 1 still has a floor');
   q.setMaxConcurrent(24); // recovery restores the proportional reserve
   assert.equal(q.snapshot().tier1Reserve, 4, 'recovery: reserve scales back to 4');
 });

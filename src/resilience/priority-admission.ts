@@ -236,7 +236,11 @@ export class PriorityAdmissionQueue {
     // just re-clamp the absolute reserve — else when the AIMD shrinks the cap to the floor, a 15%-of-24 reserve
     // (=4) stays ~4 and becomes 3-of-4 live slots (75%), starving su + every bee tier to ONE shared slot exactly
     // when the fleet most needs throughput. clampReserve still guarantees ≥1 shared slot stays open.
-    if (this.tiered) this.tier1Reserve = this.clampReserve(Math.round(this.maxConcurrent * this.reserveFrac));
+    if (this.tiered) {
+      const scaled = Math.round(this.maxConcurrent * this.reserveFrac);
+      const reserve = this.reserveFrac > 0 && this.maxConcurrent > 1 ? Math.max(1, scaled) : scaled;
+      this.tier1Reserve = this.clampReserve(reserve);
+    }
     this.pump();
   }
 
