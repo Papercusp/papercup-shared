@@ -4,7 +4,7 @@
  */
 import { test, afterEach } from 'vitest';
 import assert from 'node:assert/strict';
-import { normalizeModelForClaude, headersToRecord, buildSystemParam, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, GATEWAY_PRIORITY_HEADER } from './chat-stream';
+import { normalizeModelForClaude, headersToRecord, buildSystemParam, CLAUDE_CODE_IDENTIFIER, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, GATEWAY_PRIORITY_HEADER } from './chat-stream';
 
 // priorityTierHeaders (gateway-priority-tiers): the in-process anthropic-direct call
 // stamps `x-papercusp-priority: <role>` so the pacing gateway tiers it (scout/queen=1)
@@ -94,19 +94,26 @@ test('normalizeModelForClaude — empty in → empty out', () => {
   assert.equal(normalizeModelForClaude(''), '');
 });
 
-// buildSystemParam (RB-008): the stable system prefix is sent as a cache_control:ephemeral
-// block so repeat calls (gym judge / sim-user) cache-read it (cache-read input tokens don't
-// count toward ITPM). Off-switch returns the bare string (transport that rejects the field).
+// buildSystemParam (RB-008 + claude-code-system-framing 2026-06-30): the FIRST block is ALWAYS the
+// Claude Code identifier (auth-bucket framing — a Max-OAuth request without it is 429-shunted, esp.
+// opus), then the caller's stable prefix as a cache_control:ephemeral block so repeat calls cache-read
+// it. Off-switch keeps the block-array form (no cache_control) — the identifier must still be present.
 afterEach(() => {
   delete process.env.PAPERCUSP_PROMPT_CACHE;
   delete process.env.PAPERCUSP_PROMPT_CACHE_TTL;
 });
-test('buildSystemParam — caching on (default) → single ephemeral text block', () => {
-  const r = buildSystemParam('frozen rubric', true);
-  assert.deepEqual(r, [{ type: 'text', text: 'frozen rubric', cache_control: { type: 'ephemeral' } }]);
+const CC = { type: 'text', text: CLAUDE_CODE_IDENTIFIER };
+test('buildSystemParam — caching on (default) → [Claude Code id, ephemeral prefix]', () => {
+  assert.deepEqual(buildSystemParam('frozen rubric', true), [
+    CC,
+    { type: 'text', text: 'frozen rubric', cache_control: { type: 'ephemeral' } },
+  ]);
 });
-test('buildSystemParam — caching off → bare string (no cache_control)', () => {
-  assert.equal(buildSystemParam('frozen rubric', false), 'frozen rubric');
+test('buildSystemParam — caching off → [Claude Code id, bare prefix block] (no cache_control)', () => {
+  assert.deepEqual(buildSystemParam('frozen rubric', false), [CC, { type: 'text', text: 'frozen rubric' }]);
+});
+test('buildSystemParam — empty prompt still frames as Claude Code (the headless-429 fix)', () => {
+  assert.deepEqual(buildSystemParam(''), [CC]);
 });
 test('promptCacheEnabled — defaults ON, OFF only when PAPERCUSP_PROMPT_CACHE=0', () => {
   delete process.env.PAPERCUSP_PROMPT_CACHE;
@@ -118,17 +125,19 @@ test('promptCacheEnabled — defaults ON, OFF only when PAPERCUSP_PROMPT_CACHE=0
 });
 test('buildSystemParam — honors the env flag when no explicit arg', () => {
   process.env.PAPERCUSP_PROMPT_CACHE = '0';
-  assert.equal(buildSystemParam('x'), 'x');
+  assert.deepEqual(buildSystemParam('x'), [CC, { type: 'text', text: 'x' }]);
   process.env.PAPERCUSP_PROMPT_CACHE = '1';
-  assert.deepEqual(buildSystemParam('x'), [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral' } }]);
+  assert.deepEqual(buildSystemParam('x'), [CC, { type: 'text', text: 'x', cache_control: { type: 'ephemeral' } }]);
 });
 test('buildSystemParam — PAPERCUSP_PROMPT_CACHE_TTL=1h opts into the 1-hour cache window (P-006)', () => {
-  // default (unset) = 5m, no ttl field → byte-identical to today
+  // default (unset) = 5m, no ttl field on the caller block
   assert.deepEqual(buildSystemParam('frozen rubric', true), [
+    CC,
     { type: 'text', text: 'frozen rubric', cache_control: { type: 'ephemeral' } },
   ]);
   process.env.PAPERCUSP_PROMPT_CACHE_TTL = '1h';
   assert.deepEqual(buildSystemParam('frozen rubric', true), [
+    CC,
     { type: 'text', text: 'frozen rubric', cache_control: { type: 'ephemeral', ttl: '1h' } },
   ]);
 });

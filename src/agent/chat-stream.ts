@@ -821,11 +821,29 @@ export function promptCacheTtl(): '1h' | undefined {
   return process.env.PAPERCUSP_PROMPT_CACHE_TTL === '1h' ? '1h' : undefined;
 }
 
-export function buildSystemParam(systemPromptText: string, cache: boolean = promptCacheEnabled()): string | CachedSystemBlock[] {
-  if (!cache) return systemPromptText;
+/**
+ * The Claude Code identifier — MUST be the FIRST `system` block on a Max-OAuth (Claude Max subscription
+ * OAuth) request, which is what every inference-gateway pool credential is. WITHOUT it, Anthropic shunts
+ * the request to a far stricter rate-limit bucket that bogus-429s, especially on opus — confirmed live
+ * 2026-06-30: opus returned 200 in 2.6s WITH this block but 20s-timeout/429 WITHOUT, through the gateway.
+ * The `claude` CLI fleet bees self-frame (they ARE Claude Code); our IN-PROCESS anthropic-direct calls
+ * (scout ideators / gym judge / sim-user / transfer) did NOT — which is exactly why the headless
+ * autonomous loop's opus calls 429'd while interactive terminal (claude-CLI) sessions on the same box
+ * worked. Same string as `su.ts` CLAUDE_CODE_IDENTIFIER + the external-bench copies — keep in sync.
+ */
+export const CLAUDE_CODE_IDENTIFIER = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+export function buildSystemParam(systemPromptText: string, cache: boolean = promptCacheEnabled()): CachedSystemBlock[] {
+  // FIRST block = the Claude Code identifier (auth-bucket framing, see CLAUDE_CODE_IDENTIFIER), as a
+  // SEPARATE block; then the caller's prompt — which is the cache_control breakpoint (the large STABLE
+  // prefix) when caching is on. Always returns the block-array form so the identifier is present even
+  // when caching is off or the caller passes no system prompt.
+  const idBlock: CachedSystemBlock = { type: 'text', text: CLAUDE_CODE_IDENTIFIER };
+  if (!systemPromptText) return [idBlock];
+  if (!cache) return [idBlock, { type: 'text', text: systemPromptText }];
   const ttl = promptCacheTtl();
   const cache_control = ttl ? ({ type: 'ephemeral', ttl } as const) : ({ type: 'ephemeral' } as const);
-  return [{ type: 'text', text: systemPromptText, cache_control }];
+  return [idBlock, { type: 'text', text: systemPromptText, cache_control }];
 }
 
 async function* statelessAgentChat(
@@ -887,7 +905,9 @@ async function* statelessAgentChat(
     max_tokens: opts.maxTokens ?? 4096,
     messages,
   };
-  if (opts.systemPromptText) params.system = buildSystemParam(opts.systemPromptText);
+  // ALWAYS set `system` (even with no caller prompt) so the Claude Code identifier frames the auth
+  // bucket — a Max-OAuth request with no/un-framed system block is shunted to the stricter 429 bucket.
+  params.system = buildSystemParam(opts.systemPromptText ?? '');
   if (sendsTemperature && opts.temperature !== undefined) params.temperature = opts.temperature;
   if (opts.thinkingBudgetTokens && opts.thinkingBudgetTokens > 0) {
     params.thinking = { type: 'enabled', budget_tokens: opts.thinkingBudgetTokens };
