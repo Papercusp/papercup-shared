@@ -6,13 +6,14 @@
  * clean env slice. (The runAgentChat generator itself is a subprocess/SSE
  * integration surface and is out of scope for this unit lane.)
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   resolveBackend,
   resolveAgentBin,
   tokenIsLive,
   chooseStatelessTransport,
   resolveAnthropicBaseUrl,
+  resolveRouteAccountId,
   isConnectionFailure,
   isAuthFailure,
   type AgentBackend,
@@ -198,6 +199,53 @@ describe('isConnectionFailure (EI-281)', () => {
     expect(isConnectionFailure(new Error('529 {"type":"overloaded_error"}'))).toBe(false);
     expect(isConnectionFailure(new Error('401 unauthorized'))).toBe(false);
     expect(isConnectionFailure(new Error('rate limited'))).toBe(false);
+  });
+});
+
+// autonomous-loop-hardening B4/F5 — a single-account PIN on the in-process anthropic-direct
+// path has no 429 failover. The pin is honored (value unchanged) but made LOUD (a one-shot
+// warn) so the footgun that silently gated the scout circuit can't recur silently.
+describe('resolveRouteAccountId (B4/F5 hard-pin footgun guard)', () => {
+  const KEY = 'PAPERCUSP_ROUTE_ACCOUNT';
+  let savedPin: string | undefined;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    savedPin = process.env[KEY];
+    delete process.env[KEY];
+    // The suite runs vitest-fail-on-console; the guard's one-shot warn is expected here.
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    warnSpy.mockRestore();
+    if (savedPin === undefined) delete process.env[KEY];
+    else process.env[KEY] = savedPin;
+  });
+
+  it('returns the trimmed pin when set, undefined when unset/blank', () => {
+    expect(resolveRouteAccountId()).toBeUndefined();
+    process.env[KEY] = '  aviynw6  ';
+    expect(resolveRouteAccountId()).toBe('aviynw6');
+    process.env[KEY] = '   ';
+    expect(resolveRouteAccountId()).toBeUndefined();
+  });
+
+  it('warns exactly ONCE per process when a pin is set (loud, not spammy)', async () => {
+    // Fresh module instance so the one-shot warn flag starts un-fired.
+    vi.resetModules();
+    const mod = await import('./chat-stream');
+    process.env[KEY] = 'aviynw6';
+    expect(mod.resolveRouteAccountId()).toBe('aviynw6');
+    expect(mod.resolveRouteAccountId()).toBe('aviynw6'); // 2nd call
+    const pinWarns = warnSpy.mock.calls.filter((c) => String(c[0]).includes('PAPERCUSP_ROUTE_ACCOUNT'));
+    expect(pinWarns.length).toBe(1); // one-shot, both calls returned the value
+  });
+
+  it('does NOT warn when no pin is set', async () => {
+    vi.resetModules();
+    const mod = await import('./chat-stream');
+    expect(mod.resolveRouteAccountId()).toBeUndefined();
+    const pinWarns = warnSpy.mock.calls.filter((c) => String(c[0]).includes('PAPERCUSP_ROUTE_ACCOUNT'));
+    expect(pinWarns.length).toBe(0);
   });
 });
 

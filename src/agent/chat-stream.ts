@@ -662,8 +662,23 @@ export const ROUTE_ACCOUNT_HEADER = 'x-papercusp-account';
  * poisoning the global opus bucket. Empty/unset ⇒ no header ⇒ the gateway routes to active() (today's
  * behavior). Env-based to keep this lib free of an operator-core import (mirrors `resolveAnthropicBaseUrl`).
  */
+let routePinWarned = false;
 export function resolveRouteAccountId(): string | undefined {
   const v = process.env.PAPERCUSP_ROUTE_ACCOUNT?.trim();
+  // Loud footgun guard (autonomous-loop-hardening B4/F5): a single-account PIN on the
+  // in-process anthropic-direct path has NO failover — if that one account hits its rate
+  // window, in-process calls 429 with nothing to fall back on (this silently gated the
+  // scout-cycle circuit). The gateway auto-routes + fails over; this pin bypasses that. The
+  // owner mandate is pool AUTO-routing, so a set pin should be rare + deliberate — make it
+  // loud (once per process) rather than silent. Warn does not change behavior.
+  if (v && !routePinWarned) {
+    routePinWarned = true;
+    console.warn(
+      `[route-account] ⚠ PAPERCUSP_ROUTE_ACCOUNT pins in-process anthropic-direct egress to a SINGLE ` +
+        `pool account ('${v}') with NO 429 failover (autonomous-loop-hardening B4/F5). The owner mandate ` +
+        `is gateway auto-routing across the pool — leave this UNSET unless deliberately/temporarily pinning.`,
+    );
+  }
   return v || undefined;
 }
 
