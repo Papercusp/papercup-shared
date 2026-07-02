@@ -78,9 +78,20 @@ describe('resolveBackend', () => {
     expect(resolveBackend(opts())).toBe('omp');
   });
 
-  it('AGENT_BACKEND env beats an inferable agentCmd', () => {
+  it('an inferable agentCmd beats a stale AGENT_BACKEND env', () => {
+    process.env.AGENT_BACKEND = 'claude-code';
+    expect(resolveBackend(opts({ agentCmd: 'codex' }))).toBe('codex');
+  });
+
+  it('an inferable AGENT_CMD env beats a stale AGENT_BACKEND env', () => {
+    process.env.AGENT_BACKEND = 'claude-code';
+    process.env.AGENT_CMD = 'codex';
+    expect(resolveBackend(opts())).toBe('codex');
+  });
+
+  it('AGENT_BACKEND env still applies when no command is inferable', () => {
     process.env.AGENT_BACKEND = 'anthropic-direct';
-    expect(resolveBackend(opts({ agentCmd: 'claude' }))).toBe('anthropic-direct');
+    expect(resolveBackend(opts({ agentCmd: 'some-unknown-bin' }))).toBe('anthropic-direct');
   });
 
   it('defaults to omp when nothing resolves', () => {

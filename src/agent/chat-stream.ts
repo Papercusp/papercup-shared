@@ -170,24 +170,30 @@ function maybeBootstrap(): void {
 }
 
 /**
- * Resolve which backend to drive. Explicit opt > AGENT_BACKEND env >
- * inferred from the binary name. Default fallback: omp.
+ * Resolve which backend to drive. Explicit opt > inferred from the
+ * configured agent binary > AGENT_BACKEND env > default fallback omp.
+ *
+ * The binary wins over AGENT_BACKEND because the spawn path must match the
+ * executable's CLI surface. A stale env/backend label paired with a different
+ * AGENT_CMD is worse than ignoring the label: it sends the wrong flag set
+ * (e.g. Claude flags to `codex exec`) and the brain dies before producing
+ * output.
  *
  * Exported so non-runAgentChat callers with their own bespoke stream
  * parser can resolve the backend identically.
  */
 export function resolveBackend(opts: RunAgentChatOptions): AgentBackend {
   if (opts.backend) return opts.backend;
-  const env = (process.env.AGENT_BACKEND ?? '').trim().toLowerCase();
-  if (env === 'omp' || env === 'pi') return 'omp';
-  if (env === 'claude-code' || env === 'claude') return 'claude-code';
-  if (env === 'anthropic-direct') return 'anthropic-direct';
-  if (env === 'codex') return 'codex';
   const cmd = opts.agentCmd ?? process.env.AGENT_CMD ?? process.env.CLAUDE_CMD ?? '';
   const first = cmd.split(/\s+/).filter(Boolean)[0] ?? '';
   if (/(?:^|\/)(omp|pi)$/.test(first)) return 'omp';
   if (/(?:^|\/)claude$/.test(first)) return 'claude-code';
   if (/(?:^|\/)codex$/.test(first)) return 'codex';
+  const env = (process.env.AGENT_BACKEND ?? '').trim().toLowerCase();
+  if (env === 'omp' || env === 'pi') return 'omp';
+  if (env === 'claude-code' || env === 'claude') return 'claude-code';
+  if (env === 'anthropic-direct') return 'anthropic-direct';
+  if (env === 'codex') return 'codex';
   return 'omp';
 }
 
