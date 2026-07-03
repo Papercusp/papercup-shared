@@ -319,3 +319,55 @@ test('setTierCap raises admission live (tier-aware un-shed)', async () => {
   releases.forEach((r) => r());
   await second;
 });
+
+// ── P-005/W3 slot-leak recurrence guard (D-001): `running` must return to 0 after EVERY settle mode ──
+// The gateway wraps each request forward inside `queue.run(...)`, so a leaked admission slot is a task
+// promise that never settles. These pin down the queue's half of the invariant: whatever way a task
+// settles (resolve / handler-error / abort / idle-timeout), its slot frees — and a genuinely stuck task
+// holds exactly its slot (which the gateway's reconcile guard then surfaces), never a miscount.
+
+test('P-005/W3: inFlight returns to 0 after every settle mode (resolve / handler-error / abort / idle-timeout)', async () => {
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 4 });
+  const ac = new AbortController();
+  // (1) normal resolve.
+  const ok = q.run(0, async () => 'ok');
+  // (2) handler-error — the task throws (a proxy handler crash).
+  const boom = q.run(0, async () => {
+    throw new Error('handler crashed');
+  });
+  // (3) abort-driven reject — client-disconnect / hard-ceiling. Mirrors the gateway's own already-aborted
+  //     guard so the abort is race-free regardless of when the task body starts.
+  const aborted = q.run(
+    0,
+    () =>
+      new Promise<void>((_res, rej) => {
+        const onAbort = () => rej(new Error('aborted'));
+        if (ac.signal.aborted) onAbort();
+        else ac.signal.addEventListener('abort', onAbort, { once: true });
+      }),
+  );
+  // (4) idle-timeout — rejects after a short idle deadline.
+  const idle = q.run(0, () => new Promise<void>((_res, rej) => { setTimeout(() => rej(new Error('idle timeout')), 5); }));
+
+  // All four admitted synchronously (running bumped in pump); none has settled yet.
+  assert.equal(q.inFlight, 4, 'four admitted tasks hold four slots');
+
+  ac.abort(); // fire the client-disconnect / ceiling abort
+  await Promise.allSettled([ok, boom, aborted, idle]);
+  await tick(); // let the settle → onSettle → pump microtasks drain
+
+  assert.equal(q.inFlight, 0, 'every settle mode frees its admission slot — no leak');
+});
+
+test('P-005/W3: a task that never settles holds exactly its slot (the real leak, correctly reflected); settling frees it', async () => {
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 2 });
+  let release: () => void = () => {};
+  const stuck = q.run(0, () => new Promise<void>((res) => { release = res; })); // never settles on its own
+  await q.run(0, async () => 'done'); // a sibling completes cleanly
+  await tick();
+  assert.equal(q.inFlight, 1, 'the stuck task pins exactly one slot — running tracks true liveness, not a miscount');
+  release();
+  await stuck;
+  await tick();
+  assert.equal(q.inFlight, 0, 'once the stuck task settles, running returns to 0');
+});
