@@ -105,6 +105,38 @@ test('recovery is NOT stalled by absorbed (sub-threshold) throttles that INTERRU
   assert.equal(c.snapshot().decreases, 1, 'every churn throttle was absorbed by the bucket — no extra decrease');
 });
 
+test('EI-7168: recordHardFailure trips an IMMEDIATE decrease — no threshold buffering like recordThrottle', () => {
+  const changes: number[] = [];
+  const c = new AimdConcurrencyController({ cap: 24, floor: 1, decreaseThreshold: 4, onChange: (n) => changes.push(n) });
+  c.recordHardFailure(); // a SINGLE call trips immediately — contrast with the "lone throttle does nothing" test above
+  assert.equal(c.current, 12, 'one hard failure halves immediately, unlike one throttle');
+  assert.deepEqual(changes, [12]);
+  assert.equal(c.snapshot().hardFailures, 1);
+  assert.equal(c.snapshot().decreases, 1, 'a hard failure counts toward decreases too');
+});
+
+test('EI-7168: recordHardFailure resets cleanStreak (does not let a doomed account ride out on stale recovery progress)', () => {
+  const c = new AimdConcurrencyController({ cap: 16, floor: 1, increaseEvery: 3 });
+  c.recordSuccess();
+  c.recordSuccess(); // cleanStreak=2, one short of the +1 step
+  c.recordHardFailure();
+  assert.equal(c.snapshot().cleanStreak, 0, 'the in-progress clean streak is wiped by a hard failure');
+});
+
+test('EI-7168: hardFailures is tracked SEPARATELY from threshold-tripped decreases', () => {
+  const c = new AimdConcurrencyController({ cap: 32, floor: 1, decreaseThreshold: 4 });
+  for (let i = 0; i < 4; i++) c.recordThrottle(); // 1 threshold-tripped decrease
+  c.recordHardFailure(); // 1 more decrease, this one a hard failure
+  assert.equal(c.snapshot().decreases, 2, 'both count toward lifetime decreases');
+  assert.equal(c.snapshot().hardFailures, 1, 'only the hard failure is attributed separately');
+});
+
+test('recordHardFailure never decreases below the floor', () => {
+  const c = new AimdConcurrencyController({ cap: 4, floor: 2 });
+  for (let i = 0; i < 10; i++) c.recordHardFailure();
+  assert.equal(c.current, 2, 'pinned at the floor, never lower, even under repeated hard failures');
+});
+
 test('floor is clamped to ≥1 and to ≤cap', () => {
   assert.equal(new AimdConcurrencyController({ cap: 10, floor: 0 }).snapshot().floor, 1, 'floor ≥ 1');
   assert.equal(new AimdConcurrencyController({ cap: 4, floor: 99 }).snapshot().floor, 4, 'floor ≤ cap');

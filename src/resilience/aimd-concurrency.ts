@@ -60,6 +60,9 @@ export interface AimdSnapshot {
   decreases: number;
   /** Lifetime count of additive increases. */
   increases: number;
+  /** Lifetime count of `recordHardFailure()` calls (EI-7168) — the subset of `decreases` caused by an
+   *  admitted-then-died request rather than at-the-door throttle pressure crossing the threshold. */
+  hardFailures: number;
 }
 
 export class AimdConcurrencyController {
@@ -74,6 +77,7 @@ export class AimdConcurrencyController {
   private cleanStreak = 0;
   private decreases = 0;
   private increases = 0;
+  private hardFailures = 0;
 
   constructor(opts: AimdConcurrencyOptions) {
     this.cap = Math.max(1, Math.floor(opts.cap));
@@ -160,6 +164,7 @@ export class AimdConcurrencyController {
       cleanStreak: this.cleanStreak,
       decreases: this.decreases,
       increases: this.increases,
+      hardFailures: this.hardFailures,
     };
   }
 }
