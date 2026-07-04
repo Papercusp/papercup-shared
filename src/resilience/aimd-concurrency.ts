@@ -112,6 +112,21 @@ export class AimdConcurrencyController {
     }
   }
 
+  /** Record a HARD, EXPENSIVE failure — a request that was ADMITTED and started processing (billed) then
+   *  died before completing (a mid-stream stream death/stall, a 529 after admission, …) — as opposed to
+   *  `recordThrottle()`'s cheap, at-the-door 429 (EI-7168: asymmetric caution). Unlike `recordThrottle`,
+   *  this bypasses the leaky-bucket "sustained" buffer entirely and trips ONE multiplicative decrease
+   *  IMMEDIATELY, every call — a single admitted-then-died request is itself the expensive signal; there is
+   *  no cheap-noise case to filter out the way there is for a lone bounced 429. Also resets `cleanStreak`
+   *  (same as an actual throttle-trip decrease) so a just-proven-doomed account doesn't ride out on stale
+   *  recovery progress. Tracked separately (`hardFailures`) from `decreases` so a dashboard can tell "shrank
+   *  because of cheap throttle noise" from "shrank because we're burning money on doomed requests" apart. */
+  recordHardFailure(): void {
+    this.cleanStreak = 0;
+    this.hardFailures += 1;
+    this.setEff(Math.max(this.floor, Math.floor(this.eff * this.decreaseFactor)), 'decrease');
+  }
+
   /** Record a clean upstream SUCCESS (a 2xx). Drains the pressure bucket; a run of `increaseEvery`
    *  clean successes earns ONE additive +1 step back toward the cap. */
   recordSuccess(): void {
