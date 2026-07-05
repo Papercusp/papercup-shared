@@ -67,7 +67,7 @@ export interface StatelessUsageEvent {
   costUsd: number;
   /** Lower-cased response headers when the transport exposed them (anthropic-ratelimit-*). */
   headers?: Record<string, string | undefined>;
-  /** The caller's identity for the usage row (EI-7633): whatever the caller passed as
+  /** The caller's identity for the usage row (EI-7625): whatever the caller passed as
    *  `RunAgentChatOptions.usageAttribution`, verbatim. Absent when the caller didn't say. */
   attribution?: StatelessUsageAttribution;
 }

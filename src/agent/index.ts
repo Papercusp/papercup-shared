@@ -24,6 +24,7 @@ export {
   type ChatEvent,
   type RunAgentChatOptions,
   type StatelessUsageEvent,
+  type StatelessUsageAttribution,
 } from './chat-stream';
 
 // Agent-turn robustness (RB-*): the turn-error taxonomy + classifier, the backend governor
