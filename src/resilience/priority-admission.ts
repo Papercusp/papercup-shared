@@ -313,12 +313,14 @@ export function priorityFromLabel(label: string | number | undefined): number {
     case 'interactive':
     case 'operator':
     case 'queen':
+    case 'mug': // pot-rename dual-accept (P1 MIGRATE): additive twin of `queen`
       return 100;
     case 'high':
       return 50;
     case 'low':
     case 'batch':
     case 'bee':
+    case 'cup': // pot-rename dual-accept (P1 MIGRATE): additive twin of `bee`
     case '':
       return 0;
     default: {
@@ -346,12 +348,16 @@ export const DEFAULT_TIER = 5;
  *  `parsePriorityTierMap`. The `default` key sets the fallback band for unnamed roles. */
 export const DEFAULT_GATEWAY_PRIORITY_MAP: PriorityTierMap = {
   queen: 1,
+  mug: 1, // pot-rename dual-accept (P1 MIGRATE): additive twin of `queen`
   scout: 1,
+  blender: 1, // pot-rename dual-accept (P1 MIGRATE): additive twin of `scout`
   overwatch: 1,
+  kettle: 1, // pot-rename dual-accept (P1 MIGRATE): additive twin of `overwatch`
   operator: 1,
   interactive: 1,
   su: 2,
   bee: 3,
+  cup: 3, // pot-rename dual-accept (P1 MIGRATE): additive twin of `bee`
   gym: 4,
   benchmark: 4,
   default: DEFAULT_TIER,
