@@ -67,6 +67,22 @@ export interface StatelessUsageEvent {
   costUsd: number;
   /** Lower-cased response headers when the transport exposed them (anthropic-ratelimit-*). */
   headers?: Record<string, string | undefined>;
+  /** The caller's identity for the usage row (EI-7633): whatever the caller passed as
+   *  `RunAgentChatOptions.usageAttribution`, verbatim. Absent when the caller didn't say. */
+  attribution?: StatelessUsageAttribution;
+}
+
+/** Who/what a stateless LLM call was FOR — attribution the host persists onto the
+ *  `agent_usage_samples` row (role / run_id / session_id / tool_name). Before this seam
+ *  every `source:'headers'` sample was anonymous (~73% of rows), which blinded the
+ *  token-conservation dashboards to the in-process spenders. Free-text `role` names the
+ *  calling feature ('haiku', 'llm-test', 'pr-reviewer', 'memory-extraction', a brain
+ *  persona, …). */
+export interface StatelessUsageAttribution {
+  role?: string;
+  runId?: string;
+  sessionId?: string;
+  toolName?: string;
 }
 let statelessUsageSink: ((ev: StatelessUsageEvent) => void) | undefined;
 /** Install (or clear) the host's usage-telemetry sink. Call once at operator boot. */
@@ -407,6 +423,15 @@ export interface RunAgentChatOptions {
    * to accept.
    */
   model?: string;
+  /**
+   * Attribute this call's usage-telemetry row to the calling feature
+   * (anthropic-direct only — the subprocess backends attribute at the spawn
+   * layer). Flows onto `agent_usage_samples.role/run_id/session_id/tool_name`
+   * via the host's stateless-usage sink; without it a `source:'headers'` row
+   * is anonymous and invisible to per-role spend attribution. Pass at least
+   * `role` (the calling feature's name) on every stateless call.
+   */
+  usageAttribution?: StatelessUsageAttribution;
   /** Aborts the spawn. */
   signal?: AbortSignal;
   /**
@@ -982,6 +1007,7 @@ async function* statelessAgentChat(
         cacheCreationTokens: resp.usage?.cache_creation_input_tokens ?? undefined,
         costUsd,
         headers: headersToRecord(stream.response?.headers),
+        attribution: opts.usageAttribution,
       });
       if (finalText) yield { type: 'delta', text: finalText };
       yield { type: 'result', costUsd, tokensIn: inputTokens, tokensOut: outputTokens, finalText };
@@ -1091,6 +1117,7 @@ async function* governedStatelessChat(
             cacheCreationTokens: resp.usage?.cache_creation_input_tokens ?? undefined,
             costUsd,
             headers,
+            attribution: opts.usageAttribution,
           });
           // Returning headers lets runWithRetry feed governor.recordResponse → header-driven
           // pacing (limits auto-tune, low-headroom soft pacing) activates on API-key paths.
