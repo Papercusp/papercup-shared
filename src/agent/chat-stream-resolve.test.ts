@@ -7,11 +7,16 @@
  * integration surface and is out of scope for this unit lane.)
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   resolveBackend,
   resolveAgentBin,
   tokenIsLive,
   chooseStatelessTransport,
+  probeStatelessTransport,
+  invalidateClaudeTokenCache,
   resolveAnthropicBaseUrl,
   resolveRouteAccountId,
   isConnectionFailure,
@@ -20,7 +25,7 @@ import {
   type RunAgentChatOptions,
 } from './chat-stream';
 
-const ENV_KEYS = ['AGENT_BACKEND', 'AGENT_CMD', 'CLAUDE_CMD'] as const;
+const ENV_KEYS = ['AGENT_BACKEND', 'AGENT_CMD', 'CLAUDE_CMD', 'HOME'] as const;
 const saved: Record<string, string | undefined> = {};
 
 function opts(partial: Partial<RunAgentChatOptions> = {}): RunAgentChatOptions {
@@ -161,6 +166,25 @@ describe('chooseStatelessTransport (EI-281 / EI-399)', () => {
 
   it('no usable credential → null', () => {
     expect(chooseStatelessTransport({ claudeTok: null })).toBeNull();
+  });
+
+  it('probe failure names an unusable OAuth token, not a missing credentials file as the only cause', () => {
+    const home = mkdtempSync(join(tmpdir(), 'papercusp-no-claude-home-'));
+    try {
+      process.env.HOME = home;
+      invalidateClaudeTokenCache();
+
+      const probed = probeStatelessTransport();
+      expect(probed.ok).toBe(false);
+      if (!probed.ok) {
+        expect(probed.error).toContain('no usable Claude OAuth token');
+        expect(probed.error).toContain('missing/unreadable, expired, or lacks claudeAiOauth.accessToken');
+        expect(probed.error).not.toContain('needs a live Claude session');
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      invalidateClaudeTokenCache();
+    }
   });
 });
 
