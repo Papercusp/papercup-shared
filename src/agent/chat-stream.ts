@@ -746,7 +746,9 @@ function resolveStatelessTransport(): StatelessTransport | { error: string } {
   const choice = chooseStatelessTransport({ claudeTok });
   if (choice === 'anthropic-direct') return anthropicDirectTransport(claudeTok!);
   return {
-    error: 'stateless LLM path needs a live Claude session (~/.claude/.credentials.json)',
+    error:
+      'stateless LLM path has no usable Claude OAuth token from ~/.claude/.credentials.json ' +
+      '(file missing/unreadable, expired, or lacks claudeAiOauth.accessToken)',
   };
 }
 
