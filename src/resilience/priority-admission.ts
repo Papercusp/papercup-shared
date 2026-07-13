@@ -150,15 +150,44 @@ export class PriorityAdmissionQueue {
     return this.tierCaps !== null;
   }
 
+  /** Is a MORE IMPORTANT tier (a strictly lower tier number) currently waiting in the queue? Gates
+   *  cap-borrowing below: idle capacity may be lent out, but never over the head of a waiter that
+   *  outranks the borrower. */
+  private hasWaiterAboveTier(tier: number): boolean {
+    for (const w of this.waiters) if (w.tier < tier) return true;
+    return false;
+  }
+
   /** Can a waiter of `tier` be admitted RIGHT NOW given live in-flight + the reserved floor + its cap?
    *  Only consulted when the tier layer is on. */
   private canAdmitTier(tier: number): boolean {
-    // Per-tier in-flight cap.
-    const cap = this.tierCaps!.get(tier);
-    if (cap !== undefined && (this.inFlightByTier.get(tier) ?? 0) >= cap) return false;
-    // Reserved tier-1 floor: tier > 1 may not occupy the slots held open for tier 1.
+    // (1) HARD — the reserved tier-1 floor: tier > 1 may never occupy the slots held open for tier 1.
+    //     Checked FIRST so cap-borrowing below can never erode the interactive guarantee.
     if (tier > 1 && this.running >= this.maxConcurrent - this.tier1Reserve) return false;
-    return true;
+
+    // (2) The per-tier in-flight cap is a GUARANTEED MINIMUM SHARE, not an idle-capacity ceiling.
+    const cap = this.tierCaps!.get(tier);
+    if (cap === undefined || (this.inFlightByTier.get(tier) ?? 0) < cap) return true;
+
+    // (3) AT CAP → BORROW an otherwise-IDLE slot, but only when no more-important tier is waiting.
+    //     WI-4541: the caps were a hard ceiling, so a tier at its cap was refused even with the pool
+    //     nearly EMPTY. That is catastrophic in the real traffic mix, because the two mechanisms
+    //     compound: untagged requests default to the BOTTOM tier (DEFAULT_TIER = 5), and the AIMD
+    //     shed drives the bottom tier's cap down to its floor of 1 (`shedTierCaps`). Measured live on
+    //     2026-07-13: every queued request sat in tier 5 at cap 1 while tiers 2-4 were EMPTY and 9-10
+    //     of 12 slots idled — the whole fleet serialized through ONE admission slot, and the owner's
+    //     voice turn ("processing forever", EI-10795) queued behind it. The shed is meant to squeeze
+    //     BATCH tiers so the interactive lane keeps working; it assumed traffic is spread across
+    //     tiers, and silently became "shed EVERYTHING" once ~all traffic landed in one band.
+    //     This is the sibling of the H11 fix below (which rescued the same starvation on the RESERVE
+    //     axis but left the CAP axis armed).
+    //     Borrowing is safe: the tier-1 reserve is already honoured above, `maxConcurrent` still binds
+    //     in pump(), and a borrowed slot is handed back on completion — pump() re-picks the best
+    //     waiter every settle, so an outranking tier takes the NEXT freed slot. The
+    //     `hasWaiterAboveTier` guard is load-bearing rather than belt-and-braces: pump() orders by
+    //     NUMERIC priority, and `priorityFromLabel` scores su/scout/bee/untagged all 0, so a tier-2
+    //     waiter would NOT otherwise outrank an earlier-queued tier-5 one on priority alone.
+    return !this.hasWaiterAboveTier(tier);
   }
 
   /** Effective priority at `t` — raw priority plus one point per aging interval waited. */
