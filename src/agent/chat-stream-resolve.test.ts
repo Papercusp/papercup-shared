@@ -7,12 +7,13 @@
  * integration surface and is out of scope for this unit lane.)
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import {
   resolveBackend,
   resolveAgentBin,
+  withAgentBinDirs,
   tokenIsLive,
   chooseStatelessTransport,
   probeStatelessTransport,
@@ -304,5 +305,50 @@ describe('isAuthFailure (EI-281 rotated-token retry)', () => {
     expect(isAuthFailure(new Error('rate limited'))).toBe(false);
     // 4013-shaped ids must not false-positive the `<status> ` prefix match.
     expect(isAuthFailure(new Error('40134 bad id'))).toBe(false);
+  });
+});
+
+describe('withAgentBinDirs (EI-11519 stripped-PATH spawn fix)', () => {
+  it('appends well-known per-user bin dirs that exist but are missing from PATH', () => {
+    const home = mkdtempSync(join(tmpdir(), 'wabd-'));
+    try {
+      // Simulate the claude native-installer layout under a fake HOME.
+      const localBin = join(home, '.local', 'bin');
+      mkdirSync(localBin, { recursive: true });
+      const env = { HOME: home, PATH: '/usr/bin:/bin' };
+      const out = withAgentBinDirs(env);
+      const parts = (out.PATH ?? '').split(delimiter);
+      expect(parts[0]).toBe('/usr/bin'); // existing entries win (append, never prepend)
+      expect(parts).toContain(localBin);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('returns the env unchanged when every existing well-known dir is already on PATH', () => {
+    const home = mkdtempSync(join(tmpdir(), 'wabd-'));
+    try {
+      const localBin = join(home, '.local', 'bin');
+      mkdirSync(localBin, { recursive: true });
+      // PATH already carries the only well-known dir that exists under this HOME
+      // (the real linuxbrew dir may exist on the host, so include it too).
+      const env = { HOME: home, PATH: `/usr/bin:${localBin}:/home/linuxbrew/.linuxbrew/bin` };
+      const out = withAgentBinDirs(env);
+      expect(out).toBe(env); // identity — no copy, no mutation
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('does not append well-known dirs that do not exist on disk', () => {
+    const home = mkdtempSync(join(tmpdir(), 'wabd-'));
+    try {
+      // No ~/.local/bin created under this HOME.
+      const env = { HOME: home, PATH: '/usr/bin:/home/linuxbrew/.linuxbrew/bin' };
+      const out = withAgentBinDirs(env);
+      expect(out.PATH).not.toContain(join(home, '.local', 'bin'));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

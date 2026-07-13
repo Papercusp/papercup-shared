@@ -39,7 +39,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, delimiter, join } from 'node:path';
 // Agent-turn robustness (opt-in via PAPERCUSP_AGENT_GOVERNOR=1). These modules are pure +
 // import nothing from this file, so there's no cycle and ~no load cost when the flag is off.
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
@@ -253,6 +253,34 @@ export function resolveAgentBin(opts: RunAgentChatOptions, backend: AgentBackend
   if (backend === 'omp') return 'omp';
   if (backend === 'codex') return 'codex';
   return 'claude';
+}
+
+/**
+ * EI-11519: the operator PROCESS itself may run with a PATH that lacks the
+ * standard per-user install dirs — a Tauri dev shell's spawned operator
+ * inherits the launching shell's env, observed missing `~/.local/bin`,
+ * which is exactly where the claude native installer (>=2.x, 2026-07-11)
+ * puts the `claude` binary. A bare `spawn('claude')` then dies ENOENT and
+ * (before the on('error') fix below) surfaced as an opaque
+ * "claude-code exited ?" with empty stderr, on EVERY chat surface served
+ * by that operator. Fixing one launcher's env would leave the class armed
+ * for the next launcher (systemd units, CI, packaged desktop), so instead
+ * augment the spawn PATH at this shared chokepoint: append the well-known
+ * per-user binary dirs that exist on disk but are missing from PATH.
+ * Existing PATH entries always win (append, never prepend).
+ */
+export function withAgentBinDirs(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const home = env.HOME ?? process.env.HOME ?? homedir();
+  const wellKnown = [
+    join(home, '.local', 'bin'), // claude native installer
+    join(home, '.bun', 'bin'), // bun-installed CLIs (omp)
+    join(home, '.cargo', 'bin'),
+    '/home/linuxbrew/.linuxbrew/bin', // linuxbrew-installed CLIs (codex)
+  ];
+  const cur = (env.PATH ?? '').split(delimiter).filter(Boolean);
+  const missing = wellKnown.filter((d) => !cur.includes(d) && existsSync(d));
+  if (missing.length === 0) return env;
+  return { ...env, PATH: [...cur, ...missing].join(delimiter) };
 }
 
 /**
@@ -1769,7 +1797,10 @@ export async function* runAgentChat(
     child = spawn(command, finalArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: spawnCwd,
-      env: spawnEnv,
+      // EI-11519: augment PATH with the well-known per-user bin dirs so the
+      // agent binary resolves even when the operator's own env is stripped
+      // (Tauri dev shell). See withAgentBinDirs.
+      env: withAgentBinDirs(spawnEnv),
     });
   } catch (e) {
     if (ompAgentDir) {
@@ -2043,8 +2074,18 @@ export async function* runAgentChat(
   let exitCode: number | null = null;
   let exitSignal: NodeJS.Signals | null = null;
   let exited = false;
+  // EI-11519: an async spawn failure (ENOENT — binary not on PATH — being the
+  // classic) lands HERE, not in the try/catch above. Swallowing the error
+  // object made it surface as "<backend> exited ?" with empty stderr — hours
+  // of misdiagnosis. Capture it so the terminal error event names the cause.
+  let spawnErrMsg: string | null = null;
   child.on('exit', (code, signal) => { exitCode = code; exitSignal = signal; exited = true; tick(); });
-  child.on('error', () => { exited = true; tick(); });
+  child.on('error', (e) => {
+    spawnErrMsg = `failed to spawn ${command}: ${(e as Error).message}`;
+    stderrBuf += (stderrBuf ? '\n' : '') + spawnErrMsg;
+    exited = true;
+    tick();
+  });
 
   // RB review #6 — wall-clock turn timeout backstop. A subprocess that hangs (never exits,
   // never streams) would otherwise wedge an un-signaled caller forever; the orchestrator passes
@@ -2149,7 +2190,10 @@ export async function* runAgentChat(
   if (exitCode !== 0) {
     yield {
       type: 'error',
-      message: `${backend} exited ${exitCode ?? '?'}`,
+      // A spawn failure never produced an exit code — name the real cause
+      // (e.g. "failed to spawn claude: spawn claude ENOENT") instead of the
+      // opaque "exited ?" (EI-11519).
+      message: spawnErrMsg ?? `${backend} exited ${exitCode ?? '?'}`,
       stderr: stderrBuf.slice(-800),
       ...(cliTurn ? { turn: cliTurn } : {}),
     };
