@@ -347,8 +347,20 @@ function gatewayPort(): number {
   return Number.isFinite(p) && p > 0 ? p : 8788;
 }
 
-export function codexGatewayConfigToml(accountId: string): string {
+/**
+ * Per-spawn codex model-provider config. `priority` adds the gateway admission-tier
+ * header alongside the account route header — the codex twin of the claude spawn's
+ * ANTHROPIC_CUSTOM_HEADERS line and of `priorityTierHeaders()` for anthropic-direct.
+ * Without it a codex-backed brain spawns UNTIERED into the gateway's lowest default
+ * band, the same starvation that hung the owner's interactive voice (EI-10795); all
+ * three backends must tier identically or the bug just moves to whichever one is
+ * configured.
+ */
+export function codexGatewayConfigToml(accountId: string, priority?: string): string {
   const providerId = 'papercusp-codex-gateway';
+  const label = priority?.trim();
+  const httpHeaders = [`"${ROUTE_ACCOUNT_HEADER}" = "${tomlStr(accountId)}"`];
+  if (label) httpHeaders.push(`"${GATEWAY_PRIORITY_HEADER}" = "${tomlStr(label)}"`);
   return [
     '# Per-spawn codex model provider config (managed by chat-stream.ts).',
     `model_provider = "${providerId}"`,
@@ -358,7 +370,7 @@ export function codexGatewayConfigToml(accountId: string): string {
     `base_url = "http://127.0.0.1:${gatewayPort()}/v1"`,
     'wire_api = "responses"',
     'experimental_bearer_token = "papercusp-gateway"',
-    `http_headers = { "${ROUTE_ACCOUNT_HEADER}" = "${tomlStr(accountId)}" }`,
+    `http_headers = { ${httpHeaders.join(', ')} }`,
     '',
   ].join('\n');
 }
@@ -1378,7 +1390,7 @@ export async function* runAgentChat(
 
       const codexGatewayAccountId = process.env.PAPERCUSP_ACCOUNT_ID?.trim();
       const configParts = [
-        codexGatewayAccountId ? codexGatewayConfigToml(codexGatewayAccountId) : '',
+        codexGatewayAccountId ? codexGatewayConfigToml(codexGatewayAccountId, opts.priority) : '',
         opts.mcpConfig ? codexMcpConfigToml(opts.mcpConfig as ClaudeShapeMcpConfig) : '',
       ].filter(Boolean);
       if (configParts.length > 0) {

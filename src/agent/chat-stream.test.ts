@@ -110,6 +110,24 @@ test('codexGatewayConfigToml — routes Codex model traffic through the account-
   assert.match(toml, /http_headers = \{ "x-papercusp-account" = "codex-main" \}/);
 });
 
+// EI-10795 (codex twin): all three backends must tier identically, or the starvation bug
+// simply moves to whichever backend happens to be configured. A codex brain with no tier
+// label admits in the gateway's lowest default band — the same band that left the owner's
+// interactive voice queued behind the background fleet until it hung.
+test('codexGatewayConfigToml — priority adds x-papercusp-priority beside the account route header', () => {
+  process.env.PAPERCUSP_GATEWAY_PORT = '9898';
+  const toml = codexGatewayConfigToml('codex-main', 'interactive');
+  assert.match(
+    toml,
+    /http_headers = \{ "x-papercusp-account" = "codex-main", "x-papercusp-priority" = "interactive" \}/,
+  );
+});
+test('codexGatewayConfigToml — absent/blank priority → account header only (untiered, byte-identical to before)', () => {
+  process.env.PAPERCUSP_GATEWAY_PORT = '9898';
+  assert.equal(codexGatewayConfigToml('codex-main', '  '), codexGatewayConfigToml('codex-main'));
+  assert.ok(!codexGatewayConfigToml('codex-main').includes('x-papercusp-priority'));
+});
+
 // headersToRecord (P-004): SDK error `.headers` → a lowercased record so the TurnError
 // classifier can read retry-after / anthropic-ratelimit-* off it.
 test('headersToRecord — Headers-like object (forEach) → lowercased record', () => {
