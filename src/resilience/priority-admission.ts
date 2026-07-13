@@ -17,19 +17,31 @@
  * A tier is a small integer where 1 is the HIGHEST band (the interactive/Queen lane) and larger
  * numbers are progressively more sheddable batch bands. The tier layer adds two starvation guarantees
  * a flat priority queue can't make:
- *  - a PER-TIER in-flight cap (`caps`): a flood of one tier can't consume every slot,
+ *  - a PER-TIER in-flight cap (`caps`): a GUARANTEED MINIMUM SHARE for each tier — a flood of one
+ *    tier can't crowd another tier out of the slots it is entitled to,
  *  - a RESERVED tier-1 FLOOR (`tier1Reserve`): a fixed number of slots only tier 1 may ever occupy,
  *    so the interactive lane is never fully crowded out by a saturated batch backlog — the
  *    un-starving piece. Tier > 1 admits only while `running < maxConcurrent - tier1Reserve`; tier 1
  *    may use all `maxConcurrent`.
+ *
+ * WORK-CONSERVING (WI-4541): a per-tier cap is a minimum share, NOT an idle-capacity ceiling. A tier
+ * sitting at its cap may still BORROW a free slot when no more-important tier is waiting for one, and
+ * hands it back on completion. Without this the queue refuses work while the pool idles: untagged
+ * traffic defaults to the BOTTOM tier and the AIMD shed drives the bottom tier's cap to its floor of
+ * 1, so in the real traffic mix (~everything in one band) the two compounded into the whole fleet
+ * running single-file through ONE slot while 9-10 of 12 sat idle. The tier-1 reserve is always
+ * honoured first, so borrowing never erodes the interactive guarantee.
  *
  * Aging still applies WITHIN the queue's priority ordering (its starvation guard for the FIFO pick);
  * the tier layer adds the cross-tier capacity guarantees on top. All domain-free: the gateway maps a
  * role → tier and passes it on `run()`.
  */
 export interface TierAdmissionConfig {
-  /** Max IN-FLIGHT tasks per tier (key = tier number). A tier absent from the map is uncapped
-   *  (bounded only by `maxConcurrent` and the reserved-floor rule). Values are clamped to ≥1. */
+  /** Per-tier GUARANTEED MINIMUM SHARE of in-flight tasks (key = tier number) — the slots a tier can
+   *  always claim against a flood of other tiers. NOT a hard ceiling: a tier at its cap may still
+   *  borrow an otherwise-idle slot when no more-important tier is waiting (WI-4541 work-conservation),
+   *  bounded by `maxConcurrent` and the reserved tier-1 floor. A tier absent from the map is uncapped.
+   *  Values are clamped to ≥1. */
   caps?: Record<number, number>;
   /** Slots RESERVED for tier 1 — tier > 1 is refused admission once `running` reaches
    *  `maxConcurrent - tier1Reserve`, holding that many slots open for the interactive lane even under

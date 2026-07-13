@@ -516,14 +516,38 @@ export interface RunAgentChatOptions {
    */
   thinkingBudgetTokens?: number;
   /**
-   * Cap (ms) on how long a CLI spawn will wait for a shared-governor permit before it
-   * surfaces a `rate_limited` error instead of blocking (RB-012). Only consulted when the
-   * `PAPERCUSP_AGENT_GOVERNOR` flag is on. Interactive callers (operator/oracle brains) pass
-   * a small value (or rely on `signal`) so they escalate rather than inherit a far-off shared
-   * pause (D-002); unattended callers (the gym) leave the default so a normal 429's
-   * retry-after is waited out. Default `DEFAULT_CLI_GOVERNOR_MAX_WAIT_MS`.
+   * Cap (ms) on how long a call will wait for a shared-governor permit (the ADMISSION
+   * wait) before it surfaces a `rate_limited` error instead of blocking (RB-012).
+   * Interactive callers (operator/oracle brains) pass a small value (or rely on `signal`)
+   * so they escalate rather than inherit a far-off shared pause (D-002); unattended callers
+   * (the gym) leave the default so a normal 429's retry-after is waited out.
+   *
+   * Honored on BOTH governed paths (widened 2026-07-13, WI-4475):
+   *  - CLI spawns — default `DEFAULT_CLI_GOVERNOR_MAX_WAIT_MS`; only when `PAPERCUSP_AGENT_GOVERNOR` is on.
+   *  - the in-process `anthropic-direct` path — default `runWithRetry`'s own 600s.
+   *
+   * WI-4475: a caller with a bounded outer budget (a scout cycle, a request deadline) MUST
+   * pass this, derived from the time it actually has left. Otherwise the inner governor wait
+   * (600s default) can exceed — or equal — the caller's whole budget, and a survivable
+   * capacity wait gets guillotined by the caller's timer and misreported as a transport
+   * "timeout" with $0 spent. Pair it with {@link onAdmitted} so the caller can charge
+   * queue-wait and generation to SEPARATE budgets.
    */
   governorMaxWaitMs?: number;
+  /**
+   * Fired once the shared governor ADMITS this call — i.e. immediately before the underlying
+   * HTTP request is issued — and again on each retry attempt (an attempt re-acquires a permit).
+   *
+   * WI-4475: the seam that lets a caller separate ADMISSION wait (queueing behind a shared
+   * rate-limit pause; unbounded-ish, should be charged against the caller's outer deadline)
+   * from GENERATION time (the model actually streaming; bounded by a per-call cap). Without
+   * it, one wall-clock timer conflates the two, and any governor pause longer than the cap
+   * turns a correctly-paced capacity wait into a hard failure. Start/reset the generation
+   * timer here.
+   *
+   * `anthropic-direct` only (the governed in-process path). No-op for subprocess backends.
+   */
+  onAdmitted?: () => void;
   /**
    * Priority/role LABEL for the inference-gateway admission tier
    * (gateway-priority-tiers-2026-06-22). For the in-process `anthropic-direct`
@@ -1133,11 +1157,26 @@ async function* governedStatelessChat(
     // so estimating OTPM as max_tokens would massively over-charge the budget. Until we
     // reconcile from real usage headers, pace on concurrency + RPM + 429-penalty only
     // (token-budget dimensions stay inert on the subscription path anyway). [reviewer #4]
-    { backend: 'anthropic-direct', maxAttempts: 8 },
+    //
+    // WI-4475: `maxWaitMs` was NOT threaded here, so this path always used runWithRetry's
+    // 600s default no matter what the caller asked for. For a caller with a bounded outer
+    // budget that is fatal: the governor's ADMISSION wait could equal (scout cycle: 600s) or
+    // exceed (scout ideator: 180s) the caller's entire budget, so a correctly-paced wait for
+    // capacity got axed by the caller's timer and misreported as a transport "timeout" with
+    // $0 spent. Undefined => unchanged 600s default, so no existing caller shifts.
+    { backend: 'anthropic-direct', maxAttempts: 8, ...(opts.governorMaxWaitMs !== undefined ? { maxWaitMs: opts.governorMaxWaitMs } : {}) },
     {
       governor,
       runOnce: async (): Promise<TurnOutcome<V>> => {
         if (opts.signal?.aborted) return { ok: false, raw: { message: 'anthropic-direct: aborted' } };
+        // ADMITTED: the governor has granted a permit and we are about to issue the real HTTP
+        // request. Everything before this point was queue-wait; everything after is generation.
+        // Fires per attempt so a caller's generation timer resets on each retry (WI-4475).
+        try {
+          opts.onAdmitted?.();
+        } catch {
+          /* a caller's bookkeeping must never break the turn */
+        }
         try {
           const stream = client.messages.stream(params, opts.signal ? { signal: opts.signal } : {});
           const resp = await stream.finalMessage();

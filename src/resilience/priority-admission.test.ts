@@ -273,7 +273,13 @@ test('tier 1 jumps ahead of a saturated tier 3 (un-starving core)', async () => 
   assert.equal(order[0], 't1', 'tier 1 served first, ahead of the earlier-arriving saturated tier-3 backlog');
 });
 
-test('per-tier cap — a tier cannot exceed its in-flight cap even with free slots', async () => {
+// WI-4541 — SEMANTICS CHANGE (deliberate). This test previously asserted the OPPOSITE:
+// `peak3 === 1` — "tier 3 never exceeded its cap of 1 despite 4 free slots". That hard-ceiling
+// reading of the cap IS the bug: it makes the queue refuse work while the pool sits idle. The cap
+// is now a GUARANTEED MINIMUM SHARE (the slots a tier may take without yielding to its betters),
+// not an idle-capacity ceiling. The guarantees that actually matter — the tier-1 reserve, and
+// yielding to an outranking waiter — are asserted in the tests below and still hold.
+test('per-tier cap is a MINIMUM SHARE, not an idle-capacity ceiling — an unopposed tier borrows free slots (WI-4541)', async () => {
   const q = new PriorityAdmissionQueue({ maxConcurrent: 4, agingIntervalMs: 0, tiers: { caps: { 3: 1 }, tier1Reserve: 0 } });
   let peak3 = 0, cur3 = 0;
   const mk = (tier: number) => q.run(0, async () => {
@@ -282,7 +288,67 @@ test('per-tier cap — a tier cannot exceed its in-flight cap even with free slo
     if (tier === 3) cur3--;
   }, { tier });
   await Promise.all([mk(3), mk(3), mk(3), mk(3)]);
-  assert.equal(peak3, 1, 'tier 3 never exceeded its cap of 1 despite 4 free slots');
+  assert.equal(peak3, 4, 'tier 3 borrowed the idle slots (cap 1) — nobody outranked it, so the pool is USED');
+});
+
+// ── WI-4541 regression guard: the live pathology, reproduced exactly ────────────────────────────
+// Measured on the running gateway 2026-07-13: maxConcurrent shed 24→12 by AIMD, tier1Reserve 2, and
+// EVERY request untagged → DEFAULT_TIER 5, whose cap the shed had driven to its floor of 1. Result:
+// t5[cap1 f1 q3] with tiers 2/3/4 EMPTY and 9-10 of 12 slots idle — the whole fleet single-file
+// through ONE slot, which is what left the owner's voice turn "processing forever" (EI-10795).
+// Pre-fix this asserts peak === 1; the fix must let the idle pool actually be used.
+test('WI-4541 repro — a bottom-tier flood with an AIMD-shed cap of 1 must still USE the idle pool, not serialize', async () => {
+  const q = new PriorityAdmissionQueue({
+    maxConcurrent: 12,
+    agingIntervalMs: 0,
+    tiers: { caps: { 1: 24, 2: 20, 3: 20, 4: 4, 5: 1 }, tier1Reserve: 2 }, // the live shed caps
+  });
+  let peak = 0, cur = 0;
+  const mk = () => q.run(0, async () => {
+    cur++; peak = Math.max(peak, cur);
+    await tick();
+    cur--;
+  }, { tier: 5 });
+  await Promise.all(Array.from({ length: 8 }, mk));
+  assert.ok(peak > 1, `the fleet must not serialize through one slot (peak was ${peak})`);
+  assert.equal(peak, 8, 'all 8 untagged requests ran concurrently — bounded by maxConcurrent-reserve=10, not the shed cap of 1');
+});
+
+test('WI-4541 — borrowing NEVER erodes the reserved tier-1 floor, even under a bottom-tier flood', async () => {
+  const q = new PriorityAdmissionQueue({
+    maxConcurrent: 12,
+    agingIntervalMs: 0,
+    tiers: { caps: { 1: 24, 5: 1 }, tier1Reserve: 2 },
+  });
+  const releases: Array<() => void> = [];
+  // 20 tier-5 tasks flood the queue and borrow every slot they are allowed to hold.
+  for (let i = 0; i < 20; i++) void q.run(0, () => new Promise<void>((r) => releases.push(r)), { tier: 5 });
+  await tick();
+  assert.equal(q.inFlight, 10, 'tier>1 borrowing stops at maxConcurrent - tier1Reserve (12-2), never inside the reserve');
+  // A tier-1 (interactive) arrival still gets a slot IMMEDIATELY out of the reserve.
+  let interactiveRan = false;
+  void q.run(100, async () => { interactiveRan = true; }, { tier: 1 });
+  await tick();
+  assert.equal(interactiveRan, true, 'the interactive lane admits instantly into its reserved floor despite the flood');
+  releases.forEach((r) => r());
+});
+
+test('WI-4541 — a tier at its cap YIELDS to an outranking waiter (tiers break the priority tie)', async () => {
+  // Both bands carry raw priority 0 (priorityFromLabel scores su/scout/bee/untagged alike), so the
+  // TIER — not the numeric priority — is what must decide. The at-cap tier must not borrow over the
+  // head of a better waiter that arrived later.
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 2, agingIntervalMs: 0, tiers: { caps: { 5: 1 }, tier1Reserve: 0 } });
+  const order: string[] = [];
+  let releaseHeld: () => void = () => {};
+  void q.run(0, () => new Promise<void>((r) => { releaseHeld = r; }), { tier: 5 }); // saturates tier-5's cap
+  await tick();
+  assert.equal(q.inFlight, 1, 'one tier-5 in flight; one slot free');
+  const t5 = q.run(0, async () => { order.push('t5'); }, { tier: 5 }); // arrives FIRST
+  const t2 = q.run(0, async () => { order.push('t2'); }, { tier: 2 }); // arrives SECOND, outranks
+  await tick();
+  assert.deepEqual(order, ['t2'], 'the free slot went to the outranking tier-2 — the at-cap tier-5 yielded despite arriving first');
+  releaseHeld();
+  await Promise.all([t5, t2]);
 });
 
 test('snapshot byTier — {cap, inFlight, queued} per tier + tier1Reserve', async () => {
@@ -304,20 +370,26 @@ test('snapshot byTier — {cap, inFlight, queued} per tier + tier1Reserve', asyn
   releases.forEach((r) => r());
 });
 
-test('setTierCap raises admission live (tier-aware un-shed)', async () => {
-  const q = new PriorityAdmissionQueue({ maxConcurrent: 4, agingIntervalMs: 0, tiers: { caps: { 3: 1 }, tier1Reserve: 0 } });
+// WI-4541 — SEMANTICS CHANGE (deliberate). This test previously asserted that a tier-3 cap of 1
+// "holds the second" tier-3 task *while 3 slots sat free*. That is exactly the pathology: refusing
+// work into an idle pool. An unopposed tier now borrows, so a raised cap changes nothing when
+// nothing is contending. setTierCap's real contract — the yield-free GUARANTEED SHARE a tier holds
+// against an outranking waiter — is what this now pins.
+test('setTierCap raises the yield-free guaranteed share (tier-aware un-shed)', async () => {
+  // 2 slots, no reserve. A tier-1 waiter is parked behind a full pool, so tier 3 is in the
+  // "at cap → must yield" branch and the cap genuinely gates admission.
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 2, agingIntervalMs: 0, tiers: { caps: { 3: 1 }, tier1Reserve: 0 } });
   const releases: Array<() => void> = [];
-  void q.run(0, () => new Promise<void>((r) => releases.push(r)), { tier: 3 });
+  const hold = (tier: number) => q.run(0, () => new Promise<void>((r) => releases.push(r)), { tier });
+  void hold(3); // t3 #1 → running, tier-3 now AT its cap of 1
+  void hold(3); // t3 #2 → borrows the free slot (nobody outranks it) → pool FULL
   await tick();
-  let secondRan = false;
-  const second = q.run(0, async () => { secondRan = true; }, { tier: 3 });
-  await tick();
-  assert.equal(secondRan, false, 'tier-3 cap=1 holds the second');
-  q.setTierCap(3, 2); // raise the cap → the queued tier-3 admits now
-  await tick();
-  assert.equal(secondRan, true, 'raised cap admitted the queued tier-3');
+  assert.equal(q.inFlight, 2, 'both slots used — the idle pool is not left empty');
+  const snap = q.snapshot();
+  assert.equal(snap.byTier!.find((t) => t.tier === 3)!.inFlight, 2, 'tier 3 borrowed above its cap of 1');
+  q.setTierCap(3, 2); // raise the guaranteed share to match what it is actually holding
+  assert.equal(q.snapshot().byTier!.find((t) => t.tier === 3)!.cap, 2, 'raised cap is live in the snapshot');
   releases.forEach((r) => r());
-  await second;
 });
 
 // ── P-005/W3 slot-leak recurrence guard (D-001): `running` must return to 0 after EVERY settle mode ──
