@@ -530,24 +530,27 @@ export interface RunAgentChatOptions {
    * pass this, derived from the time it actually has left. Otherwise the inner governor wait
    * (600s default) can exceed — or equal — the caller's whole budget, and a survivable
    * capacity wait gets guillotined by the caller's timer and misreported as a transport
-   * "timeout" with $0 spent. Pair it with {@link onAdmitted} so the caller can charge
-   * queue-wait and generation to SEPARATE budgets.
+   * "timeout" with $0 spent. Pair it with {@link onResponseStart} so the caller can charge
+   * every admission layer and generation to SEPARATE budgets.
    */
   governorMaxWaitMs?: number;
   /**
-   * Fired once the shared governor ADMITS this call — i.e. immediately before the underlying
-   * HTTP request is issued — and again on each retry attempt (an attempt re-acquires a permit).
+   * Fired once the process-local shared governor ADMITS this call — i.e. immediately before
+   * the underlying HTTP request is issued — and again on each retry attempt.
    *
-   * WI-4475: the seam that lets a caller separate ADMISSION wait (queueing behind a shared
-   * rate-limit pause; unbounded-ish, should be charged against the caller's outer deadline)
-   * from GENERATION time (the model actually streaming; bounded by a per-call cap). Without
-   * it, one wall-clock timer conflates the two, and any governor pause longer than the cap
-   * turns a correctly-paced capacity wait into a hard failure. Start/reset the generation
-   * timer here.
+   * IMPORTANT: when the transport points at Papercusp's inference gateway, the request can
+   * still queue behind the gateway's own admission/account governors after this callback.
+   * Therefore this is not a safe generation-timer boundary; use {@link onResponseStart}.
    *
    * `anthropic-direct` only (the governed in-process path). No-op for subprocess backends.
    */
   onAdmitted?: () => void;
+  /**
+   * Fired when the Anthropic stream CONNECTS (response headers arrived), after both the
+   * process-local governor and the inference gateway have admitted/routed the request. This
+   * is the safe boundary for a caller's generation timer. Fires per successful retry attempt.
+   */
+  onResponseStart?: () => void;
   /**
    * Priority/role LABEL for the inference-gateway admission tier
    * (gateway-priority-tiers-2026-06-22). For the in-process `anthropic-direct`
@@ -1055,6 +1058,13 @@ async function* statelessAgentChat(
       // .stream() satisfies that guard; .finalMessage() resolves to the same full
       // Message (content + usage), so the downstream extraction below is unchanged.
       const stream = client.messages.stream(params, opts.signal ? { signal: opts.signal } : {});
+      stream.once('connect', () => {
+        try {
+          opts.onResponseStart?.();
+        } catch {
+          /* a caller's bookkeeping must never break the turn */
+        }
+      });
       const resp = await stream.finalMessage();
       let finalText = '';
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1169,9 +1179,9 @@ async function* governedStatelessChat(
       governor,
       runOnce: async (): Promise<TurnOutcome<V>> => {
         if (opts.signal?.aborted) return { ok: false, raw: { message: 'anthropic-direct: aborted' } };
-        // ADMITTED: the governor has granted a permit and we are about to issue the real HTTP
-        // request. Everything before this point was queue-wait; everything after is generation.
-        // Fires per attempt so a caller's generation timer resets on each retry (WI-4475).
+        // LOCAL admission only: the governor has granted a permit and we are about to issue
+        // the HTTP request. The request may still queue inside the inference gateway, so the
+        // generation timer must wait for stream 'connect' below (EI-11417).
         try {
           opts.onAdmitted?.();
         } catch {
@@ -1179,6 +1189,13 @@ async function* governedStatelessChat(
         }
         try {
           const stream = client.messages.stream(params, opts.signal ? { signal: opts.signal } : {});
+          stream.once('connect', () => {
+            try {
+              opts.onResponseStart?.();
+            } catch {
+              /* a caller's bookkeeping must never break the turn */
+            }
+          });
           const resp = await stream.finalMessage();
           let finalText = '';
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
