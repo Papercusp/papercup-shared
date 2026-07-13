@@ -288,7 +288,10 @@ test('per-tier cap is a MINIMUM SHARE, not an idle-capacity ceiling — an unopp
     if (tier === 3) cur3--;
   }, { tier });
   await Promise.all([mk(3), mk(3), mk(3), mk(3)]);
-  assert.equal(peak3, 4, 'tier 3 borrowed the idle slots (cap 1) — nobody outranked it, so the pool is USED');
+  // 3, not 4: borrowing leaves a headroom slot free (max(tier1Reserve,1)) so a tier-1 arrival is
+  // still admitted instantly — a borrowed slot can't be preempted. The pool is USED (3 of 4) instead
+  // of serialized to 1, without giving up the interactive lane's instant admission.
+  assert.equal(peak3, 3, 'tier 3 borrowed the idle slots above its cap of 1, holding one back as tier-1 headroom');
 });
 
 // ── WI-4541 regression guard: the live pathology, reproduced exactly ────────────────────────────
@@ -376,15 +379,14 @@ test('snapshot byTier — {cap, inFlight, queued} per tier + tier1Reserve', asyn
 // nothing is contending. setTierCap's real contract — the yield-free GUARANTEED SHARE a tier holds
 // against an outranking waiter — is what this now pins.
 test('setTierCap raises the yield-free guaranteed share (tier-aware un-shed)', async () => {
-  // 2 slots, no reserve. A tier-1 waiter is parked behind a full pool, so tier 3 is in the
-  // "at cap → must yield" branch and the cap genuinely gates admission.
-  const q = new PriorityAdmissionQueue({ maxConcurrent: 2, agingIntervalMs: 0, tiers: { caps: { 3: 1 }, tier1Reserve: 0 } });
+  // 4 slots, no reserve → borrowing may use up to maxConcurrent - max(reserve,1) = 3.
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 4, agingIntervalMs: 0, tiers: { caps: { 3: 1 }, tier1Reserve: 0 } });
   const releases: Array<() => void> = [];
   const hold = (tier: number) => q.run(0, () => new Promise<void>((r) => releases.push(r)), { tier });
-  void hold(3); // t3 #1 → running, tier-3 now AT its cap of 1
-  void hold(3); // t3 #2 → borrows the free slot (nobody outranks it) → pool FULL
+  void hold(3); // t3 #1 → admitted UNDER its cap of 1
+  void hold(3); // t3 #2 → BORROWS an idle slot (nobody outranks it)
   await tick();
-  assert.equal(q.inFlight, 2, 'both slots used — the idle pool is not left empty');
+  assert.equal(q.inFlight, 2, 'the idle pool is used — the second tier-3 borrowed rather than waiting');
   const snap = q.snapshot();
   assert.equal(snap.byTier!.find((t) => t.tier === 3)!.inFlight, 2, 'tier 3 borrowed above its cap of 1');
   q.setTierCap(3, 2); // raise the guaranteed share to match what it is actually holding

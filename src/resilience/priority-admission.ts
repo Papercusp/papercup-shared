@@ -193,13 +193,24 @@ export class PriorityAdmissionQueue {
     //     tiers, and silently became "shed EVERYTHING" once ~all traffic landed in one band.
     //     This is the sibling of the H11 fix below (which rescued the same starvation on the RESERVE
     //     axis but left the CAP axis armed).
-    //     Borrowing is safe: the tier-1 reserve is already honoured above, `maxConcurrent` still binds
-    //     in pump(), and a borrowed slot is handed back on completion — pump() re-picks the best
-    //     waiter every settle, so an outranking tier takes the NEXT freed slot. The
-    //     `hasWaiterAboveTier` guard is load-bearing rather than belt-and-braces: pump() orders by
-    //     NUMERIC priority, and `priorityFromLabel` scores su/scout/bee/untagged all 0, so a tier-2
-    //     waiter would NOT otherwise outrank an earlier-queued tier-5 one on priority alone.
-    return !this.hasWaiterAboveTier(tier);
+    //     Borrowing rides on two guards, because a borrowed slot CANNOT BE PREEMPTED — an in-flight
+    //     upstream call can't be clawed back, so a slot lent out is gone for a whole request-duration:
+    //
+    //  (a) Never borrow over the head of an OUTRANKING WAITER already queued. Load-bearing, not
+    //      belt-and-braces: pump() picks by NUMERIC priority, and `priorityFromLabel` scores
+    //      su/scout/bee/untagged all 0 — so a tier-2 waiter does NOT outrank an earlier-queued tier-5
+    //      one on priority alone. The TIER has to break that tie, or borrowing would starve the
+    //      better band.
+    //
+    //  (b) A tier > 1 must leave a HEADROOM slot free, so a tier-1 (interactive/queen) request that
+    //      arrives LATER is still admitted INSTANTLY rather than waiting out a borrowed request. The
+    //      tier-1 reserve normally IS that headroom; `max(tier1Reserve, 1)` keeps the guarantee alive
+    //      even for a caller that configures `tier1Reserve: 0` and relies on the caps alone to hold a
+    //      slot open (the un-starving-core contract). In production the reserve is already ≥1, so this
+    //      floor costs nothing; it only closes the degenerate config's footgun.
+    if (this.hasWaiterAboveTier(tier)) return false;
+    if (tier > 1 && this.running >= this.maxConcurrent - Math.max(this.tier1Reserve, 1)) return false;
+    return true;
   }
 
   /** Effective priority at `t` — raw priority plus one point per aging interval waited. */
