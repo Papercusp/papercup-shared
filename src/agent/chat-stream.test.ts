@@ -33,6 +33,53 @@ test('claudeSpawnEnvOverrides — default / false → no env override', () => {
   assert.deepEqual(claudeSpawnEnvOverrides({ disableToolSearch: false }), {});
 });
 
+// EI-10795: the SPAWN-side twin of priorityTierHeaders above. priorityTierHeaders only
+// tiers the in-process `anthropic-direct` backend; a SPAWNED claude brain carries its
+// admission tier in ANTHROPIC_CUSTOM_HEADERS, and nothing was setting it — so the owner's
+// interactive voice reply spawned UNTIERED, fell to the gateway's lowest default band, and
+// queued behind ~30 background fleet agents during an account-pool crunch until it hung
+// ("processing forever"). Same bug class as the scout's 12-day outage, on the other path.
+test('claudeSpawnEnvOverrides — priority becomes an x-papercusp-priority ANTHROPIC_CUSTOM_HEADERS line', () => {
+  assert.deepEqual(claudeSpawnEnvOverrides({ priority: 'interactive' }), {
+    ANTHROPIC_CUSTOM_HEADERS: 'x-papercusp-priority: interactive',
+  });
+  assert.deepEqual(claudeSpawnEnvOverrides({ priority: '  queen  ' }), {
+    ANTHROPIC_CUSTOM_HEADERS: `${GATEWAY_PRIORITY_HEADER}: queen`,
+  });
+  // Composes with the tool-search toggle — neither override displaces the other.
+  assert.deepEqual(claudeSpawnEnvOverrides({ priority: 'interactive', disableToolSearch: true }), {
+    ENABLE_TOOL_SEARCH: 'false',
+    ANTHROPIC_CUSTOM_HEADERS: 'x-papercusp-priority: interactive',
+  });
+});
+
+// Discrimination — the stamp must NOT fire when there's no label, or the header would be
+// meaningless (every spawn "interactive" is the same as none being tiered).
+test('claudeSpawnEnvOverrides — absent/blank priority → NO custom-headers stamp (untiered, unchanged)', () => {
+  assert.deepEqual(claudeSpawnEnvOverrides({ priority: undefined }), {});
+  assert.deepEqual(claudeSpawnEnvOverrides({ priority: '' }), {});
+  assert.deepEqual(claudeSpawnEnvOverrides({ priority: '   ' }), {});
+  // A pre-existing header on the env is untouched when we have no label to add.
+  assert.deepEqual(claudeSpawnEnvOverrides({}, 'x-trace-id: abc'), {});
+});
+
+// The inherited env's custom headers must SURVIVE — clobbering them would silently drop a
+// caller's forwarded headers (trading one bug for another).
+test('claudeSpawnEnvOverrides — priority APPENDS to inherited custom headers, never clobbers', () => {
+  assert.deepEqual(claudeSpawnEnvOverrides({ priority: 'interactive' }, 'x-trace-id: abc'), {
+    ANTHROPIC_CUSTOM_HEADERS: 'x-trace-id: abc\nx-papercusp-priority: interactive',
+  });
+});
+
+// Idempotent: an env that ALREADY carries a priority line is left alone rather than
+// stamped twice — two conflicting priority headers is an ambiguous tier at the gateway.
+test('claudeSpawnEnvOverrides — an inherited priority line is not double-stamped', () => {
+  assert.deepEqual(
+    claudeSpawnEnvOverrides({ priority: 'interactive' }, 'x-papercusp-priority: queen'),
+    { ANTHROPIC_CUSTOM_HEADERS: 'x-papercusp-priority: queen' },
+  );
+});
+
 test('codexMcpConfigToml — bakes HTTP MCP Authorization headers, never bearer_token_env_var', () => {
   const toml = codexMcpConfigToml({
     mcpServers: {

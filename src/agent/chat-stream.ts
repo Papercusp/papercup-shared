@@ -141,16 +141,45 @@ export const CLAUDE_BUILTIN_TOOLS = [
 ] as const;
 
 /**
- * Extra spawn-env entries for the claude-code backend. Today just the
- * tool-search toggle: `disableToolSearch` → `ENABLE_TOOL_SEARCH=false`, which
- * loads the (caller-shrunk) `--mcp-config` surface DIRECTLY instead of deferring
- * it behind `ToolSearch` — the proven non-deferral lever for the operator brain
- * (per-tool `_meta.alwaysLoad` is NOT honored over HTTP MCP on claude-code
- * 2.1.x). Pure + exported for unit testing. See
- * voice-persona-production-readiness P-009.
+ * Extra spawn-env entries for the claude-code backend. Two things:
+ *
+ * 1. The tool-search toggle: `disableToolSearch` → `ENABLE_TOOL_SEARCH=false`, which
+ *    loads the (caller-shrunk) `--mcp-config` surface DIRECTLY instead of deferring
+ *    it behind `ToolSearch` — the proven non-deferral lever for the operator brain
+ *    (per-tool `_meta.alwaysLoad` is NOT honored over HTTP MCP on claude-code
+ *    2.1.x). See voice-persona-production-readiness P-009.
+ *
+ * 2. The GATEWAY ADMISSION TIER: `priority` → an `x-papercusp-priority: <label>` line
+ *    in `ANTHROPIC_CUSTOM_HEADERS` (the claude CLI forwards those headers on every
+ *    call). This is the SPAWN-side counterpart of `priorityTierHeaders()`, which
+ *    only covers the in-process `anthropic-direct` backend. Without it a spawned
+ *    claude brain is UNTIERED and the gateway drops it into the lowest default band
+ *    — which is how the owner's interactive voice reply came to queue behind ~30
+ *    background fleet agents under an account-pool crunch and hang ("processing
+ *    forever", EI-10795). `inheritedCustomHeaders` (the spawn env's existing value)
+ *    is APPENDED to rather than clobbered, so a caller that already forwards custom
+ *    headers keeps them.
+ *
+ * Pure + exported for unit testing.
  */
-export function claudeSpawnEnvOverrides(opts: { disableToolSearch?: boolean }): Record<string, string> {
-  return opts.disableToolSearch ? { ENABLE_TOOL_SEARCH: 'false' } : {};
+export function claudeSpawnEnvOverrides(
+  opts: { disableToolSearch?: boolean; priority?: string },
+  inheritedCustomHeaders?: string,
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  if (opts.disableToolSearch) env.ENABLE_TOOL_SEARCH = 'false';
+  const label = opts.priority?.trim();
+  if (label) {
+    const line = `${GATEWAY_PRIORITY_HEADER}: ${label}`;
+    const existing = inheritedCustomHeaders?.trim();
+    // Don't double-stamp: an inherited priority line already tiers this spawn.
+    env.ANTHROPIC_CUSTOM_HEADERS = !existing
+      ? line
+      : existing.includes(`${GATEWAY_PRIORITY_HEADER}:`)
+        ? existing
+        : `${existing}\n${line}`;
+  }
+  return env;
 }
 
 /**
@@ -1290,10 +1319,13 @@ export async function* runAgentChat(
       }
       spawnEnv = { ...process.env, CLAUDE_CONFIG_DIR: claudeConfigDir };
     }
-    // Tool-search toggle (disableToolSearch → ENABLE_TOOL_SEARCH=false). Spread
-    // into a COPY: spawnEnv may still alias process.env when isolateConfig is
-    // off, and we must not mutate the parent's env.
-    spawnEnv = { ...spawnEnv, ...claudeSpawnEnvOverrides(opts) };
+    // Tool-search toggle (disableToolSearch → ENABLE_TOOL_SEARCH=false) + the gateway
+    // admission-tier header (priority → ANTHROPIC_CUSTOM_HEADERS `x-papercusp-priority`,
+    // EI-10795 — an untagged spawn lands in the gateway's lowest default band). The
+    // inherited value is passed in so the priority line APPENDS instead of clobbering
+    // any custom headers already on the env. Spread into a COPY: spawnEnv may still
+    // alias process.env when isolateConfig is off, and we must not mutate the parent's env.
+    spawnEnv = { ...spawnEnv, ...claudeSpawnEnvOverrides(opts, spawnEnv.ANTHROPIC_CUSTOM_HEADERS) };
   } else if (backend === 'codex') {
     // codex (`codex exec`). Like claude, codex reads the prompt from
     // STDIN via the `-` positional (handled in the stdin block below).
