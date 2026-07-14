@@ -367,6 +367,12 @@ export function priorityFromLabel(label: string | number | undefined): number {
     case 'queen':
     case 'mug': // pot-rename dual-accept (P1 MIGRATE): additive twin of `queen`
       return 100;
+    case 'maintenance':
+    case 'compaction': // alias — compaction/summarizer calls are the canonical maintenance traffic
+      // Above `high`, below interactive: a maintenance call (a compaction summary) is small, rare,
+      // and blocking a session's ability to continue — it must not queue behind worker traffic
+      // (deterministic-context-carry P-002; the 2026-07-13 ornith incident starved exactly this call).
+      return 75;
     case 'high':
       return 50;
     case 'low':
@@ -407,6 +413,12 @@ export const DEFAULT_GATEWAY_PRIORITY_MAP: PriorityTierMap = {
   kettle: 1, // pot-rename dual-accept (P1 MIGRATE): additive twin of `overwatch`
   operator: 1,
   interactive: 1,
+  // Maintenance lane (deterministic-context-carry P-002): compaction/summarizer calls ride tier 1 so
+  // fleet worker traffic can never starve them — the tier-1 reserved floor is the "small reserved
+  // budget for maintenance calls" of the ornith-overflow brief (fix 3), and tier 1 is never AIMD-shed.
+  // They are rare and tiny (one short completion per compaction), so they cannot crowd interactive.
+  maintenance: 1,
+  compaction: 1, // alias for the same lane
   su: 2,
   bee: 3,
   cup: 3, // pot-rename dual-accept (P1 MIGRATE): additive twin of `bee`
