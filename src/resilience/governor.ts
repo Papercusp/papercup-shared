@@ -101,6 +101,17 @@ export interface AcquireDecision {
   reason?: 'paused' | 'concurrency' | 'rpm' | 'itpm' | 'otpm' | 'pace';
 }
 
+/** Why a bounded acquire could not admit a request. This is intentionally typed at the
+ * governor boundary so callers do not infer pool state from provider prose. */
+export type AdmissionDenialReason = 'all-accounts-paused' | 'no-free-slot' | 'provider-429';
+
+export interface AdmissionDenial {
+  reason: AdmissionDenialReason;
+  /** Optional pool counters when the caller owns a pool-wide view. */
+  pausedAccounts?: number;
+  freeSlots?: number;
+}
+
 const WINDOW_MS = 60_000;
 const CONCURRENCY_POLL_MS = 250; // we don't know when a peer releases → short re-poll
 // Cascade-aware staggered resume (rate-limit-layer-v2 D-006): waiters parked on one pause get
@@ -520,6 +531,8 @@ export interface AcquireOpts {
    *  isSoftPause). The gateway sets this in its last-resort fallback to SERVE a serviceable near-cap account
    *  rather than shed (a HARD/rejected pause still blocks). The pace still applies, so it serves slowly. */
   allowSoftPaused?: boolean;
+  /** Receives the typed reason when a bounded acquire gives up. */
+  onDenied?: (denial: AdmissionDenial) => void;
 }
 
 /** Async façade over the pure core: `acquire()` blocks until allowed, then returns a
@@ -703,7 +716,17 @@ export class RateLimitGovernor {
         }
         w += Math.min(pauseTicket * RESUME_STAGGER_STEP_MS, RESUME_STAGGER_MAX_MS);
       }
-      if (waited + w > maxWait) return null; // would wait too long → give up, let the caller decide
+      if (waited + w > maxWait) {
+        // Preserve the admission fact at the boundary. A caller may attach pool counters, but
+        // the governor can still distinguish a pause wall from a free-slot/concurrency miss.
+        opts.onDenied?.({
+          reason: d.reason === 'paused' || d.reason === 'rpm' || d.reason === 'itpm' || d.reason === 'otpm' || d.reason === 'pace'
+            ? 'all-accounts-paused'
+            : 'no-free-slot',
+          ...(d.reason === 'concurrency' ? { freeSlots: 0 } : {}),
+        });
+        return null; // would wait too long → give up, let the caller decide
+      }
       waited += w;
       await this.sleep(w);
     }

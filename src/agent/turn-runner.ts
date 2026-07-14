@@ -101,5 +101,6 @@ function verdictToTurnError(v: RetryVerdict, backend: TurnBackend): TurnError {
     retryable: false,
     ...(v.retryAfterMs !== undefined ? { retryAfterMs: v.retryAfterMs } : {}),
     ...(v.resetAt !== undefined ? { resetAt: v.resetAt } : {}),
+    ...(v.admissionDenial ? { admissionDenial: v.admissionDenial } : {}),
   };
 }

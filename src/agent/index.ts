@@ -70,7 +70,15 @@ export {
   type GovernorSnapshot,
   type GovernorPauseListener,
 } from './governor-registry';
-export type { GovernorPauseEvent, GovernorState, GovernorStore, GovernorLimits, GlobalConcurrencyGate } from '../resilience/governor';
+export type {
+  AdmissionDenial,
+  AdmissionDenialReason,
+  GovernorPauseEvent,
+  GovernorState,
+  GovernorStore,
+  GovernorLimits,
+  GlobalConcurrencyGate,
+} from '../resilience/governor';
 export {
   runAgentTurn,
   type TurnOutcome,

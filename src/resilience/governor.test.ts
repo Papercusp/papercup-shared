@@ -479,6 +479,15 @@ test('RateLimitGovernor.acquire — returns null when the wait would exceed maxW
   const r = await g.acquire({}, { maxWaitMs: 1000 });
   assert.equal(r, null);
 });
+test('RateLimitGovernor.acquire — bounded denial carries a typed admission reason', async () => {
+  const g = new RateLimitGovernor({ maxConcurrent: 1 });
+  const held = await g.acquire({});
+  let denial: import('./governor').AdmissionDenial | undefined;
+  const r = await g.acquire({}, { maxWaitMs: 0, onDenied: (d) => (denial = d) });
+  assert.equal(r, null);
+  assert.deepEqual(denial, { reason: 'no-free-slot', freeSlots: 0 });
+  held!();
+});
 test('RateLimitGovernor.acquire — returns null when the abort signal is already aborted', async () => {
   const g = new RateLimitGovernor({ maxConcurrent: 1 }, { now: () => 0, sleep: async () => {} });
   await g.acquire({}); // exhaust concurrency so the next would wait

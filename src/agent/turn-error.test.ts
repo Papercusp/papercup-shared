@@ -43,10 +43,19 @@ test('classifyHttpError — 429 → rate_limited, honors retry-after + reset', (
     message: 'rate_limit_error',
   }, 'anthropic');
   assert.equal(e.class, 'rate_limited');
+  assert.deepEqual(e.admissionDenial, { reason: 'provider-429' });
   assert.equal(e.retryAfterMs, 12_000);
   assert.equal(e.resetAt, Date.parse('2026-06-02T12:00:00Z'));
   assert.equal(e.retryable, true);
   assert.equal(e.provider, 'anthropic');
+});
+test('classifyHttpError — preserves a typed gateway admission denial', () => {
+  const e = classifyHttpError({
+    status: 429,
+    message: 'opaque gateway response',
+    admissionDenial: { reason: 'all-accounts-paused', pausedAccounts: 4, freeSlots: 0 },
+  }, 'anthropic');
+  assert.deepEqual(e.admissionDenial, { reason: 'all-accounts-paused', pausedAccounts: 4, freeSlots: 0 });
 });
 test('classifyHttpError — 529 / 503 → overloaded (retryable)', () => {
   assert.equal(classifyHttpError({ status: 529, message: 'overloaded' }).class, 'overloaded');

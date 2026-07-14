@@ -27,6 +27,8 @@ export {
   type GovernorPauseEvent,
   type AcquireOpts,
   type AcquireDecision,
+  type AdmissionDenial,
+  type AdmissionDenialReason,
   type TokenEstimate,
   type UnifiedWindowState,
 } from './governor';

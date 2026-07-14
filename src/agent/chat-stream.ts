@@ -1301,9 +1301,16 @@ export async function* runAgentChat(
   let releaseGovernor: (() => void) | null = null;
   if (governed) {
     const gov = governorForBackend(backend as TurnBackend, opts.model ?? '');
+    let admissionDenial: import('../resilience/governor').AdmissionDenial | undefined;
     const release = await gov.acquire(
       {},
-      { signal: opts.signal, maxWaitMs: opts.governorMaxWaitMs ?? DEFAULT_CLI_GOVERNOR_MAX_WAIT_MS },
+      {
+        signal: opts.signal,
+        maxWaitMs: opts.governorMaxWaitMs ?? DEFAULT_CLI_GOVERNOR_MAX_WAIT_MS,
+        onDenied: (denial) => {
+          admissionDenial = denial;
+        },
+      },
     );
     if (!release) {
       // Bailed: the shared bucket is paused past our maxWait (a far-off reset) or aborted.
@@ -1326,6 +1333,7 @@ export async function* runAgentChat(
                 provider: BACKEND_PROFILES[backend as TurnBackend].provider,
                 retryable: false,
                 ...(pausedUntil ? { resetAt: pausedUntil } : {}),
+                ...(admissionDenial ? { admissionDenial } : {}),
               },
             }),
       };

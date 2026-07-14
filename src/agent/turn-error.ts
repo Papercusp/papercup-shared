@@ -10,6 +10,8 @@
  * backends) classifies from `{exitCode, signal, stderr, stdout, timedOut}`.
  */
 
+import type { AdmissionDenial } from '../resilience/governor';
+
 export type TurnErrorClass =
   | 'rate_limited' // 429 / acceleration (RPM) limit — transient: back off the fleet briefly + retry
   | 'usage_limit' // plan/subscription CAP (Max/ChatGPT daily-weekly-session, insufficient_quota) — capped until a reset window (often hours): pause the fleet + surface, do NOT retry into the wall
@@ -42,6 +44,8 @@ export interface TurnError {
    * transient classes the governor handles silently (`rate_limited`/`overloaded`/`timeout`/…).
    */
   surfaceToUser?: boolean;
+  /** Structured admission fact from the governor/gateway; never infer this from message text. */
+  admissionDenial?: AdmissionDenial;
 }
 
 const RETRYABLE: ReadonlySet<TurnErrorClass> = new Set<TurnErrorClass>([
@@ -185,7 +189,7 @@ export function parseUsageResetMs(text: string, now: number = Date.now()): numbe
 
 /** Classify an HTTP-style failure (anthropic-direct in-process call, or an API error). */
 export function classifyHttpError(
-  input: { status?: number; headers?: Record<string, string | undefined>; message?: string },
+  input: { status?: number; headers?: Record<string, string | undefined>; message?: string; admissionDenial?: AdmissionDenial },
   provider: TurnProvider = 'unknown',
   now: number = Date.now(),
 ): TurnError {
@@ -199,10 +203,15 @@ export function classifyHttpError(
   // pause-until-reset + surface, do NOT retry. Checked before the transient-429 branch since the
   // disposition is opposite (D-001). The header reset (if any) IS the cap's reset time.
   if (USAGE_LIMIT_RE.test(msg) && !TRANSIENT_OVERRIDE_RE.test(msg) && (st === 429 || st === undefined)) {
-    return mk('usage_limit', msg, provider, { retryAfterMs, resetAt });
+    return mk('usage_limit', msg, provider, { retryAfterMs, resetAt, ...(input.admissionDenial ? { admissionDenial: input.admissionDenial } : {}) });
   }
   if (st === 429 || (st === undefined && (RATE_RE.test(msg) || TRANSIENT_OVERRIDE_RE.test(msg)))) {
-    return mk('rate_limited', msg, provider, { retryAfterMs, resetAt });
+    return mk('rate_limited', msg, provider, {
+      retryAfterMs,
+      resetAt,
+      // A provider 429 is a typed capacity signal even when the body is opaque.
+      admissionDenial: input.admissionDenial ?? { reason: 'provider-429' },
+    });
   }
   if (st === 529 || st === 503 || st === 502 || st === 500 || st === 504 || (st === undefined && OVERLOAD_RE.test(msg))) {
     return mk('overloaded', msg, provider, { retryAfterMs });

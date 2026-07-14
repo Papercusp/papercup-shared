@@ -12,7 +12,7 @@
  * of inheriting a far-off shared pause. Reusable by any rate-limited/flaky I/O; the agent
  * layer wraps it with its own classifier (see ../agent/turn-runner).
  */
-import type { RateLimitGovernor, TokenEstimate } from './governor';
+import type { AdmissionDenial, RateLimitGovernor, TokenEstimate } from './governor';
 
 /** The generic, domain-free classification of a failed attempt. */
 export interface RetryVerdict {
@@ -24,6 +24,7 @@ export interface RetryVerdict {
   message?: string;
   /** Opaque passthrough so the caller can recover its own richer error object. */
   detail?: unknown;
+  admissionDenial?: AdmissionDenial;
 }
 
 export type AttemptOutcome<T> =
@@ -60,7 +61,14 @@ export async function runWithRetry<T>(opts: RetryOptions, deps: RetryDeps<T>): P
   let totalWaited = 0;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const release = await deps.governor.acquire(opts.estTokens, { signal: opts.signal, maxWaitMs: maxWaitMs - totalWaited });
+    let admissionDenial: AdmissionDenial | undefined;
+    const release = await deps.governor.acquire(opts.estTokens, {
+      signal: opts.signal,
+      maxWaitMs: maxWaitMs - totalWaited,
+      onDenied: (denial) => {
+        admissionDenial = denial;
+      },
+    });
     if (!release) {
       const pausedUntil = deps.governor.state.pausedUntil;
       return {
@@ -70,6 +78,7 @@ export async function runWithRetry<T>(opts: RetryOptions, deps: RetryDeps<T>): P
           accountWide: true,
           message: opts.signal?.aborted ? 'aborted while rate-limited' : 'rate-limit pause exceeds maxWait',
           ...(pausedUntil > now() ? { resetAt: pausedUntil } : {}),
+          ...(admissionDenial ? { admissionDenial } : {}),
         },
       };
     }
