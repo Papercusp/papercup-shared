@@ -26,6 +26,18 @@ test('priorityFromLabel — known labels + numeric + default', () => {
   assert.equal(priorityFromLabel('nonsense'), 0);
 });
 
+test('maintenance lane (deterministic-context-carry P-002): compaction/summarizer labels order above high, below interactive, and ride tier 1', () => {
+  assert.equal(priorityFromLabel('maintenance'), 75);
+  assert.equal(priorityFromLabel('compaction'), 75);
+  assert.ok(priorityFromLabel('maintenance') > priorityFromLabel('high'));
+  assert.ok(priorityFromLabel('maintenance') < priorityFromLabel('interactive'));
+  // Tier 1 = never AIMD-shed + reserved floor — the "small reserved budget for maintenance calls".
+  assert.equal(tierOf('maintenance'), 1);
+  assert.equal(tierOf('compaction'), 1);
+  assert.equal(DEFAULT_GATEWAY_PRIORITY_MAP.maintenance, 1);
+  assert.equal(DEFAULT_GATEWAY_PRIORITY_MAP.compaction, 1);
+});
+
 test('admits highest priority first when slots are scarce', async () => {
   const q = new PriorityAdmissionQueue({ maxConcurrent: 1 });
   const order: string[] = [];
