@@ -513,9 +513,13 @@ export interface RunAgentChatOptions {
   /**
    * When `sessionId` is set, controls which flag to use:
    *   - 'resume' → `-r <id>` (fail if no such session in claude's store)
-   *   - 'force' → `--session-id <uuid>` (create-or-resume; uuid must be valid)
-   * Default: 'force' (create-or-resume) — used by historical delegate sessions since
-   * we manage the session id ourselves.
+   *   - 'force' → `--session-id <uuid>` (create-ONLY; uuid must be valid.
+   *     ⚠ NOT create-or-resume: claude-code exits 1 "Session ID … is already
+   *     in use" when the id exists — verified live 2026-07-16, WI-5071. A
+   *     caller reusing a session must switch to 'resume' after the first
+   *     completed turn.)
+   * Default: 'force' — used by historical delegate sessions since we manage
+   * the session id ourselves.
    */
   sessionMode?: 'resume' | 'force';
   /**
