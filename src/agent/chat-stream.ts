@@ -751,7 +751,46 @@ interface StatelessTransport {
   baseURL: string;
   token: string;
   headers: Record<string, string>;
-  label: 'anthropic-direct';
+  label: 'anthropic-direct' | 'gateway-pool';
+}
+
+/**
+ * Bearer an in-process call presents to the LOCAL inference gateway when it has
+ * no Claude OAuth session of its own (EI-12940). NOT a secret and NOT sent to
+ * any remote host: the gateway strips inbound `authorization`/`x-api-key`
+ * (gateway.ts STRIP_REQUEST) and re-auths every upstream attempt with a POOL
+ * account's own credential — the inbound bearer only satisfies SDK/client
+ * "token required" plumbing. Mirrors spawn-env.ts `GATEWAY_CLIENT_AUTH_TOKEN`
+ * (duplicated as a bare const because papercusp-shared must not import
+ * operator-core — same pattern as ROUTE_ACCOUNT_HEADER).
+ */
+export const GATEWAY_DELEGATED_AUTH_TOKEN = 'papercusp-gateway';
+
+/** True when `u` parses to a loopback host — the only place the delegated
+ *  placeholder bearer is allowed to go (never a remote API host). */
+function isLocalhostUrl(u: string): boolean {
+  try {
+    const h = new URL(u).hostname;
+    return h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Where a DELEGATED (no-local-token) stateless call should egress (EI-12940):
+ * the env-configured base URL when it already points at a loopback host (that
+ * IS the pacing gateway), else the well-known local gateway
+ * `http://127.0.0.1:<PAPERCUSP_GATEWAY_PORT|8788>`. A configured NON-loopback
+ * URL (e.g. api.anthropic.com) is deliberately ignored here: the placeholder
+ * bearer must never egress to a real API host. The gateway is a standing
+ * component on every papercusp host (host-bootstrap spawns/adopts it
+ * unconditionally), so the default port is a sound last resort.
+ */
+export function resolveDelegatedGatewayUrl(): string {
+  const configured = process.env.PAPERCUSP_ANTHROPIC_URL ?? process.env.ANTHROPIC_BASE_URL;
+  if (configured && isLocalhostUrl(configured)) return configured;
+  return `http://127.0.0.1:${gatewayPort()}`;
 }
 
 /**
@@ -824,46 +863,69 @@ function anthropicDirectTransport(claudeTok: string): StatelessTransport {
 }
 
 /**
- * Pure transport choice for a stateless Anthropic-format call: a live Claude
- * OAuth session → `anthropic-direct`; nothing usable → null. The token the
- * caller passes is already expiry-filtered (`readClaudeOauthToken` returns
- * null for an expired session — EI-281). The omp-token → Meridian-router leg
- * was removed 2026-06-12 (EI-399); anthropic-direct is the named default and
- * only transport.
+ * Delegated transport for a caller with NO usable local Claude OAuth session
+ * (EI-12940): egress via the LOCAL inference gateway, which strips the inbound
+ * placeholder bearer and re-auths each upstream attempt with a pool account's
+ * own credential. Before this fallback existed, one stale/missing
+ * `~/.claude/.credentials.json` took the whole learning loop down for 5h
+ * (2026-07-16) while a 12-account pool sat idle behind a running gateway.
+ * Keeps the route-account pin + tier headers at parity with the direct path.
  */
-export function chooseStatelessTransport(args: {
-  claudeTok: string | null;
-}): 'anthropic-direct' | null {
-  return args.claudeTok ? 'anthropic-direct' : null;
-}
-
-function resolveStatelessTransport(): StatelessTransport | { error: string } {
-  const claudeTok = readClaudeOauthToken();
-  const choice = chooseStatelessTransport({ claudeTok });
-  if (choice === 'anthropic-direct') return anthropicDirectTransport(claudeTok!);
+function gatewayPoolTransport(): StatelessTransport {
+  const headers: Record<string, string> = { 'anthropic-beta': 'oauth-2025-04-20' };
+  const routeAccount = resolveRouteAccountId();
+  if (routeAccount) headers[ROUTE_ACCOUNT_HEADER] = routeAccount;
   return {
-    error:
-      'stateless LLM path has no usable Claude OAuth token from ~/.claude/.credentials.json ' +
-      '(file missing/unreadable, expired, or lacks claudeAiOauth.accessToken)',
+    baseURL: resolveDelegatedGatewayUrl(),
+    token: GATEWAY_DELEGATED_AUTH_TOKEN,
+    headers,
+    label: 'gateway-pool',
   };
 }
 
+/**
+ * Pure transport choice for a stateless Anthropic-format call: a live Claude
+ * OAuth session → `anthropic-direct`; no usable local session →
+ * `gateway-pool` (EI-12940: delegate auth to the local inference gateway's
+ * account pool instead of failing — a single stale credential file must never
+ * be a SPOF while a pool sits behind a running gateway). The token the caller
+ * passes is already expiry-filtered (`readClaudeOauthToken` returns null for
+ * an expired session — EI-281). The omp-token → Meridian-router leg was
+ * removed 2026-06-12 (EI-399).
+ */
+export function chooseStatelessTransport(args: {
+  claudeTok: string | null;
+}): 'anthropic-direct' | 'gateway-pool' {
+  return args.claudeTok ? 'anthropic-direct' : 'gateway-pool';
+}
+
+function resolveStatelessTransport(): StatelessTransport {
+  const claudeTok = readClaudeOauthToken();
+  const choice = chooseStatelessTransport({ claudeTok });
+  return choice === 'anthropic-direct'
+    ? anthropicDirectTransport(claudeTok!)
+    : gatewayPoolTransport();
+}
+
 export type StatelessTransportProbe =
-  | { ok: true; label: 'anthropic-direct' }
+  | { ok: true; label: 'anthropic-direct' | 'gateway-pool' }
   | { ok: false; error: string };
 
 /**
- * Credential-presence probe for health monitors: would a stateless call
- * resolve a transport right now, without issuing one. Shares the exact
- * resolution the real calls use, so a health leg riding it can never disagree
- * with the call path. NEVER TCP-probe :3456 for this — the retired local
- * Meridian router not running is the normal state (the omp token died
- * 2026-04-11; calls go anthropic-direct — see
+ * Transport-resolution probe for health monitors: would a stateless call
+ * resolve a transport right now, without issuing one — and WHICH one. Shares
+ * the exact resolution the real calls use, so a health leg riding it can never
+ * disagree with the call path. Since EI-12940 a missing/expired local Claude
+ * session resolves `gateway-pool` (auth delegated to the local gateway's
+ * account pool) rather than failing — pair this with the gateway `/healthz`
+ * reachability leg (learning-infra-health already does) for the composite
+ * "can a call actually succeed" verdict. NEVER TCP-probe :3456 for this — the
+ * retired local Meridian router not running is the normal state (EI-399; see
  * agent-insights/gym-boot-readiness-and-meridian-topology).
  */
 export function probeStatelessTransport(): StatelessTransportProbe {
   const t = resolveStatelessTransport();
-  return 'error' in t ? { ok: false, error: t.error } : { ok: true, label: t.label };
+  return { ok: true, label: t.label };
 }
 
 interface ModelPrice { in: number; out: number }
@@ -1001,14 +1063,10 @@ async function* statelessAgentChat(
     yield { type: 'error', message: 'anthropic-direct backend requires opts.model (resolve via modelRoles or pass explicitly)' };
     return;
   }
-  // Resolve transport: direct-to-Anthropic with the Claude OAuth session
-  // (see resolveStatelessTransport).
-  const resolved = resolveStatelessTransport();
-  if ('error' in resolved) {
-    yield { type: 'error', message: resolved.error };
-    return;
-  }
-  let transport: StatelessTransport = resolved;
+  // Resolve transport: direct-to-Anthropic with the Claude OAuth session, or
+  // gateway-pool delegation when no usable local session exists (EI-12940 —
+  // see resolveStatelessTransport / gatewayPoolTransport).
+  let transport: StatelessTransport = resolveStatelessTransport();
 
   // Lazy-load the SDK so consumers that never use this path don't pay the import
   // cost. Dynamic `import()` (not a static top-level import) keeps it lazy, stays
