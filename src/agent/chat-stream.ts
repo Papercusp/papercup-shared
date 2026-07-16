@@ -37,7 +37,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, delimiter, join } from 'node:path';
 // Agent-turn robustness (opt-in via PAPERCUSP_AGENT_GOVERNOR=1). These modules are pure +
@@ -518,6 +518,18 @@ export interface RunAgentChatOptions {
    * we manage the session id ourselves.
    */
   sessionMode?: 'resume' | 'force';
+  /**
+   * CALLER-OWNED stable isolate dir (claude-code + isolateConfig only —
+   * operator-chat session reuse, WI-5071). When set, the spawn uses THIS
+   * directory as its clean CLAUDE_CONFIG_DIR (created if missing) instead of
+   * a fresh mkdtemp, and — critically — does NOT delete it afterwards: the
+   * caller owns its lifecycle. Because the spawn cwd is the config dir and
+   * claude keys its on-disk session store by cwd, a stable isolateDir is what
+   * makes `sessionId` reuse across separate spawns actually find the prior
+   * session (a per-spawn tmp dir strands every session it creates).
+   * Ignored unless `isolateConfig` is set and the backend is claude-code.
+   */
+  isolateDir?: string;
   /**
    * Multi-turn message history. For the stateless backend
    * (`anthropic-direct`) this is the entire conversation sent to the
@@ -1457,6 +1469,10 @@ export async function* runAgentChat(
   // OAuth login carries over; nothing else, so no host MCP/hooks/plugins
   // load. Cleaned up after the child exits (alongside codexHome).
   let claudeConfigDir: string | undefined;
+  // True when claudeConfigDir is a caller-owned stable dir (opts.isolateDir,
+  // WI-5071) — cleanup must then LEAVE it alone (it holds the claude session
+  // store the next turn resumes from).
+  let claudeConfigDirCallerOwned = false;
 
   // Per-spawn dir holding the claude-code `--system-prompt-file` (the
   // persona). Only allocated when claudeConfigDir is absent (the persona
@@ -1499,11 +1515,21 @@ export async function* runAgentChat(
       // the codex `auth.json` symlink pattern below. (`--bare` would also
       // isolate but forces ANTHROPIC_API_KEY auth, disabling the OAuth
       // login this box runs on — see plan operator-brain-test-isolation.)
-      claudeConfigDir = mkdtempSync(join(tmpdir(), 'claude-chat-'));
+      // WI-5071: a caller-supplied `isolateDir` is a STABLE, caller-owned
+      // config dir (session reuse across spawns needs the same config dir +
+      // cwd every turn); without one, allocate a throwaway tmp dir as before.
+      if (opts.isolateDir) {
+        claudeConfigDir = opts.isolateDir;
+        claudeConfigDirCallerOwned = true;
+        try { mkdirSync(claudeConfigDir, { recursive: true }); } catch { /* exists */ }
+      } else {
+        claudeConfigDir = mkdtempSync(join(tmpdir(), 'claude-chat-'));
+      }
       try {
         const realCreds = join(homedir(), '.claude', '.credentials.json');
-        if (existsSync(realCreds)) {
-          symlinkSync(realCreds, join(claudeConfigDir, '.credentials.json'));
+        const linkPath = join(claudeConfigDir, '.credentials.json');
+        if (existsSync(realCreds) && !existsSync(linkPath)) {
+          symlinkSync(realCreds, linkPath);
         }
       } catch (err) {
         console.warn('[chat-stream] claude-code: failed to symlink credentials:', err);
@@ -1904,7 +1930,7 @@ export async function* runAgentChat(
     if (codexHome) {
       try { rmSync(codexHome, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
-    if (claudeConfigDir) {
+    if (claudeConfigDir && !claudeConfigDirCallerOwned) {
       try { rmSync(claudeConfigDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
     if (claudeSysDir) {
