@@ -1197,7 +1197,7 @@ async function* statelessAgentChat(
       if (!isTransientLlmError(err) || attempt === RETRY_MAX) {
         yield {
           type: 'error',
-          message: `anthropic-direct error: ${err instanceof Error ? err.message : String(err)}`,
+          message: `${transport.label} error: ${err instanceof Error ? err.message : String(err)}${statelessErrorContext(transport, err)}`,
         };
         return;
       }
@@ -1210,8 +1210,27 @@ async function* statelessAgentChat(
   }
   yield {
     type: 'error',
-    message: `anthropic-direct: exhausted ${RETRY_MAX} retries: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`,
+    message: `${transport.label}: exhausted ${RETRY_MAX} retries: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}${statelessErrorContext(transport, lastErr)}`,
   };
+}
+
+/**
+ * Diagnostic suffix for a failed stateless call (EI-12940): a `gateway-pool`
+ * (delegated) transport that cannot even CONNECT means BOTH credential paths
+ * are down — no usable local Claude OAuth token AND no reachable local
+ * gateway. Say so explicitly on the tick ledger instead of a bare
+ * "fetch failed" that hides the missing-local-token half.
+ */
+function statelessErrorContext(transport: StatelessTransport, err: unknown): string {
+  if (transport.label !== 'gateway-pool') return '';
+  if (isConnectionFailure(err)) {
+    return (
+      ' [gateway-pool: no usable local Claude OAuth token (~/.claude/.credentials.json missing/expired),' +
+      ` so the call was delegated to the inference gateway at ${transport.baseURL} — which is UNREACHABLE;` +
+      ' both credential paths are down (EI-12940)]'
+    );
+  }
+  return ' [via gateway-pool delegation — no usable local Claude OAuth token (EI-12940)]';
 }
 
 /** Convert an SDK error's `.headers` (a Headers object OR a plain object) to a record so

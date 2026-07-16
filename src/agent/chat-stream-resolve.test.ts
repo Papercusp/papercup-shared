@@ -19,6 +19,8 @@ import {
   probeStatelessTransport,
   invalidateClaudeTokenCache,
   resolveAnthropicBaseUrl,
+  resolveDelegatedGatewayUrl,
+  GATEWAY_DELEGATED_AUTH_TOKEN,
   resolveRouteAccountId,
   isConnectionFailure,
   isAuthFailure,
@@ -160,32 +162,75 @@ describe('tokenIsLive (EI-281)', () => {
   });
 });
 
-describe('chooseStatelessTransport (EI-281 / EI-399)', () => {
-  it('a live Claude session resolves anthropic-direct — the named default and only transport', () => {
+describe('chooseStatelessTransport (EI-281 / EI-399 / EI-12940)', () => {
+  it('a live Claude session resolves anthropic-direct — the preferred transport', () => {
     expect(chooseStatelessTransport({ claudeTok: 'c' })).toBe('anthropic-direct');
   });
 
-  it('no usable credential → null', () => {
-    expect(chooseStatelessTransport({ claudeTok: null })).toBeNull();
+  it('no usable credential → gateway-pool delegation, never a hard failure (EI-12940)', () => {
+    expect(chooseStatelessTransport({ claudeTok: null })).toBe('gateway-pool');
   });
 
-  it('probe failure names an unusable OAuth token, not a missing credentials file as the only cause', () => {
+  it('probe with no credentials file resolves gateway-pool (the 2026-07-16 5h-outage class: a stale local token must not be a SPOF)', () => {
     const home = mkdtempSync(join(tmpdir(), 'papercusp-no-claude-home-'));
     try {
       process.env.HOME = home;
       invalidateClaudeTokenCache();
 
       const probed = probeStatelessTransport();
-      expect(probed.ok).toBe(false);
-      if (!probed.ok) {
-        expect(probed.error).toContain('no usable Claude OAuth token');
-        expect(probed.error).toContain('missing/unreadable, expired, or lacks claudeAiOauth.accessToken');
-        expect(probed.error).not.toContain('needs a live Claude session');
-      }
+      expect(probed.ok).toBe(true);
+      if (probed.ok) expect(probed.label).toBe('gateway-pool');
     } finally {
       rmSync(home, { recursive: true, force: true });
       invalidateClaudeTokenCache();
     }
+  });
+});
+
+// EI-12940: where a DELEGATED (no-local-token) call egresses. The placeholder
+// bearer (GATEWAY_DELEGATED_AUTH_TOKEN) is only ever allowed to go to a
+// loopback host — the local pacing gateway, which strips it and re-auths from
+// its account pool.
+describe('resolveDelegatedGatewayUrl (EI-12940)', () => {
+  const URL_KEYS = ['PAPERCUSP_ANTHROPIC_URL', 'ANTHROPIC_BASE_URL', 'PAPERCUSP_GATEWAY_PORT'] as const;
+  const savedUrls: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const k of URL_KEYS) {
+      savedUrls[k] = process.env[k];
+      delete process.env[k];
+    }
+  });
+  afterEach(() => {
+    for (const k of URL_KEYS) {
+      if (savedUrls[k] === undefined) delete process.env[k];
+      else process.env[k] = savedUrls[k];
+    }
+  });
+
+  it('defaults to the well-known local gateway when no env is configured (the bg-host case)', () => {
+    expect(resolveDelegatedGatewayUrl()).toBe('http://127.0.0.1:8788');
+  });
+
+  it('honors PAPERCUSP_GATEWAY_PORT for the default', () => {
+    process.env.PAPERCUSP_GATEWAY_PORT = '9917';
+    expect(resolveDelegatedGatewayUrl()).toBe('http://127.0.0.1:9917');
+  });
+
+  it('uses a configured loopback base URL (it IS the gateway)', () => {
+    process.env.ANTHROPIC_BASE_URL = 'http://127.0.0.1:8788';
+    expect(resolveDelegatedGatewayUrl()).toBe('http://127.0.0.1:8788');
+    process.env.PAPERCUSP_ANTHROPIC_URL = 'http://localhost:9021';
+    expect(resolveDelegatedGatewayUrl()).toBe('http://localhost:9021');
+  });
+
+  it('NEVER delegates to a non-loopback URL — the placeholder bearer must not egress to a real API host', () => {
+    process.env.PAPERCUSP_ANTHROPIC_URL = 'https://api.anthropic.com';
+    expect(resolveDelegatedGatewayUrl()).toBe('http://127.0.0.1:8788');
+  });
+
+  it('the delegated bearer is the gateway client placeholder, not a credential', () => {
+    expect(GATEWAY_DELEGATED_AUTH_TOKEN).toBe('papercusp-gateway');
   });
 });
 
