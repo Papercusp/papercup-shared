@@ -1423,6 +1423,16 @@ export async function* runAgentChat(
   // spawn-failure return, abort, or a consumer abandoning the generator). Body indentation is
   // left unchanged to keep the diff readable.
   try {
+  // Spawn-phase timing (WI-5068): split first-event latency into prep
+  // (config/system-prompt writes) → process spawn→first stdout → parse→first
+  // visible event, so "model TTFT" vs "CLI spawn overhead" is measured, not
+  // guessed (operator chat firstEventMs was 12–18s with no way to tell which
+  // side owned it). One `[agent-chat] spawn-timings` log line per turn,
+  // emitted at the first visible (delta/tool_call) event in the drain loop.
+  const tPrep = Date.now();
+  let tSpawned = 0;
+  let tFirstStdout = 0;
+  let spawnTimingsLogged = false;
   const agentCmd = resolveAgentBin(opts, backend);
   const argv = agentCmd.split(/\s+/).filter(Boolean);
   const command = argv[0];
@@ -1903,6 +1913,7 @@ export async function* runAgentChat(
     yield { type: 'error', message: `failed to spawn ${agentCmd}: ${(e as Error).message}` };
     return;
   }
+  tSpawned = Date.now();
 
   const onAbort = () => {
     try { child.kill('SIGTERM'); } catch { /* ignore */ }
@@ -2127,6 +2138,7 @@ export async function* runAgentChat(
         : handleClaudeEvent;
 
   child.stdout!.on('data', (chunk: Buffer) => {
+    if (!tFirstStdout) tFirstStdout = Date.now();
     stdoutLineBuf += chunk.toString('utf8');
     let nl: number;
     // eslint-disable-next-line no-cond-assign
@@ -2193,7 +2205,18 @@ export async function* runAgentChat(
   // Drain loop.
   while (true) {
     while (queue.length > 0) {
-      yield queue.shift()!;
+      const ev = queue.shift()!;
+      if (!spawnTimingsLogged && (ev.type === 'delta' || ev.type === 'tool_call')) {
+        spawnTimingsLogged = true;
+        const now = Date.now();
+        console.log(
+          `[agent-chat] spawn-timings backend=${backend} prepMs=${tSpawned ? tSpawned - tPrep : -1} ` +
+            `spawnToFirstStdoutMs=${tFirstStdout && tSpawned ? tFirstStdout - tSpawned : -1} ` +
+            `stdoutToFirstEventMs=${tFirstStdout ? now - tFirstStdout : -1} ` +
+            `totalToFirstEventMs=${now - tPrep} model=${opts.model ?? '(default)'}`,
+        );
+      }
+      yield ev;
     }
     if (exited) break;
     await new Promise<void>((resolve) => { resolveTick = resolve; });
