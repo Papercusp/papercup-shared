@@ -424,6 +424,12 @@ export const DEFAULT_GATEWAY_PRIORITY_MAP: PriorityTierMap = {
   cup: 3, // pot-rename dual-accept (P1 MIGRATE): additive twin of `bee`
   gym: 4,
   benchmark: 4,
+  // EI-315: llm-testing scenario runs (sim-user + judge calls, packages/operator-core/lib/
+  // llm-testing/llm-client.ts) used to go out UNLABELED and fall to the `default` band below
+  // (tier 5 — the most aggressively AIMD-shed lane), which is the literal root cause of
+  // "17/17 attempts 429-capped over 7h" under fleet load. Same batch-lane floor as gym/
+  // benchmark — high enough to stop starving, never ahead of real interactive work.
+  'llm-testing': 4,
   default: DEFAULT_TIER,
 };
 

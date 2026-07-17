@@ -164,6 +164,7 @@ test('tierOf — role map, numeric label, bare-numeric string, unknown → defau
   assert.equal(tierOf('bee'), 3);
   assert.equal(tierOf('gym'), 4);
   assert.equal(tierOf('benchmark'), 4);
+  assert.equal(tierOf('llm-testing'), 4, 'EI-315: llm-testing shares the gym/benchmark batch band, not the bottom default');
   assert.equal(tierOf('worker'), DEFAULT_TIER, 'unknown role → default band');
   assert.equal(tierOf(undefined), DEFAULT_TIER);
   assert.equal(tierOf(''), DEFAULT_TIER);
