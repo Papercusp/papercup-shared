@@ -88,6 +88,17 @@ export interface UnifiedWindowState {
   resetAt: number;
   /** Server verdict for the binding window: true once `status: rejected` was seen. */
   rejected: boolean;
+  /** Epoch ms this reading was OBSERVED (the last time an upstream response actually carried this
+   *  window's headers) — added for the gateway-healthz-stale-latch fix (EI-535): on an idle
+   *  account/fleet, `recordHeaders` simply never runs again, so `rejected`/`utilization`/`resetAt`
+   *  freeze at their last-seen values forever. A consumer reading `rejected:true` with no sense of
+   *  WHEN that was observed can't tell "genuinely still rejected" from "last seen hours ago, and the
+   *  window has long since rolled over" — this is that missing clock. Compare against `resetAt` (once
+   *  it's in the past, the window this reading describes has already ended server-side) or against
+   *  `Date.now()` for a plain staleness age. Optional so existing call sites/fixtures that construct
+   *  a `UnifiedWindowState` by hand (tests, older persisted snapshots) stay valid — absence just means
+   *  staleness can't be computed for that reading, not that it's fresh. */
+  observedAt?: number;
 }
 
 export interface TokenEstimate {
@@ -451,7 +462,7 @@ export function recordHeaders(s: GovernorState, headers: Record<string, string |
     // among same-verdict windows, the higher utilization binds.
     const u = util ?? (rejected ? 1 : 0);
     if (!binding || (rejected && !binding.rejected) || (rejected === binding.rejected && u > binding.utilization)) {
-      binding = { window: w.window, utilization: u, resetAt, rejected };
+      binding = { window: w.window, utilization: u, resetAt, rejected, observedAt: now };
     }
   }
   if (binding) s.unified = binding;
