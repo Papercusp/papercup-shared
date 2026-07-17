@@ -188,6 +188,27 @@ test('USAGE-CAP re-probe cap (2026-06-23 aviynw 12h over-park fix): an account-k
   assert.equal(usageCap.state.pausedUntil, clock + ROLLING_WINDOW_REPROBE_MAX_MS, 're-penalize re-parks to the bounded re-probe');
 });
 
+test('EI-535 (over-pause on inflated retry-after): a RAW retry-after-ONLY 429 — no unified reset header at all, matching the literal bug report ("429 retry-after 13193s") — is STILL bounded to the 30min re-probe cap, never a multi-hour pause', () => {
+  // The reported symptom named `retryAfterMs` specifically (not `resetAt`) as the inflated value, and this
+  // path has NO unified header to even guard against in gateway.ts's parseRateReset — so the protection has
+  // to live HERE, in penalize()'s own reprobeCapMs, which clamps `until` AFTER computing max(resetAt,
+  // now+retryAfterMs) regardless of which term produced it. Confirms retryAfterMs-only is bounded exactly
+  // like resetAt-only above — the fix is not narrower than the bug.
+  const clock = 1_000_000;
+  const INFLATED_RETRY_AFTER_MS = 13_193_000; // the exact figure from the bug report (~3.66h)
+  const acctKeyed = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock, storeKey: 'anthropic:opus@aviynw10' });
+  acctKeyed.penalize({ retryAfterMs: INFLATED_RETRY_AFTER_MS, rateLimited: true }); // no resetAt at all
+  assert.equal(
+    acctKeyed.state.pausedUntil,
+    clock + ROLLING_WINDOW_REPROBE_MS, // rateLimited:true ⇒ the FAST cap (this IS the transient-rate-429 shape gateway.ts's { ...reset, rateLimited:true } call site uses)
+    'retryAfterMs alone, with no resetAt to guard it, is still clamped — never the raw 13193s',
+  );
+  assert.ok(
+    acctKeyed.state.pausedUntil < clock + INFLATED_RETRY_AFTER_MS,
+    'the enforced pause is far below the inflated retry-after value the server sent',
+  );
+});
+
 test('ADAPTIVE rpm — a RATE 429 multiplicatively decreases the learned factor; usage-cap + transport do NOT (2026-06-22)', () => {
   let clock = 1_000_000;
   const mk = () => new RateLimitGovernor({ maxConcurrent: 100, rpm: 40 }, { now: () => clock });
