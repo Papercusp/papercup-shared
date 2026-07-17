@@ -816,8 +816,31 @@ test('recordHeaders — unified 5h rejected pauses a BOUNDED re-probe interval, 
   assert.equal(s.unified!.window, '5h'); // 5h binds over the allowed 7d
   assert.equal(s.unified!.utilization, 1.01);
   assert.equal(s.unified!.resetAt, resetSec * 1000, 'real reset kept for observability + failover rejoin');
+  assert.equal(s.unified!.observedAt, now, 'EI-535: stamped with WHEN this reading was taken, so a consumer can tell a fresh reading from a frozen one once traffic goes idle');
   assert.equal(decideAcquire(s, now, {}).allowed, false); // blocked during the re-probe pause
   assert.equal(decideAcquire(s, now + ROLLING_WINDOW_REPROBE_MAX_MS + 1, {}).allowed, true); // then re-probes
+});
+
+test('recordHeaders — unified.observedAt only advances on a FRESH response, so it stays a true staleness clock across an idle stretch (EI-535)', () => {
+  const s = initGovernorState({ maxConcurrent: 10 });
+  const t0 = 1_000;
+  const resetSec = 1_781_076_000;
+  recordHeaders(
+    s,
+    {
+      'anthropic-ratelimit-unified-5h-status': 'rejected',
+      'anthropic-ratelimit-unified-5h-utilization': '1.01',
+      'anthropic-ratelimit-unified-5h-reset': String(resetSec),
+    },
+    t0,
+  );
+  assert.equal(s.unified!.observedAt, t0);
+  // No traffic for hours (the idle-fleet scenario the bug report described) — nothing calls recordHeaders,
+  // so the reading (rejected/utilization/resetAt/observedAt) simply never changes. A caller comparing
+  // `observedAt` against the current wall clock (or `resetAt` against it) can tell this is a STALE reading;
+  // one that only inspects `rejected` cannot.
+  assert.equal(s.unified!.rejected, true, 'frozen at the last-observed verdict — this is the bug the fix makes legible, not a regression');
+  assert.equal(s.unified!.observedAt, t0, 'observedAt stays put — it is not a live clock, it is the last-write timestamp');
 });
 
 test('recordHeaders — a 7d-exhausted window parks FAR longer than the flat 2-min re-probe (owner 2026-06-21: agents pinned to a 97%-7d account 429ing while its 5h read empty)', () => {
