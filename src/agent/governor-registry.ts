@@ -312,6 +312,25 @@ export function getGovernor(provider: TurnProvider, modelClass: string, deps?: G
         storeKey: deps?.storeKey ?? key,
         // Bind the cross-process store (RB-007) unless the caller injected its own (tests do).
         ...(deps?.store ? {} : sharedStore ? { store: sharedStore } : {}),
+        // Pool counters for denial evidence (WI-5391 item 3): the registry is the only layer
+        // that can see a bucket's siblings, so it answers "how many `provider:modelClass`
+        // buckets exist, and how many are paused right now" — one bucket per account
+        // subscription (the account-blind base bucket counts as one). Stamped onto every
+        // governor-attested denial so its exclusion from the error rate is retro-auditable.
+        poolCounters:
+          deps?.poolCounters ??
+          (() => {
+            const now = Date.now();
+            let totalAccounts = 0;
+            let pausedAccounts = 0;
+            for (const [k, sibling] of registry) {
+              const parsed = parseGovernorKey(k);
+              if (parsed.provider !== provider || parsed.modelClass !== modelClass) continue;
+              totalAccounts += 1;
+              if (sibling.state.pausedUntil > now) pausedAccounts += 1;
+            }
+            return { pausedAccounts, totalAccounts };
+          }),
         onPause: (ev) => {
           emitGovernorPause({ ...ev, key });
           deps?.onPause?.(ev);

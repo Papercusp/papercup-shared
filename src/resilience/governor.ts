@@ -592,6 +592,7 @@ export class RateLimitGovernor {
     this.store = deps.store;
     this.storeKey = deps.storeKey;
     this.globalGate = deps.globalGate;
+    this.poolCounters = deps.poolCounters;
     if (this.store && !this.storeKey) throw new Error('RateLimitGovernor: storeKey is required when a store is set');
   }
 
@@ -747,8 +748,15 @@ export class RateLimitGovernor {
         w += Math.min(pauseTicket * RESUME_STAGGER_STEP_MS, RESUME_STAGGER_MAX_MS);
       }
       if (waited + w > maxWait) {
-        // Preserve the admission fact at the boundary. A caller may attach pool counters, but
-        // the governor can still distinguish a pause wall from a free-slot/concurrency miss.
+        // Preserve the admission fact at the boundary. The registry-injected poolCounters give
+        // the denial its retro-audit evidence (how many sibling buckets were walled, of how
+        // many) — without them a governor-attested exclusion is unauditable (WI-5391 item 3).
+        let counters: { pausedAccounts: number; totalAccounts: number } | undefined;
+        try {
+          counters = this.poolCounters?.();
+        } catch {
+          /* best-effort — counters must never block or break admission */
+        }
         opts.onDenied?.({
           reason: d.reason === 'paused' || d.reason === 'rpm' || d.reason === 'itpm' || d.reason === 'otpm' || d.reason === 'pace'
             ? 'all-accounts-paused'
@@ -756,6 +764,7 @@ export class RateLimitGovernor {
           via: 'governor',
           ...(d.reason ? { governorReason: d.reason } : {}),
           ...(d.reason === 'concurrency' ? { freeSlots: 0 } : {}),
+          ...(counters ? { pausedAccounts: counters.pausedAccounts, totalAccounts: counters.totalAccounts } : {}),
         });
         return null; // would wait too long → give up, let the caller decide
       }
