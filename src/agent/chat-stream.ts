@@ -1235,7 +1235,7 @@ async function* statelessAgentChat(
       // it can still record it — a backoff sleep that runs past `retryDeadlineMs` hands the
       // outcome to the caller's own timer, which reports a generic timeout instead of the
       // real (capacity-classifiable) condition. Never start a sleep that can't pay for itself.
-      if (opts.retryDeadlineMs !== undefined && Date.now() + backoffMs >= opts.retryDeadlineMs) {
+      if (retryLadderDeadlineExceeded(opts.retryDeadlineMs, backoffMs)) {
         yield {
           type: 'error',
           message: `${transport.label} error: ${err instanceof Error ? err.message : String(err)} (retry ladder stopped at attempt ${attempt}/${RETRY_MAX}: caller retry deadline reached)${statelessErrorContext(transport, err)}`,
@@ -1275,6 +1275,20 @@ function statelessErrorContext(transport: StatelessTransport, err: unknown): str
 
 /** Convert an SDK error's `.headers` (a Headers object OR a plain object) to a record so
     the TurnError classifier can read `retry-after` / `anthropic-ratelimit-*`. */
+/**
+ * WI-5391 (pure, exported for tests): true when starting a `backoffMs` retry sleep would
+ * cross the caller's absolute retry deadline — the ladder must then surface the last
+ * classified error instead of sleeping, so a deadline-bounded caller (a scout cycle)
+ * records the true capacity condition rather than its own generic timeout.
+ */
+export function retryLadderDeadlineExceeded(
+  retryDeadlineMs: number | undefined,
+  backoffMs: number,
+  nowMs: number = Date.now(),
+): boolean {
+  return retryDeadlineMs !== undefined && nowMs + backoffMs >= retryDeadlineMs;
+}
+
 export function headersToRecord(h: unknown): Record<string, string | undefined> | undefined {
   if (!h || typeof h !== 'object') return undefined;
   const anyH = h as { forEach?: (cb: (v: string, k: string) => void) => void };

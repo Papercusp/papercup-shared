@@ -4,7 +4,29 @@
  */
 import { test, afterEach } from 'vitest';
 import assert from 'node:assert/strict';
-import { normalizeModelForClaude, headersToRecord, buildSystemParam, CLAUDE_CODE_IDENTIFIER, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, GATEWAY_PRIORITY_HEADER } from './chat-stream';
+import { normalizeModelForClaude, headersToRecord, buildSystemParam, CLAUDE_CODE_IDENTIFIER, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, GATEWAY_PRIORITY_HEADER, retryLadderDeadlineExceeded } from './chat-stream';
+
+// retryLadderDeadlineExceeded (WI-5391): the anthropic-direct transient-retry ladder must
+// never start a backoff sleep that crosses the caller's absolute retry deadline — a
+// deadline-bounded caller (a scout cycle) has to receive the last CLASSIFIED transport
+// error (a capacity-classifiable 429/529) while its own timer still has room, instead of
+// the ladder outliving that timer and the failure being mislabeled a generic cycle timeout.
+test('retryLadderDeadlineExceeded — no deadline → ladder unchanged (never exceeded)', () => {
+  assert.equal(retryLadderDeadlineExceeded(undefined, 60_000, 1_000_000), false);
+  assert.equal(retryLadderDeadlineExceeded(undefined, 0, Number.MAX_SAFE_INTEGER), false);
+});
+test('retryLadderDeadlineExceeded — sleep fits before the deadline → keep retrying', () => {
+  assert.equal(retryLadderDeadlineExceeded(1_000_000, 2_000, 990_000), false);
+});
+test('retryLadderDeadlineExceeded — sleep would cross (or exactly meet) the deadline → bail', () => {
+  assert.equal(retryLadderDeadlineExceeded(1_000_000, 2_000, 999_000), true);
+  assert.equal(retryLadderDeadlineExceeded(1_000_000, 2_000, 998_000), true); // exact boundary
+  assert.equal(retryLadderDeadlineExceeded(1_000_000, 60_000, 999_999), true);
+});
+test('retryLadderDeadlineExceeded — already past the deadline → bail regardless of backoff', () => {
+  assert.equal(retryLadderDeadlineExceeded(1_000_000, 0, 1_000_000), true);
+  assert.equal(retryLadderDeadlineExceeded(1_000_000, 0, 2_000_000), true);
+});
 
 // priorityTierHeaders (gateway-priority-tiers): the in-process anthropic-direct call
 // stamps `x-papercusp-priority: <role>` so the pacing gateway tiers it (scout/queen=1)
