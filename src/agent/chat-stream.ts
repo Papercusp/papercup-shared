@@ -579,6 +579,19 @@ export interface RunAgentChatOptions {
    */
   governorMaxWaitMs?: number;
   /**
+   * ABSOLUTE epoch-ms deadline for the anthropic-direct transient-retry ladder (WI-5391,
+   * the WI-4475 class). The 8-attempt 2/4/8/16/32/60/60/60s ladder is deliberately patient,
+   * but it is deadline-blind: a caller with a hard outer budget (a scout cycle, a request
+   * deadline) can have the ladder outlive its own timer, which then fires FIRST and
+   * mislabels an honest, classified capacity error (429/529) as the caller's generic
+   * timeout ("cycle timed out …", $0 spent). With this set, the ladder refuses to start a
+   * backoff sleep it cannot pay for before the deadline and yields the LAST classified
+   * transport error instead — the caller records the true condition while it still has
+   * time to. Omit ⇒ the proven ladder runs unchanged. `governorMaxWaitMs` bounds one
+   * ADMISSION wait; this bounds the whole retry ladder — a bounded caller wants both.
+   */
+  retryDeadlineMs?: number;
+  /**
    * Fired once the process-local shared governor ADMITS this call — i.e. immediately before
    * the underlying HTTP request is issued — and again on each retry attempt.
    *
@@ -1218,6 +1231,17 @@ async function* statelessAgentChat(
         return;
       }
       const backoffMs = Math.min(RETRY_CAP_MS, 1000 * 2 ** attempt) + Math.random() * 500;
+      // WI-5391: a deadline-bounded caller must get the HONEST classified error back while
+      // it can still record it — a backoff sleep that runs past `retryDeadlineMs` hands the
+      // outcome to the caller's own timer, which reports a generic timeout instead of the
+      // real (capacity-classifiable) condition. Never start a sleep that can't pay for itself.
+      if (opts.retryDeadlineMs !== undefined && Date.now() + backoffMs >= opts.retryDeadlineMs) {
+        yield {
+          type: 'error',
+          message: `${transport.label} error: ${err instanceof Error ? err.message : String(err)} (retry ladder stopped at attempt ${attempt}/${RETRY_MAX}: caller retry deadline reached)${statelessErrorContext(transport, err)}`,
+        };
+        return;
+      }
       console.warn(
         `[anthropic-direct] transient (attempt ${attempt}/${RETRY_MAX}), retrying in ${Math.round(backoffMs)}ms: ${err instanceof Error ? err.message.slice(0, 140) : String(err)}`,
       );
