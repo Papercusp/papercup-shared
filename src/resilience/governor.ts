@@ -127,8 +127,13 @@ export interface AdmissionDenial {
   via?: AdmissionDenialVia;
   /** The governor's raw internal decision reason (paused/rpm/itpm/otpm/pace/concurrency) — audit trail. */
   governorReason?: string;
-  /** Optional pool counters when the caller owns a pool-wide view. */
+  /** Pool counters at denial time (caller- or registry-provided): how many of the pool's
+   * buckets were paused / existed when the permit was withheld. A governor-attested denial
+   * WITHOUT these is excluded from the error rate on the governor's say-so alone with
+   * nothing to retro-audit (WI-5391 item 3 — evidence parity with the http-429 leg's
+   * persisted poolSnapshot). */
   pausedAccounts?: number;
+  totalAccounts?: number;
   freeSlots?: number;
 }
 
@@ -540,6 +545,10 @@ export interface GovernorDeps {
   storeKey?: string;
   /** Fleet-wide concurrency gate (D-004) shared across all buckets. Omit = no global cap. */
   globalGate?: GlobalConcurrencyGate;
+  /** Pool-wide counters stamped onto denials (WI-5391 item 3). The governor itself is ONE
+   * bucket and cannot see its siblings; the registry (which can) injects this. Best-effort:
+   * a throw or undefined return mints the denial without counters, never blocks admission. */
+  poolCounters?: () => { pausedAccounts: number; totalAccounts: number } | undefined;
 }
 
 export interface AcquireOpts {
@@ -565,6 +574,7 @@ export class RateLimitGovernor {
   private readonly store?: GovernorStore;
   private readonly storeKey?: string;
   private readonly globalGate?: GlobalConcurrencyGate;
+  private readonly poolCounters?: () => { pausedAccounts: number; totalAccounts: number } | undefined;
   private readonly floor: GovernorLimits;
   /** Bumped on every account-wide penalty — lets a release decide whether its turn was CLEAN
       (no penalty between acquire and release) for the AIMD feedback (D-005). */
