@@ -518,8 +518,7 @@ test('RateLimitGovernor.acquire — denial carries poolCounters when the dep pro
     { maxConcurrent: 1 },
     { now: () => clock, sleep: async (ms) => { clock += ms; }, poolCounters: () => ({ pausedAccounts: 3, totalAccounts: 4 }) },
   );
-  const held = await g.acquire({});
-  assert.ok(held);
+  // A far-off pause wall (concurrency stays free, so the PAUSE is what denies).
   g.penalize({ retryAfterMs: 60 * 60 * 1000 });
   let denial: import('./governor').AdmissionDenial | undefined;
   const r = await g.acquire({}, { maxWaitMs: 1000, onDenied: (d) => (denial = d) });
@@ -528,7 +527,6 @@ test('RateLimitGovernor.acquire — denial carries poolCounters when the dep pro
   assert.equal(denial?.via, 'governor');
   assert.equal(denial?.pausedAccounts, 3);
   assert.equal(denial?.totalAccounts, 4);
-  held!();
 });
 test('RateLimitGovernor.acquire — a throwing poolCounters dep still mints the denial (no counters)', async () => {
   const g = new RateLimitGovernor(
