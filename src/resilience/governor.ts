@@ -116,8 +116,17 @@ export interface AcquireDecision {
  * governor boundary so callers do not infer pool state from provider prose. */
 export type AdmissionDenialReason = 'all-accounts-paused' | 'no-free-slot' | 'provider-429';
 
+/** What ATTESTED the denial. A denial without a `via` stamp is evidence-free — the capacity
+ * classifier (scout/capacity-errors.ts) refuses to exclude it from the error rate, so an
+ * unstamped mint site fails LOUD (counted as an error), never silent (WI-5391 Part B). */
+export type AdmissionDenialVia = 'governor' | 'http-429';
+
 export interface AdmissionDenial {
   reason: AdmissionDenialReason;
+  /** Evidence stamp: which authority minted this denial. Absent ⇒ evidence-free ⇒ not capacity. */
+  via?: AdmissionDenialVia;
+  /** The governor's raw internal decision reason (paused/rpm/itpm/otpm/pace/concurrency) — audit trail. */
+  governorReason?: string;
   /** Optional pool counters when the caller owns a pool-wide view. */
   pausedAccounts?: number;
   freeSlots?: number;
@@ -734,6 +743,8 @@ export class RateLimitGovernor {
           reason: d.reason === 'paused' || d.reason === 'rpm' || d.reason === 'itpm' || d.reason === 'otpm' || d.reason === 'pace'
             ? 'all-accounts-paused'
             : 'no-free-slot',
+          via: 'governor',
+          ...(d.reason ? { governorReason: d.reason } : {}),
           ...(d.reason === 'concurrency' ? { freeSlots: 0 } : {}),
         });
         return null; // would wait too long → give up, let the caller decide

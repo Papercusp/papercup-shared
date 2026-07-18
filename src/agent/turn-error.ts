@@ -206,11 +206,21 @@ export function classifyHttpError(
     return mk('usage_limit', msg, provider, { retryAfterMs, resetAt, ...(input.admissionDenial ? { admissionDenial: input.admissionDenial } : {}) });
   }
   if (st === 429 || (st === undefined && (RATE_RE.test(msg) || TRANSIENT_OVERRIDE_RE.test(msg)))) {
+    // Fail-closed mint discipline (WI-5391 Part B): only a REAL HTTP 429 status attests a
+    // capacity denial (`via:'http-429'`). The prose branch (no status, message merely LOOKS
+    // rate-limity) mints NOTHING — that shape is indistinguishable from an admission-path
+    // defect (WI-4541), and an evidence-free denial would let the defect vanish into the
+    // capacity bucket of the very error metric that should catch it. Prose failures stay
+    // 'rate_limited' for retry policy but COUNT as errors unless the governor attached a
+    // typed denial itself.
     return mk('rate_limited', msg, provider, {
       retryAfterMs,
       resetAt,
-      // A provider 429 is a typed capacity signal even when the body is opaque.
-      admissionDenial: input.admissionDenial ?? { reason: 'provider-429' },
+      ...(input.admissionDenial
+        ? { admissionDenial: input.admissionDenial }
+        : st === 429
+          ? { admissionDenial: { reason: 'provider-429', via: 'http-429' } as AdmissionDenial }
+          : {}),
     });
   }
   if (st === 529 || st === 503 || st === 502 || st === 500 || st === 504 || (st === undefined && OVERLOAD_RE.test(msg))) {
