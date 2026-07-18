@@ -244,6 +244,24 @@ test('AIMD — inactive (effective null, no adaptation) until a finite cap is in
 
 // ── Per-account bucket keying (cloud-deployment-layer Phase 7, P-019) ─────────
 
+// WI-5391 item 3: the registry injects poolCounters so a governor-attested denial carries
+// its pool's paused/total bucket counts — the retro-audit evidence for the governor leg.
+test('getGovernor — registry poolCounters count same provider+modelClass siblings (paused vs total)', async () => {
+  const a = getGovernor('anthropic', 'opus', undefined, 'acct-a');
+  const b = getGovernor('anthropic', 'opus', undefined, 'acct-b');
+  getGovernor('anthropic', 'haiku'); // different model class — must NOT count
+  getGovernor('openai', 'opus'); // different provider — must NOT count
+  b.penalize({ retryAfterMs: 60 * 60 * 1000 }); // wall one sibling
+  // Exhaust a's only... concurrency is per-floor; deny via maxWaitMs:0 against a pause on a.
+  a.penalize({ retryAfterMs: 60 * 60 * 1000 });
+  let denial: import('../resilience/governor').AdmissionDenial | undefined;
+  const r = await a.acquire({}, { maxWaitMs: 0, onDenied: (d) => (denial = d) });
+  assert.equal(r, null);
+  assert.equal(denial?.via, 'governor');
+  assert.equal(denial?.totalAccounts, 2); // acct-a + acct-b (opus buckets only)
+  assert.equal(denial?.pausedAccounts, 2); // both walled at denial time
+});
+
 test('governorKey — global without an account, account-scoped with one', () => {
   assert.equal(governorKey('anthropic', 'opus'), 'anthropic:opus');
   assert.equal(governorKey('anthropic', 'opus', 'acct-1'), 'anthropic:opus@acct-1');

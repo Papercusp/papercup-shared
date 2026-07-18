@@ -510,6 +510,38 @@ test('RateLimitGovernor.acquire — bounded denial carries a typed admission rea
   assert.deepEqual(denial, { reason: 'no-free-slot', via: 'governor', governorReason: 'concurrency', freeSlots: 0 });
   held!();
 });
+// WI-5391 item 3: pool counters stamped at the denial mint make a governor-attested
+// exclusion retro-auditable (evidence parity with the http-429 leg's poolSnapshot).
+test('RateLimitGovernor.acquire — denial carries poolCounters when the dep provides them', async () => {
+  let clock = 0;
+  const g = new RateLimitGovernor(
+    { maxConcurrent: 1 },
+    { now: () => clock, sleep: async (ms) => { clock += ms; }, poolCounters: () => ({ pausedAccounts: 3, totalAccounts: 4 }) },
+  );
+  const held = await g.acquire({});
+  assert.ok(held);
+  g.penalize({ retryAfterMs: 60 * 60 * 1000 });
+  let denial: import('./governor').AdmissionDenial | undefined;
+  const r = await g.acquire({}, { maxWaitMs: 1000, onDenied: (d) => (denial = d) });
+  assert.equal(r, null);
+  assert.equal(denial?.reason, 'all-accounts-paused');
+  assert.equal(denial?.via, 'governor');
+  assert.equal(denial?.pausedAccounts, 3);
+  assert.equal(denial?.totalAccounts, 4);
+  held!();
+});
+test('RateLimitGovernor.acquire — a throwing poolCounters dep still mints the denial (no counters)', async () => {
+  const g = new RateLimitGovernor(
+    { maxConcurrent: 1 },
+    { poolCounters: () => { throw new Error('registry unavailable'); } },
+  );
+  const held = await g.acquire({});
+  let denial: import('./governor').AdmissionDenial | undefined;
+  const r = await g.acquire({}, { maxWaitMs: 0, onDenied: (d) => (denial = d) });
+  assert.equal(r, null);
+  assert.deepEqual(denial, { reason: 'no-free-slot', via: 'governor', governorReason: 'concurrency', freeSlots: 0 });
+  held!();
+});
 test('RateLimitGovernor.acquire — returns null when the abort signal is already aborted', async () => {
   const g = new RateLimitGovernor({ maxConcurrent: 1 }, { now: () => 0, sleep: async () => {} });
   await g.acquire({}); // exhaust concurrency so the next would wait
