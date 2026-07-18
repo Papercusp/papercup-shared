@@ -43,7 +43,8 @@ test('classifyHttpError — 429 → rate_limited, honors retry-after + reset', (
     message: 'rate_limit_error',
   }, 'anthropic');
   assert.equal(e.class, 'rate_limited');
-  assert.deepEqual(e.admissionDenial, { reason: 'provider-429' });
+  // A REAL HTTP 429 status attests the denial (WI-5391 fail-closed mint discipline).
+  assert.deepEqual(e.admissionDenial, { reason: 'provider-429', via: 'http-429' });
   assert.equal(e.retryAfterMs, 12_000);
   assert.equal(e.resetAt, Date.parse('2026-06-02T12:00:00Z'));
   assert.equal(e.retryable, true);
@@ -75,6 +76,14 @@ test('classifyHttpError — no status, message regex → rate_limited / overload
   assert.equal(classifyHttpError({ message: '429 rate limit exceeded' }).class, 'rate_limited');
   assert.equal(classifyHttpError({ message: 'Overloaded' }).class, 'overloaded');
   assert.equal(classifyHttpError({ message: 'ECONNRESET socket hang up' }).class, 'transient_io');
+});
+test('classifyHttpError — prose-only rate-limit (no status) mints NO admission denial (fail-closed, WI-5391)', () => {
+  // A message that merely LOOKS rate-limity is indistinguishable from an admission-path
+  // defect (WI-4541). Without a real 429 status or a governor-attached denial there is no
+  // evidence — the failure must stay a loud error, never a silently-excluded capacity event.
+  const e = classifyHttpError({ message: '429 rate limit exceeded' });
+  assert.equal(e.class, 'rate_limited');
+  assert.equal(e.admissionDenial, undefined);
 });
 
 // --- classifySubprocessResult (claude/omp/codex CLI) ---

@@ -506,7 +506,8 @@ test('RateLimitGovernor.acquire — bounded denial carries a typed admission rea
   let denial: import('./governor').AdmissionDenial | undefined;
   const r = await g.acquire({}, { maxWaitMs: 0, onDenied: (d) => (denial = d) });
   assert.equal(r, null);
-  assert.deepEqual(denial, { reason: 'no-free-slot', freeSlots: 0 });
+  // via:'governor' is the attestation stamp the capacity classifier requires (WI-5391).
+  assert.deepEqual(denial, { reason: 'no-free-slot', via: 'governor', governorReason: 'concurrency', freeSlots: 0 });
   held!();
 });
 test('RateLimitGovernor.acquire — returns null when the abort signal is already aborted', async () => {
