@@ -114,7 +114,22 @@ export interface AcquireDecision {
 
 /** Why a bounded acquire could not admit a request. This is intentionally typed at the
  * governor boundary so callers do not infer pool state from provider prose. */
-export type AdmissionDenialReason = 'all-accounts-paused' | 'no-free-slot' | 'provider-429';
+export type AdmissionDenialReason = 'rate-limit-blocked' | 'no-free-slot' | 'provider-429';
+
+/**
+ * The pre-WI-5435 spelling of `rate-limit-blocked`, retained ONLY so the ledger-read
+ * boundary (scout/capacity-errors.ts `admissionDenialFrom`) can normalize rows persisted
+ * before the rename. Never emit it.
+ *
+ * It was renamed because the name asserted a pool-wide fact the value never measured: it is
+ * a static mapping over THIS ONE governor instance's own `d.reason` (see the mint site below)
+ * and never reads the registry, the pool, or any sibling — a live row carried
+ * `reason:'all-accounts-paused'` with `pausedAccounts:1` of `totalAccounts:2`. During a
+ * failover certification that string reads as exculpatory evidence ("the pool was exhausted,
+ * nothing to see here") while carrying no evidence at all, which is exactly how a genuine
+ * failover defect (WI-4475) would stay hidden.
+ */
+export const LEGACY_RATE_LIMIT_BLOCKED_REASON = 'all-accounts-paused';
 
 /** What ATTESTED the denial. A denial without a `via` stamp is evidence-free — the capacity
  * classifier (scout/capacity-errors.ts) refuses to exclude it from the error rate, so an
@@ -758,8 +773,12 @@ export class RateLimitGovernor {
           /* best-effort — counters must never block or break admission */
         }
         opts.onDenied?.({
+          // A CLASS label over this bucket's own decision — "blocked for a rate-limit-ish
+          // reason" vs "...for a concurrency reason". Deliberately NOT a pool claim: the
+          // pool-aware evidence on the same row is `pausedAccounts`/`totalAccounts` below,
+          // which come from a different read (governor-registry poolCounters). WI-5435.
           reason: d.reason === 'paused' || d.reason === 'rpm' || d.reason === 'itpm' || d.reason === 'otpm' || d.reason === 'pace'
-            ? 'all-accounts-paused'
+            ? 'rate-limit-blocked'
             : 'no-free-slot',
           via: 'governor',
           ...(d.reason ? { governorReason: d.reason } : {}),

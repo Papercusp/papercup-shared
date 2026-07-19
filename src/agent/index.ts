@@ -79,6 +79,7 @@ export type {
   GovernorLimits,
   GlobalConcurrencyGate,
 } from '../resilience/governor';
+export { LEGACY_RATE_LIMIT_BLOCKED_REASON } from '../resilience/governor';
 export {
   runAgentTurn,
   type TurnOutcome,

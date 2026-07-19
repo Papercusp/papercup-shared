@@ -523,7 +523,7 @@ test('RateLimitGovernor.acquire — denial carries poolCounters when the dep pro
   let denial: import('./governor').AdmissionDenial | undefined;
   const r = await g.acquire({}, { maxWaitMs: 1000, onDenied: (d) => (denial = d) });
   assert.equal(r, null);
-  assert.equal(denial?.reason, 'all-accounts-paused');
+  assert.equal(denial?.reason, 'rate-limit-blocked');
   assert.equal(denial?.via, 'governor');
   assert.equal(denial?.pausedAccounts, 3);
   assert.equal(denial?.totalAccounts, 4);
