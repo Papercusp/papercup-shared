@@ -38,6 +38,49 @@ test('maintenance lane (deterministic-context-carry P-002): compaction/summarize
   assert.equal(DEFAULT_GATEWAY_PRIORITY_MAP.compaction, 1);
 });
 
+test('WI-4542 — every autonomous role gets a DISTINCT queue priority, no longer tied with bee/untagged at 0', () => {
+  assert.equal(priorityFromLabel('scout'), 60);
+  assert.equal(priorityFromLabel('blender'), 60);
+  assert.equal(priorityFromLabel('overwatch'), 60);
+  assert.equal(priorityFromLabel('kettle'), 60);
+  assert.equal(priorityFromLabel('su'), 40);
+  assert.equal(priorityFromLabel('bee'), 10);
+  assert.equal(priorityFromLabel('cup'), 10);
+  assert.equal(priorityFromLabel('gym'), 5);
+  assert.equal(priorityFromLabel('benchmark'), 5);
+  assert.equal(priorityFromLabel('llm-testing'), 5);
+  // Untagged / batch traffic stays the floor — every named role now strictly outranks it.
+  assert.equal(priorityFromLabel(undefined), 0);
+  assert.equal(priorityFromLabel('batch'), 0);
+  assert.ok(priorityFromLabel('scout') > priorityFromLabel('su'));
+  assert.ok(priorityFromLabel('su') > priorityFromLabel('bee'));
+  assert.ok(priorityFromLabel('bee') > priorityFromLabel('gym'));
+  assert.ok(priorityFromLabel('gym') > priorityFromLabel('batch'));
+});
+
+test('WI-4542 — DEFAULT_GATEWAY_PRIORITY_MAP tier order is never CONTRADICTED by priorityFromLabel order (the divergence guard)', () => {
+  // The two tables are hand-maintained separately (a merge would force every literal-priority-level
+  // caller like x-papercusp-priority:'high' through the tier vocabulary too), so this test is the
+  // "single source of truth" in spirit: it fails the build the moment a role is added to one table
+  // with a rank that contradicts the other, instead of letting them silently drift apart again.
+  const roles = Object.keys(DEFAULT_GATEWAY_PRIORITY_MAP).filter((k) => k !== 'default');
+  for (const a of roles) {
+    for (const b of roles) {
+      if (a === b) continue;
+      const tierA = DEFAULT_GATEWAY_PRIORITY_MAP[a];
+      const tierB = DEFAULT_GATEWAY_PRIORITY_MAP[b];
+      const priA = priorityFromLabel(a);
+      const priB = priorityFromLabel(b);
+      // A STRICTLY more-protected tier (lower number) must never carry a STRICTLY lower queue
+      // priority than a less-protected one — that's the exact WI-4542 contradiction (a role sitting
+      // in a better tier but ranked below/tied-with a worse one on the numeric axis).
+      if (tierA < tierB) {
+        assert.ok(priA >= priB, `${a} (tier ${tierA}, pri ${priA}) must not rank below ${b} (tier ${tierB}, pri ${priB})`);
+      }
+    }
+  }
+});
+
 test('admits highest priority first when slots are scarce', async () => {
   const q = new PriorityAdmissionQueue({ maxConcurrent: 1 });
   const order: string[] = [];
