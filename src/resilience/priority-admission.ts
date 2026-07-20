@@ -196,11 +196,14 @@ export class PriorityAdmissionQueue {
     //     Borrowing rides on two guards, because a borrowed slot CANNOT BE PREEMPTED — an in-flight
     //     upstream call can't be clawed back, so a slot lent out is gone for a whole request-duration:
     //
-    //  (a) Never borrow over the head of an OUTRANKING WAITER already queued. Load-bearing, not
-    //      belt-and-braces: pump() picks by NUMERIC priority, and `priorityFromLabel` scores
-    //      su/scout/bee/untagged all 0 — so a tier-2 waiter does NOT outrank an earlier-queued tier-5
-    //      one on priority alone. The TIER has to break that tie, or borrowing would starve the
-    //      better band.
+    //  (a) Never borrow over the head of an OUTRANKING WAITER already queued. Still necessary even
+    //      though `priorityFromLabel`'s DEFAULT ladder now gives every known role a DISTINCT numeric
+    //      priority in tier order (WI-4542 — it used to score su/scout/bee/untagged all 0, so a
+    //      tier-2 waiter did not outrank an earlier-queued tier-5 one on priority alone): an
+    //      env-overridden `GATEWAY_PRIORITY_MAP`, an unrecognized role, or a caller that hands the
+    //      queue an explicit `{ priority, tier }` pair directly (as the tests below do) can still tie
+    //      or invert priority vs tier. The TIER breaks that tie regardless of the label ladder, or
+    //      borrowing would starve the better band.
     //
     //  (b) A tier > 1 must leave a HEADROOM slot free, so a tier-1 (interactive/queen) request that
     //      arrives LATER is still admitted INSTANTLY rather than waiting out a borrowed request. The
@@ -358,10 +361,42 @@ export class PriorityAdmissionQueue {
   }
 }
 
+/** WI-4542 — the vocabulary-divergence fix: numeric within-queue PRIORITY for every AUTONOMOUS role
+ *  that also carries a TIER band in `DEFAULT_GATEWAY_PRIORITY_MAP` below, kept in the SAME rank order
+ *  as that map so the two vocabularies can't silently disagree again. Before this table, every role
+ *  not hand-cased in `priorityFromLabel`'s switch below (scout/blender/overwatch/kettle/su/gym/
+ *  benchmark/llm-testing) fell through to the untagged default of 0 — identical to a bee or literally
+ *  no header at all — despite sitting in strictly more-protected tiers. Consequence: those roles
+ *  queued dead-last within their own tier and lost same-priority ties (broken by FIFO arrival, not
+ *  tier) to lower-tier traffic whenever the shared pool had slack. Interactive/queen/mug/operator
+ *  (100), maintenance/compaction (75), and the tier-less literal levels high/low/batch/'' keep their
+ *  existing hand-tuned numbers in the switch below — this table covers exactly the gap.
+ *  `test('DEFAULT_GATEWAY_PRIORITY_MAP tier order matches priorityFromLabel order', …)` guards the
+ *  two tables from re-diverging without requiring them to be merged into one literal object. */
+const ROLE_QUEUE_PRIORITY: Record<string, number> = {
+  // tier 1 (DEFAULT_GATEWAY_PRIORITY_MAP), but below interactive/queen/mug/operator/maintenance —
+  // the owner's live turn and maintenance calls must still preempt an autonomous role's request.
+  scout: 60,
+  blender: 60,
+  overwatch: 60,
+  kettle: 60,
+  // tier 2
+  su: 40,
+  // tier 3 — still above the untagged/batch default (0), so a labeled bee no longer ties with an
+  // anonymous request when both happen to be admissible in the shared pool at once.
+  bee: 10,
+  cup: 10,
+  // tier 4
+  gym: 5,
+  benchmark: 5,
+  'llm-testing': 5,
+};
+
 /** Map a request priority label/number to a numeric admission priority (higher = sooner). */
 export function priorityFromLabel(label: string | number | undefined): number {
   if (typeof label === 'number') return label;
-  switch ((label ?? '').toLowerCase()) {
+  const key = (label ?? '').toLowerCase();
+  switch (key) {
     case 'interactive':
     case 'operator':
     case 'queen':
@@ -377,11 +412,10 @@ export function priorityFromLabel(label: string | number | undefined): number {
       return 50;
     case 'low':
     case 'batch':
-    case 'bee':
-    case 'cup': // pot-rename dual-accept (P1 MIGRATE): additive twin of `bee`
     case '':
       return 0;
     default: {
+      if (key in ROLE_QUEUE_PRIORITY) return ROLE_QUEUE_PRIORITY[key];
       const n = Number(label);
       return Number.isFinite(n) ? n : 0;
     }
