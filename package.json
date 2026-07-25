@@ -19,6 +19,7 @@
     "./*.css": "./src/*.css"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.81.0",
     "@papercusp/grid-core": "*"
   },
   "scripts": {
