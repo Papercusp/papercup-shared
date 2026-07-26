@@ -17,6 +17,15 @@ export {
   resolveAnthropicBaseUrl,
   probeStatelessTransport,
   type StatelessTransportProbe,
+  // EI-18685386548651513 / WI-5391 — the delegated-gateway transport choice (EI-12940): a
+  // caller with no local Claude OAuth session (every in-process bg-host/Scout ideator call —
+  // register-scout-action.ts's FB-16 wiring) egresses via the LOCAL inference gateway's account
+  // pool instead of failing. Exported so a cross-package test (operator-core's real
+  // createInferenceGateway) can exercise this exact path end-to-end without duplicating its
+  // header/token/URL construction — see gateway-scout-delegated-failover.test.ts.
+  chooseStatelessTransport,
+  resolveDelegatedGatewayUrl,
+  GATEWAY_DELEGATED_AUTH_TOKEN,
   AGENT_BACKENDS,
   SUBPROCESS_AGENT_BACKENDS,
   CLAUDE_BUILTIN_TOOLS,
