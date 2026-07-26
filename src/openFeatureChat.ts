@@ -41,7 +41,22 @@ export async function openFeatureChat(opts: {
    *  first, doesn't implement). Carried to the panel + sent per message;
    *  the agent-chats stream handler reads it when assembling the prompt. */
   mode?: 'chat' | 'discuss';
+  /** WI-6023 — HOST-THE-PANEL callers pass false.
+   *
+   *  Default true keeps the dock path byte-identical: queue the detail on
+   *  `__PAPERCUSP_PENDING_CHAT_OPENS__` + dispatch OPEN_CHAT_EVENT, which
+   *  only HarnessesDock / PiTerminalsDock listen for.
+   *
+   *  A caller OUTSIDE a dock tree (WorkItemPopupModal, mounted by
+   *  OperatorChat) must pass false and render <ChatPanel> itself with the
+   *  returned chatId — the PlanChat precedent. Leaving it true there is the
+   *  WI-6023 bug and is worse than a no-op: the event has no listener, so
+   *  the click looks dead, AND the detail still lands on the pending queue,
+   *  so the next time a dock mounts it drains a backlog of stale opens and
+   *  spews chat panels the user asked for minutes ago somewhere else. */
+  dispatch?: boolean;
 }): Promise<{ chatId: string } | { error: string }> {
+  const dispatch = opts.dispatch !== false;
   try {
     // Reuse-before-create (WI-125): a repeat click for the same
     // (role, featureId) focuses the existing live conversation instead of
@@ -67,7 +82,7 @@ export async function openFeatureChat(opts: {
             featureId: opts.featureId,
             ...(opts.mode ? { mode: opts.mode } : {}),
           };
-          if (typeof window !== 'undefined') {
+          if (dispatch && typeof window !== 'undefined') {
             const w = window as WindowWithQueue;
             const queue = w.__PAPERCUSP_PENDING_CHAT_OPENS__ ?? [];
             queue.push(detail);
@@ -102,7 +117,7 @@ export async function openFeatureChat(opts: {
       featureId: chat.feature_id ?? undefined,
       ...(opts.mode ? { mode: opts.mode } : {}),
     };
-    if (typeof window !== 'undefined') {
+    if (dispatch && typeof window !== 'undefined') {
       const w = window as WindowWithQueue;
       const queue = w.__PAPERCUSP_PENDING_CHAT_OPENS__ ?? [];
       queue.push(detail);
