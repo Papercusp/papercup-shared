@@ -16,6 +16,8 @@ import {
   withAgentBinDirs,
   tokenIsLive,
   chooseStatelessTransport,
+  defaultAccountActive,
+  DEFAULT_ACCOUNT_ACTIVE_ENV,
   probeStatelessTransport,
   invalidateClaudeTokenCache,
   resolveAnthropicBaseUrl,
@@ -169,6 +171,68 @@ describe('chooseStatelessTransport (EI-281 / EI-399 / EI-12940)', () => {
 
   it('no usable credential → gateway-pool delegation, never a hard failure (EI-12940)', () => {
     expect(chooseStatelessTransport({ claudeTok: null })).toBe('gateway-pool');
+  });
+
+  // default-deploy-account-2026-08-08 P-008 / D-004.
+  describe('a nominated DEFAULT account overrides the local ~/.claude session', () => {
+    it('routes via gateway-pool EVEN WITH a live local token — the whole point of the default', () => {
+      // This is the case the feature exists for. Judges, sim-users, summarisers and memory
+      // session-extraction all run where a local token is present, so if a live token still
+      // won here, "set a default account" would silently mean "…except for most in-process
+      // traffic" — which is exactly the split the owner asked to remove.
+      expect(chooseStatelessTransport({ claudeTok: 'c', defaultAccountSet: true })).toBe('gateway-pool');
+    });
+
+    it('with NO default set, a live token still wins — behaviour is unchanged by this feature', () => {
+      expect(chooseStatelessTransport({ claudeTok: 'c', defaultAccountSet: false })).toBe('anthropic-direct');
+    });
+
+    it('reads the env marker when the caller does not pass the flag', () => {
+      const prev = process.env[DEFAULT_ACCOUNT_ACTIVE_ENV];
+      try {
+        process.env[DEFAULT_ACCOUNT_ACTIVE_ENV] = '1';
+        expect(defaultAccountActive()).toBe(true);
+        expect(chooseStatelessTransport({ claudeTok: 'c' })).toBe('gateway-pool');
+        // Fresh read per call, never cached — clearing the default must take effect at once
+        // rather than at the next process restart.
+        delete process.env[DEFAULT_ACCOUNT_ACTIVE_ENV];
+        expect(defaultAccountActive()).toBe(false);
+        expect(chooseStatelessTransport({ claudeTok: 'c' })).toBe('anthropic-direct');
+      } finally {
+        if (prev === undefined) delete process.env[DEFAULT_ACCOUNT_ACTIVE_ENV];
+        else process.env[DEFAULT_ACCOUNT_ACTIVE_ENV] = prev;
+      }
+    });
+
+    it('an explicit flag beats the env marker in BOTH directions (so tests + callers can pin it)', () => {
+      const prev = process.env[DEFAULT_ACCOUNT_ACTIVE_ENV];
+      try {
+        process.env[DEFAULT_ACCOUNT_ACTIVE_ENV] = '1';
+        expect(chooseStatelessTransport({ claudeTok: 'c', defaultAccountSet: false })).toBe('anthropic-direct');
+        delete process.env[DEFAULT_ACCOUNT_ACTIVE_ENV];
+        expect(chooseStatelessTransport({ claudeTok: 'c', defaultAccountSet: true })).toBe('gateway-pool');
+      } finally {
+        if (prev === undefined) delete process.env[DEFAULT_ACCOUNT_ACTIVE_ENV];
+        else process.env[DEFAULT_ACCOUNT_ACTIVE_ENV] = prev;
+      }
+    });
+
+    it('only 1/true arm it — a stray empty or "0" value must not reroute every in-process call', () => {
+      const prev = process.env[DEFAULT_ACCOUNT_ACTIVE_ENV];
+      try {
+        for (const v of ['', '0', 'false', 'no']) {
+          process.env[DEFAULT_ACCOUNT_ACTIVE_ENV] = v;
+          expect(defaultAccountActive()).toBe(false);
+        }
+        for (const v of ['1', 'true', ' true ']) {
+          process.env[DEFAULT_ACCOUNT_ACTIVE_ENV] = v;
+          expect(defaultAccountActive()).toBe(true);
+        }
+      } finally {
+        if (prev === undefined) delete process.env[DEFAULT_ACCOUNT_ACTIVE_ENV];
+        else process.env[DEFAULT_ACCOUNT_ACTIVE_ENV] = prev;
+      }
+    });
   });
 
   it('probe with no credentials file resolves gateway-pool (the 2026-07-16 5h-outage class: a stale local token must not be a SPOF)', () => {
