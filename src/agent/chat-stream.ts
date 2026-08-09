@@ -913,18 +913,49 @@ function gatewayPoolTransport(): StatelessTransport {
 }
 
 /**
- * Pure transport choice for a stateless Anthropic-format call: a live Claude
- * OAuth session → `anthropic-direct`; no usable local session →
- * `gateway-pool` (EI-12940: delegate auth to the local inference gateway's
- * account pool instead of failing — a single stale credential file must never
- * be a SPOF while a pool sits behind a running gateway). The token the caller
- * passes is already expiry-filtered (`readClaudeOauthToken` returns null for
- * an expired session — EI-281). The omp-token → Meridian-router leg was
- * removed 2026-06-12 (EI-399).
+ * Env marker meaning "the owner has nominated a pool account as the default, so this box's
+ * own ~/.claude login is no longer what unpinned traffic should use"
+ * (default-deploy-account-2026-08-08 P-008 / D-004). Set by operator-core, which owns the
+ * override row; env-based to keep this lib free of an operator-core import, exactly like
+ * `resolveAnthropicBaseUrl` and `resolveRouteAccountId` above.
+ *
+ * Deliberately a BOOLEAN marker and not the account id: the id would invite stamping it as
+ * an `x-papercusp-account` pin, which is a HARD pin with no failover (see the footgun warning
+ * on resolveRouteAccountId). The default must stay a preference — the gateway already returns
+ * it as the failover PRIMARY with the rest of the pool behind it.
+ */
+export const DEFAULT_ACCOUNT_ACTIVE_ENV = 'PAPERCUSP_DEFAULT_ACCOUNT_ACTIVE';
+
+/** Read fresh on every call — never cached, so clearing the default takes effect at once. */
+export function defaultAccountActive(): boolean {
+  const v = process.env[DEFAULT_ACCOUNT_ACTIVE_ENV]?.trim();
+  return v === '1' || v === 'true';
+}
+
+/**
+ * Pure transport choice for a stateless Anthropic-format call:
+ *   • the owner nominated a DEFAULT pool account → `gateway-pool`, EVEN with a live local
+ *     session. This is the whole point of the default (D-004): judges, sim-users,
+ *     summarisers and memory session-extraction are exactly the callers that used to be
+ *     pinned to `~/.claude` by construction, so leaving them on the local token would make
+ *     "set a default" quietly mean "…except for most in-process traffic". The gateway
+ *     re-resolves the pool on its own hot-reload poll and returns the default FIRST with the
+ *     rest behind it, so this keeps failover rather than pinning.
+ *   • else a live Claude OAuth session → `anthropic-direct`.
+ *   • else → `gateway-pool` (EI-12940: delegate auth to the local inference gateway's
+ *     account pool instead of failing — a single stale credential file must never be a SPOF
+ *     while a pool sits behind a running gateway).
+ *
+ * The token the caller passes is already expiry-filtered (`readClaudeOauthToken` returns null
+ * for an expired session — EI-281). The omp-token → Meridian-router leg was removed
+ * 2026-06-12 (EI-399). With no default set, behaviour is byte-identical to before.
  */
 export function chooseStatelessTransport(args: {
   claudeTok: string | null;
+  /** Defaults to the env marker; injectable so the choice stays pure + unit-testable. */
+  defaultAccountSet?: boolean;
 }): 'anthropic-direct' | 'gateway-pool' {
+  if (args.defaultAccountSet ?? defaultAccountActive()) return 'gateway-pool';
   return args.claudeTok ? 'anthropic-direct' : 'gateway-pool';
 }
 
