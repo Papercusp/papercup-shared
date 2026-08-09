@@ -26,6 +26,11 @@ export {
   chooseStatelessTransport,
   resolveDelegatedGatewayUrl,
   GATEWAY_DELEGATED_AUTH_TOKEN,
+  // default-deploy-account-2026-08-08 P-008: the marker operator-core publishes so the
+  // in-process stateless family routes via the gateway (which starts on the owner's default
+  // account) rather than this box's ~/.claude login.
+  DEFAULT_ACCOUNT_ACTIVE_ENV,
+  defaultAccountActive,
   AGENT_BACKENDS,
   SUBPROCESS_AGENT_BACKENDS,
   CLAUDE_BUILTIN_TOOLS,
