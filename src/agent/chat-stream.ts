@@ -993,8 +993,12 @@ const ANTHROPIC_PRICES: Record<string, ModelPrice> = {
   // Anthropic family (per 1M tokens, USD; approximate 2026-05 reference)
   'claude-haiku-4-5':  { in: 0.80, out: 4.00 },
   'claude-sonnet-4-6': { in: 3.00, out: 15.00 },
-  'claude-opus-4-7':   { in: 15.00, out: 75.00 },
-  'claude-opus-4-8':   { in: 15.00, out: 75.00 },
+  // Opus 4.5+ list price is $5/$25 — $15/$75 is the LEGACY (4.1-and-earlier) rate.
+  // 4-7/4-8 were stale here and 3x-overstated cost; corrected 2026-08-11 to match
+  // libs/generic/model-pricing + libs/generic/bench-metrics (the canonical tables).
+  'claude-opus-5':     { in: 5.00, out: 25.00 },
+  'claude-opus-4-8':   { in: 5.00, out: 25.00 },
+  'claude-opus-4-7':   { in: 5.00, out: 25.00 },
 };
 function anthropicPriceFor(model: string): ModelPrice {
   if (ANTHROPIC_PRICES[model]) return ANTHROPIC_PRICES[model];
