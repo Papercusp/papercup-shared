@@ -39,6 +39,8 @@ export interface RetryOptions {
   maxWaitMs?: number;
   baseBackoffMs?: number;
   signal?: AbortSignal;
+  /** Existing gateway priority tier, forwarded to the process-local governor. */
+  priorityTier?: number;
 }
 
 export interface RetryDeps<T> {
@@ -65,6 +67,7 @@ export async function runWithRetry<T>(opts: RetryOptions, deps: RetryDeps<T>): P
     const release = await deps.governor.acquire(opts.estTokens, {
       signal: opts.signal,
       maxWaitMs: maxWaitMs - totalWaited,
+      priorityTier: opts.priorityTier,
       onDenied: (denial) => {
         admissionDenial = denial;
       },

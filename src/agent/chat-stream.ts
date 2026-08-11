@@ -45,6 +45,7 @@ import { basename, delimiter, join } from 'node:path';
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
 import { governorForBackend, BACKEND_PROFILES } from './governor-registry';
 import { ROLLING_WINDOW_REPROBE_MS } from '../resilience/governor';
+import { tierOf } from '../resilience/priority-admission';
 import { classifyTurnError, isAccountWide, type TurnBackend, type TurnError } from './turn-error';
 
 /** Default cap on a CLI spawn's wait for a shared-governor permit (RB-012). Long enough to
@@ -1368,7 +1369,12 @@ async function* governedStatelessChat(
     // exceed (scout ideator: 180s) the caller's entire budget, so a correctly-paced wait for
     // capacity got axed by the caller's timer and misreported as a transport "timeout" with
     // $0 spent. Undefined => unchanged 600s default, so no existing caller shifts.
-    { backend: 'anthropic-direct', maxAttempts: 8, ...(opts.governorMaxWaitMs !== undefined ? { maxWaitMs: opts.governorMaxWaitMs } : {}) },
+    {
+      backend: 'anthropic-direct',
+      maxAttempts: 8,
+      priorityTier: tierOf(opts.priority),
+      ...(opts.governorMaxWaitMs !== undefined ? { maxWaitMs: opts.governorMaxWaitMs } : {}),
+    },
     {
       governor,
       runOnce: async (): Promise<TurnOutcome<V>> => {
@@ -1473,6 +1479,7 @@ export async function* runAgentChat(
       {
         signal: opts.signal,
         maxWaitMs: opts.governorMaxWaitMs ?? DEFAULT_CLI_GOVERNOR_MAX_WAIT_MS,
+        priorityTier: tierOf(opts.priority),
         onDenied: (denial) => {
           admissionDenial = denial;
         },

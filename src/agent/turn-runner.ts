@@ -32,6 +32,8 @@ export interface RunAgentTurnSpec {
   baseBackoffMs?: number;
   /** Abort the turn (interactive callers) — a pending governor wait bails to a TurnError. */
   signal?: AbortSignal;
+  /** Existing gateway priority tier, forwarded to the process-local governor. */
+  priorityTier?: number;
 }
 
 export interface RunAgentTurnDeps<T> {
@@ -54,6 +56,7 @@ export async function runAgentTurn<T>(spec: RunAgentTurnSpec, deps: RunAgentTurn
       maxWaitMs: spec.maxWaitMs,
       baseBackoffMs: spec.baseBackoffMs,
       signal: spec.signal,
+      priorityTier: spec.priorityTier,
     },
     {
       governor: deps.governor,

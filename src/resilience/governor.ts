@@ -534,8 +534,11 @@ export interface GovernorStore {
  * give it back on release". Omit = no global cap (per-bucket behavior, byte-identical to before).
  */
 export interface GlobalConcurrencyGate {
-  /** Atomically take a global slot iff total in-flight < cap; false if the fleet cap is reached. */
-  tryAcquire(): boolean;
+  /**
+   * Atomically take a global slot iff the caller's admission band has headroom.
+   * `priorityTier` is optional so bare cap-only gates remain byte-compatible.
+   */
+  tryAcquire(opts?: { priorityTier?: number }): boolean;
   /** Return a global slot (paired 1:1 with a successful tryAcquire). */
   release(): void;
   /**
@@ -577,6 +580,11 @@ export interface AcquireOpts {
   allowSoftPaused?: boolean;
   /** Receives the typed reason when a bounded acquire gives up. */
   onDenied?: (denial: AdmissionDenial) => void;
+  /**
+   * Existing gateway priority tier for this call. The process-local global gate
+   * uses it to preserve tier-1 headroom when AIMD sheds lower-priority traffic.
+   */
+  priorityTier?: number;
 }
 
 /** Async façade over the pure core: `acquire()` blocks until allowed, then returns a
@@ -704,7 +712,7 @@ export class RateLimitGovernor {
         if (d.allowed) {
           // Fleet-wide cap (D-004): this bucket has room AND rate budget — now take a global slot.
           // If the fleet is at its cap, wait + re-poll (don't charge the bucket). Released in mkRelease.
-          if (this.globalGate && !this.globalGate.tryAcquire()) {
+          if (this.globalGate && !this.globalGate.tryAcquire({ priorityTier: opts.priorityTier })) {
             d = { allowed: false, waitMs: CONCURRENCY_POLL_MS, reason: 'concurrency' };
           } else {
             recordAcquire(this.state, this.now(), est);
@@ -715,7 +723,7 @@ export class RateLimitGovernor {
         // CROSS-PROCESS path (RB-007): concurrency is local; reserve the slot atomically (right
         // after the sync check, before any await), then run the RATE gate against the shared row.
         const c = decideConcurrency(this.state);
-        if (c.allowed && this.globalGate && !this.globalGate.tryAcquire()) {
+        if (c.allowed && this.globalGate && !this.globalGate.tryAcquire({ priorityTier: opts.priorityTier })) {
           // Bucket has room but the fleet-wide cap is reached (D-004) → wait, charge nothing.
           d = { allowed: false, waitMs: CONCURRENCY_POLL_MS, reason: 'concurrency' };
         } else if (c.allowed) {

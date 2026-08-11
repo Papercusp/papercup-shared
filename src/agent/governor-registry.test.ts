@@ -201,6 +201,36 @@ test('AIMD — eff never drops below the floor', () => {
   assert.equal(effectiveConcurrencySnapshot().effective, 3);
 });
 
+test('AIMD — tier-1 Scout admission can use hard-cap headroom after ordinary traffic sheds to the floor', async () => {
+  setGlobalConcurrencyCap(4);
+  setGlobalConcurrencyFloor(1);
+  const deps = aimdDeps();
+  const ordinary = getGovernor('anthropic', 'opus', deps);
+  ordinary.penalize({ retryAfterMs: 1_000 }); // 4 → 2
+  ordinary.penalize({ retryAfterMs: 5_000 }); // 2 → floor 1
+  assert.equal(effectiveConcurrencySnapshot().effective, 1);
+  // Move beyond the synthetic pauses without recording clean turns (which would
+  // increase the AIMD effective limit and make this test vacuous).
+  await deps.sleep(6_000);
+
+  const low = await ordinary.acquire({}, { priorityTier: 5 });
+  assert.ok(low);
+  let denial: import('../resilience/governor').AdmissionDenial | undefined;
+  const anotherLow = await ordinary.acquire({}, {
+    maxWaitMs: 0,
+    priorityTier: 5,
+    onDenied: (d) => (denial = d),
+  });
+  assert.equal(anotherLow, null);
+  assert.equal(denial?.governorReason, 'concurrency');
+
+  const scout = await ordinary.acquire({}, { maxWaitMs: 0, priorityTier: 1 });
+  assert.ok(scout, 'tier 1 uses hard-cap headroom instead of inheriting the shed ordinary ceiling');
+  assert.equal(globalConcurrencySnapshot().inFlight, 2);
+  scout!();
+  low!();
+});
+
 test('AIMD — duplicate penalties on the SAME backpressure event halve only once', () => {
   setGlobalConcurrencyCap(8);
   setGlobalConcurrencyFloor(1);

@@ -114,8 +114,14 @@ let aimdCleanTurnsPerStep = AIMD_CLEAN_TURNS_PER_STEP;
 let aimdDecreaseFactor = 0.5;
 
 const globalGate: GlobalConcurrencyGate = {
-  tryAcquire() {
-    const limit = Math.min(globalCap, aimdEff ?? Infinity);
+  tryAcquire(opts) {
+    const effectiveLimit = Math.min(globalCap, aimdEff ?? Infinity);
+    // The gateway already treats tier 1 (interactive/queen/scout/overwatch) as a
+    // reserved lane. Preserve that SAME contract before the request reaches the
+    // gateway: when AIMD has shed the ordinary lane, tier 1 may use otherwise-idle
+    // hard-cap headroom. Per-bucket maxConcurrent still bounds each producer, and
+    // the gateway remains the authoritative cross-account admission queue.
+    const limit = opts?.priorityTier === 1 ? globalCap : effectiveLimit;
     if (globalInFlight >= limit) return false;
     globalInFlight += 1;
     return true;
