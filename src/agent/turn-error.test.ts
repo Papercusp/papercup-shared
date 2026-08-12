@@ -163,6 +163,17 @@ test('classifySubprocessResult — usage_limit parses a reset time from the mess
 test('classifySubprocessResult — stderr overloaded → overloaded', () => {
   assert.equal(classifySubprocessResult({ exitCode: 1, stderr: '529 overloaded_error' }).class, 'overloaded');
 });
+test('classifySubprocessResult — Codex authorization-header UTF-8 failure → auth', () => {
+  const e = classifySubprocessResult({
+    exitCode: 1,
+    stderr:
+      "codex_api::endpoint::responses_websocket: failed to connect to websocket: UTF-8 encoding error: failed to convert header to a str for header name 'authorization'",
+  }, 'openai');
+  assert.equal(e.class, 'auth');
+  assert.equal(e.provider, 'openai');
+  assert.equal(e.retryable, false);
+  assert.equal(e.surfaceToUser, true);
+});
 test('classifySubprocessResult — nonzero exit, no known pattern → agent_crash', () => {
   const e = classifySubprocessResult({ exitCode: 2, stderr: 'TypeError: boom' });
   assert.equal(e.class, 'agent_crash');
