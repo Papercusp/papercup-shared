@@ -129,6 +129,15 @@ const globalGate: GlobalConcurrencyGate = {
   release() {
     globalInFlight = Math.max(0, globalInFlight - 1);
   },
+  // WI-38062: the fleet gate's live occupancy vs the limit for the CALLER'S band, so a denial it
+  // produced carries real numbers instead of a constant. Mirrors tryAcquire's band selection
+  // exactly (tier 1 is measured against the hard cap, not the AIMD-shed effective limit) — read
+  // via the same expression so the two can't drift into reporting a limit that was never applied.
+  snapshot(opts) {
+    const effectiveLimit = Math.min(globalCap, aimdEff ?? Infinity);
+    const limit = opts?.priorityTier === 1 ? globalCap : effectiveLimit;
+    return { inFlight: globalInFlight, limit };
+  },
   noteClean() {
     if (aimdEff === undefined) return; // AIMD inactive without a finite cap
     aimdCleanStreak += 1;

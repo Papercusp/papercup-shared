@@ -136,6 +136,9 @@ export const LEGACY_RATE_LIMIT_BLOCKED_REASON = 'all-accounts-paused';
  * unstamped mint site fails LOUD (counted as an error), never silent (WI-5391 Part B). */
 export type AdmissionDenialVia = 'governor' | 'http-429';
 
+/** Which concurrency gate refused a `no-free-slot` denial — see `AdmissionDenial.gate`. */
+export type AdmissionDenialGate = 'bucket' | 'fleet';
+
 export interface AdmissionDenial {
   reason: AdmissionDenialReason;
   /** Evidence stamp: which authority minted this denial. Absent ⇒ evidence-free ⇒ not capacity. */
@@ -149,7 +152,31 @@ export interface AdmissionDenial {
    * persisted poolSnapshot). */
   pausedAccounts?: number;
   totalAccounts?: number;
+  /** Free slots on the gate that actually REFUSED — a measurement, never a constant. See `gate`. */
   freeSlots?: number;
+  /**
+   * WHICH concurrency gate withheld the permit. A `no-free-slot` denial has two independent
+   * sources and, before this stamp, minted BYTE-IDENTICAL evidence for both (WI-38062):
+   *
+   *   'bucket' — this governor's own `inFlight >= limits.maxConcurrent` (a per-(provider,
+   *              modelClass[,account]) cap from DEFAULT_FLOORS; it does NOT scale with pool size).
+   *   'fleet'  — the registry's shared cross-bucket gate, `globalInFlight >= min(globalCap,
+   *              aimdEff)`, i.e. the user's live `maxSimultaneousAgents`.
+   *
+   * The distinction is load-bearing twice over. (1) The two have OPPOSITE fixes: a bucket denial
+   * is a bucket-identity/limit problem, while a fleet denial is genuine fleet-wide concurrency
+   * exhaustion that no per-bucket change can relieve. (2) `no-free-slot` is deliberately kept
+   * LOUD as an admission-path DEFECT (scout/capacity-errors.ts), so a fleet-gate denial counted
+   * without this stamp books real capacity exhaustion as a code defect.
+   *
+   * Absent ⇒ the denial was not a concurrency denial (or predates the stamp) — never read a
+   * missing `gate` as 'bucket'.
+   */
+  gate?: AdmissionDenialGate;
+  /** The refusing gate's live occupancy at denial time (pairs with `gateLimit`). */
+  gateInFlight?: number;
+  /** The refusing gate's effective limit at denial time. `Infinity` is reported as absent. */
+  gateLimit?: number;
 }
 
 const WINDOW_MS = 60_000;
@@ -550,6 +577,13 @@ export interface GlobalConcurrencyGate {
    */
   noteClean?(): void;
   notePenalty?(): void;
+  /**
+   * The gate's live occupancy vs its effective limit for the caller's band — read ONLY to give a
+   * fleet-gate denial real numbers instead of a constant (WI-38062). Best-effort and side-effect
+   * free: a throw or undefined return mints the denial without them and never blocks admission.
+   * Optional so a bare cap-only gate (tests, simple hosts) stays valid.
+   */
+  snapshot?(opts?: { priorityTier?: number }): { inFlight: number; limit: number } | undefined;
 }
 
 export interface GovernorDeps {
@@ -705,6 +739,12 @@ export class RateLimitGovernor {
     for (;;) {
       if (opts.signal?.aborted) return null;
       let d: AcquireDecision;
+      // WHICH gate produced a `reason:'concurrency'` decision THIS iteration (WI-38062). Declared
+      // inside the loop so a later iteration can never inherit an earlier one's attribution. Only
+      // the two fleet-gate refusals below set it; every other concurrency decision comes from this
+      // bucket's own decideConcurrency/decideAcquire, so the mint site reads an unset value as
+      // 'bucket'. Attribute at the SOURCE — the two are indistinguishable by the time `d` is read.
+      let concurrencyGate: AdmissionDenialGate | undefined;
       if (!this.store) {
         // IN-MEMORY fast path: decide + record SYNCHRONOUSLY (no await between the check and the
         // increment) so concurrency stays atomic under many interleaved callers.
@@ -714,6 +754,7 @@ export class RateLimitGovernor {
           // If the fleet is at its cap, wait + re-poll (don't charge the bucket). Released in mkRelease.
           if (this.globalGate && !this.globalGate.tryAcquire({ priorityTier: opts.priorityTier })) {
             d = { allowed: false, waitMs: CONCURRENCY_POLL_MS, reason: 'concurrency' };
+            concurrencyGate = 'fleet'; // the FLEET cap refused, not this bucket (it had room)
           } else {
             recordAcquire(this.state, this.now(), est);
             return mkRelease();
@@ -726,6 +767,7 @@ export class RateLimitGovernor {
         if (c.allowed && this.globalGate && !this.globalGate.tryAcquire({ priorityTier: opts.priorityTier })) {
           // Bucket has room but the fleet-wide cap is reached (D-004) → wait, charge nothing.
           d = { allowed: false, waitMs: CONCURRENCY_POLL_MS, reason: 'concurrency' };
+          concurrencyGate = 'fleet'; // the FLEET cap refused, not this bucket (it had room)
         } else if (c.allowed) {
           this.state.inFlight += 1; // reserve the local concurrency slot now
           let rateAllowed = false;
@@ -780,6 +822,33 @@ export class RateLimitGovernor {
         } catch {
           /* best-effort — counters must never block or break admission */
         }
+        // WI-38062: attribute a concurrency denial to the gate that actually refused, and report
+        // that gate's REAL occupancy. `freeSlots` was previously the literal 0 at this site — a
+        // constant that measured nothing and read identically for both gates, which is the same
+        // defect class as the LEGACY_RATE_LIMIT_BLOCKED_REASON rename above (a name asserting a
+        // fact the value never measured). Bucket numbers are read from local state; fleet numbers
+        // come from the registry gate's optional snapshot (best-effort — never blocks admission).
+        const gate: AdmissionDenialGate | undefined = d.reason === 'concurrency' ? (concurrencyGate ?? 'bucket') : undefined;
+        let gateInFlight: number | undefined;
+        let gateLimit: number | undefined;
+        if (gate === 'bucket') {
+          gateInFlight = this.state.inFlight;
+          gateLimit = this.state.limits.maxConcurrent;
+        } else if (gate === 'fleet') {
+          try {
+            const snap = this.globalGate?.snapshot?.({ priorityTier: opts.priorityTier });
+            if (snap) {
+              gateInFlight = snap.inFlight;
+              gateLimit = snap.limit;
+            }
+          } catch {
+            /* best-effort evidence — must never block or break admission */
+          }
+        }
+        // An unbounded cap carries no information as a number and must not serialize as `null`.
+        if (gateLimit !== undefined && !Number.isFinite(gateLimit)) gateLimit = undefined;
+        const freeSlots =
+          gateInFlight !== undefined && gateLimit !== undefined ? Math.max(0, gateLimit - gateInFlight) : undefined;
         opts.onDenied?.({
           // A CLASS label over this bucket's own decision — "blocked for a rate-limit-ish
           // reason" vs "...for a concurrency reason". Deliberately NOT a pool claim: the
@@ -790,7 +859,10 @@ export class RateLimitGovernor {
             : 'no-free-slot',
           via: 'governor',
           ...(d.reason ? { governorReason: d.reason } : {}),
-          ...(d.reason === 'concurrency' ? { freeSlots: 0 } : {}),
+          ...(gate ? { gate } : {}),
+          ...(gateInFlight !== undefined ? { gateInFlight } : {}),
+          ...(gateLimit !== undefined ? { gateLimit } : {}),
+          ...(freeSlots !== undefined ? { freeSlots } : {}),
           ...(counters ? { pausedAccounts: counters.pausedAccounts, totalAccounts: counters.totalAccounts } : {}),
         });
         return null; // would wait too long → give up, let the caller decide
