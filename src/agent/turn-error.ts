@@ -19,6 +19,7 @@ export type TurnErrorClass =
   | 'timeout' // wall-clock / deadline exceeded
   | 'transient_io' // network blip (ECONNRESET, socket hang up, …)
   | 'auth' // 401/403 — NOT retryable without new creds
+  | 'context_overflow' // prompt exceeded the model context window — fix the launch/prompt, do NOT retry unchanged
   | 'agent_crash' // subprocess nonzero exit / killed by signal
   | 'empty_output' // ran clean but produced nothing
   | 'malformed_output' // produced output the caller couldn't parse
@@ -60,7 +61,12 @@ const RETRYABLE: ReadonlySet<TurnErrorClass> = new Set<TurnErrorClass>([
 
 // Classes the human should see (vs the governor handling them silently). `usage_limit` is the
 // load-bearing one — retrying is futile, so the user must know the fleet is parked until reset.
-const SURFACE_TO_USER: ReadonlySet<TurnErrorClass> = new Set<TurnErrorClass>(['usage_limit', 'auth', 'permanent']);
+const SURFACE_TO_USER: ReadonlySet<TurnErrorClass> = new Set<TurnErrorClass>([
+  'usage_limit',
+  'auth',
+  'context_overflow',
+  'permanent',
+]);
 
 /**
  * Classes that back off the SHARED account-wide budget — every agent on the account pauses
@@ -143,6 +149,11 @@ const OVERLOAD_RE = /(\b529\b|overloaded|service unavailable|\b50[0234]\b)/i;
 const AUTH_RE = /(\b401\b|\b403\b|unauthorized|forbidden|invalid api key|authentication)/i;
 const IO_RE = /(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|network|fetch failed)/i;
 const TIMEOUT_RE = /(\b408\b|timed? ?out|deadline exceeded)/i;
+// A prompt that exceeds the model window is a launch/prompt-sizing defect, not a
+// transient provider wall. Keep this ahead of the 429/usage scans because some
+// provider messages include a generic API-error prefix alongside the real cause.
+const CONTEXT_OVERFLOW_RE =
+  /prompt is too long|input (?:length )?is too long|\bcontext[_ -]?length[_ -]?exceeded\b|maximum context length|input length and `?max_tokens`? exceed|exceeds? the (?:model'?s )?maximum (?:context|(?:number of )?(?:input )?tokens)|reduce the length of (?:the )?(?:messages|prompt|input)/i;
 
 /**
  * Best-effort reset extraction from a subscription usage-limit MESSAGE (the subprocess path,
@@ -199,6 +210,8 @@ export function classifyHttpError(
   const resetAt = resetFromHeaders(headers, now);
   const st = input.status;
 
+  if (CONTEXT_OVERFLOW_RE.test(msg)) return mk('context_overflow', msg, provider);
+
   // A plan/usage CAP (429 w/ insufficient_quota, or a no-status message naming a usage cap) →
   // pause-until-reset + surface, do NOT retry. Checked before the transient-429 branch since the
   // disposition is opposite (D-001). The header reset (if any) IS the cap's reset time.
@@ -250,6 +263,12 @@ export function classifySubprocessResult(
   const failed = !!input.signal || (input.exitCode !== 0 && input.exitCode !== null);
   const scan = failed ? `${stderr}\n${input.stdout ?? ''}` : stderr;
   const errText = stderr.trim() ? stderr : failed ? input.stdout ?? '' : '';
+  // Prompt-size deaths are terminal until the launch configuration or prompt is
+  // fixed. Detect them before provider-wall patterns so a descriptive 400/429
+  // wrapper cannot turn a context failure into a retryable backoff class.
+  if (CONTEXT_OVERFLOW_RE.test(scan)) {
+    return mk('context_overflow', errText.slice(0, 200) || 'context window exceeded', provider);
+  }
   // Plan/usage CAP first (opposite disposition to a transient 429): pause-until-reset + surface,
   // no retry. The CLI prints the reset in the message ("resets 4:20am"), so parse it best-effort.
   if (USAGE_LIMIT_RE.test(scan) && !TRANSIENT_OVERRIDE_RE.test(scan)) {

@@ -72,6 +72,12 @@ test('classifyHttpError — other 4xx → permanent (not retryable)', () => {
   assert.equal(e.class, 'permanent');
   assert.equal(e.retryable, false);
 });
+test('classifyHttpError — prompt overflow → context_overflow (surface, not retryable)', () => {
+  const e = classifyHttpError({ status: 400, message: 'Prompt is too long: 210000 tokens > 200000 maximum' }, 'anthropic');
+  assert.equal(e.class, 'context_overflow');
+  assert.equal(e.retryable, false);
+  assert.equal(e.surfaceToUser, true);
+});
 test('classifyHttpError — no status, message regex → rate_limited / overloaded / transient_io', () => {
   assert.equal(classifyHttpError({ message: '429 rate limit exceeded' }).class, 'rate_limited');
   assert.equal(classifyHttpError({ message: 'Overloaded' }).class, 'overloaded');
@@ -109,6 +115,16 @@ test('classifySubprocessResult — rate-limit in STDOUT on a FAILED exit → rat
   });
   assert.equal(e.class, 'rate_limited');
   assert.equal(e.retryable, true);
+});
+test('classifySubprocessResult — prompt overflow in STDOUT on a FAILED exit → context_overflow, not agent_crash', () => {
+  const e = classifySubprocessResult({
+    exitCode: 1,
+    stderr: '',
+    stdout: 'API Error: 400 invalid_request_error — Prompt is too long: 210000 tokens > 200000 maximum',
+  }, 'anthropic');
+  assert.equal(e.class, 'context_overflow');
+  assert.equal(e.retryable, false);
+  assert.equal(e.surfaceToUser, true);
 });
 test('classifySubprocessResult — "rate limit" in STDOUT on a CLEAN exit is NOT misclassified (false-positive guard)', () => {
   // A successful bee whose OUTPUT merely discusses rate limits must stay a success, not rate_limited.
