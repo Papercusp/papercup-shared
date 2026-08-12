@@ -1204,7 +1204,7 @@ async function* statelessAgentChat(
   // default → the proven retry loop below runs unchanged (zero behavior change for the
   // live fleet until validated).
   if (process.env.PAPERCUSP_AGENT_GOVERNOR === '1') {
-    yield* governedStatelessChat(client, params, opts);
+    yield* governedStatelessChat(client, params, opts, { transport, mkClient });
     return;
   }
 
@@ -1418,8 +1418,48 @@ async function* governedStatelessChat(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   params: Record<string, any>,
   opts: RunAgentChatOptions,
+  // WI-38316: the governed path builds its client ONCE up front, so without these it has no
+  // way to swap in a refreshed credential — the refresh-on-upstream-rejection fix would apply
+  // only to the legacy ladder and silently stop applying the day PAPERCUSP_AGENT_GOVERNOR=1
+  // becomes the default.
+  auth?: {
+    transport: StatelessTransport;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mkClient: (t: StatelessTransport) => any;
+  },
 ): AsyncGenerator<ChatEvent, void, void> {
   const model = opts.model as string;
+  let refreshAttempted = false;
+  let refreshOutcome: ClaudeRefreshOutcome | undefined;
+  let authExpiresAt: number | null = null;
+  let lastRawErr: unknown;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let activeClient: any = client;
+
+  /**
+   * One-shot credential recovery for an auth rejection, shared in spirit with the legacy
+   * ladder: rotation first (a peer rewrote the file), then the refresh-token exchange.
+   * Returns a fresh client, or null when nothing recovered it.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const recoverAuth = async (): Promise<any | null> => {
+    if (refreshAttempted || !auth || auth.transport.label !== 'anthropic-direct') return null;
+    refreshAttempted = true;
+    const staleTok = auth.transport.token;
+    authExpiresAt = readClaudeOauthExpiry();
+    invalidateClaudeTokenCache();
+    let tok = readClaudeOauthToken();
+    if (!tok || tok === staleTok) {
+      refreshOutcome = await refreshClaudeOauthCredential({ rejectedAccessToken: staleTok });
+      if (!refreshOutcome.ok) return null;
+      invalidateClaudeTokenCache();
+      tok = readClaudeOauthToken();
+    }
+    if (!tok || tok === staleTok) return null;
+    auth.transport = anthropicDirectTransport(tok);
+    console.warn('[anthropic-direct] governed path recovered a rejected Claude OAuth session — retrying (WI-38316)');
+    return auth.mkClient(auth.transport);
+  };
   const governor = governorForBackend('anthropic-direct', model);
   type V = { finalText: string; tokensIn: number; tokensOut: number; costUsd: number };
   const result = await runAgentTurn<V>(
@@ -1444,6 +1484,39 @@ async function* governedStatelessChat(
       governor,
       runOnce: async (): Promise<TurnOutcome<V>> => {
         if (opts.signal?.aborted) return { ok: false, raw: { message: 'anthropic-direct: aborted' } };
+        // WI-38316: `runAgentTurn` classifies an auth rejection as non-retryable (correctly —
+        // re-issuing the same dead credential helps nobody), so credential recovery has to
+        // happen INSIDE one logical attempt. Issue, and on an auth failure recover once and
+        // re-issue; anything else is returned unchanged.
+        let issued = await issueOnce(activeClient);
+        if (!issued.ok && isAuthFailure(lastRawErr)) {
+          const fresh = await recoverAuth();
+          if (fresh) {
+            activeClient = fresh;
+            issued = await issueOnce(activeClient);
+          }
+        }
+        return issued;
+      },
+    },
+  );
+  if (result.ok) {
+    if (result.value.finalText) yield { type: 'delta', text: result.value.finalText };
+    yield { type: 'result', costUsd: result.value.costUsd, tokensIn: result.value.tokensIn, tokensOut: result.value.tokensOut, finalText: result.value.finalText };
+  } else {
+    // result.error IS a TurnError — pass it through so the caller can pause/resume on a
+    // rate_limited class instead of re-parsing the message (RB-006). WI-38316: append the
+    // credential diagnosis when the classified failure is an auth rejection, so this path
+    // explains itself exactly like the legacy ladder does.
+    const authCtx =
+      auth && isAuthFailure(lastRawErr)
+        ? statelessErrorContext(auth.transport, lastRawErr, { expiresAt: authExpiresAt, refreshOutcome })
+        : '';
+    yield { type: 'error', message: `anthropic-direct error: ${result.error.message}${authCtx}`, turn: result.error };
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  async function issueOnce(client: any): Promise<TurnOutcome<V>> {
         // LOCAL admission only: the governor has granted a permit and we are about to issue
         // the HTTP request. The request may still queue inside the inference gateway, so the
         // generation timer must wait for stream 'connect' below (EI-11417).
@@ -1487,6 +1560,9 @@ async function* governedStatelessChat(
           // pacing (limits auto-tune, low-headroom soft pacing) activates on API-key paths.
           return { ok: true, value: { finalText, tokensIn, tokensOut, costUsd }, ...(headers ? { headers } : {}) };
         } catch (err) {
+          // WI-38316: keep the RAW error — `isAuthFailure` reads `.status` off the SDK error
+          // object, which the flattened `raw` record no longer carries as a throwable.
+          lastRawErr = err;
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const e = err as any;
           return {
@@ -1498,16 +1574,6 @@ async function* governedStatelessChat(
             },
           };
         }
-      },
-    },
-  );
-  if (result.ok) {
-    if (result.value.finalText) yield { type: 'delta', text: result.value.finalText };
-    yield { type: 'result', costUsd: result.value.costUsd, tokensIn: result.value.tokensIn, tokensOut: result.value.tokensOut, finalText: result.value.finalText };
-  } else {
-    // result.error IS a TurnError — pass it through so the caller can pause/resume on a
-    // rate_limited class instead of re-parsing the message (RB-006).
-    yield { type: 'error', message: `anthropic-direct error: ${result.error.message}`, turn: result.error };
   }
 }
 

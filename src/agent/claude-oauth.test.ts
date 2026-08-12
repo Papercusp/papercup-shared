@@ -183,6 +183,42 @@ describe('refreshClaudeOauthCredential', () => {
   });
 });
 
+/**
+ * CONTROLS — a deliberately-naive refresher kept here permanently, so the two assertions that
+ * carry this module's real weight are demonstrably falsifiable rather than merely green. A
+ * guard that has never failed is a guard nobody has tested; these prove the checks above
+ * distinguish the correct implementation from the obvious wrong one, without ever mutating a
+ * file in the shared tree (which git-sync would happily commit mid-probe).
+ */
+describe('controls: the naive refresher these tests must reject', () => {
+  /** No in-flight dedupe, no peer-adoption check — refresh unconditionally, every time. */
+  async function naiveRefresh(p: string, fetchImpl: typeof fetch): Promise<void> {
+    const bundle = readClaudeCredentialBundle(p)!;
+    const res = await fetchImpl('https://example.invalid/token', { method: 'POST' });
+    const j = (await (res as Response).json()) as { access_token?: string };
+    bundle.claudeAiOauth = { ...bundle.claudeAiOauth, accessToken: j.access_token };
+    writeFileSync(p, JSON.stringify(bundle, null, 2), { mode: 0o600 });
+  }
+
+  it('the concurrency assertion FAILS the naive version (it would fire 10 exchanges)', async () => {
+    writeBundle();
+    const calls: Array<Record<string, string>> = [];
+    const endpoint = okEndpoint(calls);
+    await Promise.all(Array.from({ length: 10 }, () => naiveRefresh(path, endpoint)));
+    // The real implementation collapses these to 1; the naive one does not. If this ever
+    // reads 1, the dedupe assertion above has stopped discriminating and is proving nothing.
+    expect(calls).toHaveLength(10);
+  });
+
+  it('the adoption assertion FAILS the naive version (it burns a refresh token needlessly)', async () => {
+    writeBundle({}, { accessToken: TOK_PEER });
+    const calls: Array<Record<string, string>> = [];
+    await naiveRefresh(path, okEndpoint(calls));
+    // A peer had already rotated the token, so the correct behaviour is ZERO exchanges.
+    expect(calls).toHaveLength(1);
+  });
+});
+
 describe('describeClaudeAuthFailure', () => {
   const now = Date.UTC(2026, 7, 12, 21, 31, 0);
 
