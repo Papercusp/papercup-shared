@@ -13,6 +13,7 @@ export {
   resolveAgentBin,
   setStatelessUsageSink,
   readClaudeOauthToken,
+  readClaudeOauthExpiry,
   invalidateClaudeTokenCache,
   resolveAnthropicBaseUrl,
   probeStatelessTransport,
@@ -40,6 +41,23 @@ export {
   type StatelessUsageEvent,
   type StatelessUsageAttribution,
 } from './chat-stream';
+
+// WI-38316: the Claude OAuth bundle + its refresh exchange. The client id / endpoints live
+// here (the leaf) rather than in operator-core's oauth/providers.ts, which now re-exports
+// them — the stateless anthropic-direct transport has to refresh the same bundle on an
+// upstream rejection, and papercusp-shared cannot import operator-core.
+export {
+  CLAUDE_CODE_CLIENT_ID,
+  CLAUDE_OAUTH_DEFAULTS,
+  claudeCredentialsPath,
+  readClaudeCredentialBundle,
+  refreshClaudeOauthCredential,
+  describeClaudeAuthFailure,
+  type ClaudeCredentialBundle,
+  type ClaudeOauthBlock,
+  type ClaudeRefreshOutcome,
+  type RefreshClaudeOauthOpts,
+} from './claude-oauth';
 
 // Agent-turn robustness (RB-*): the turn-error taxonomy + classifier, the backend governor
 // registry, and the agent runAgentTurn wrapper — so server modules (e.g. the DBOS

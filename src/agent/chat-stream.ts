@@ -47,6 +47,13 @@ import { governorForBackend, BACKEND_PROFILES } from './governor-registry';
 import { ROLLING_WINDOW_REPROBE_MS } from '../resilience/governor';
 import { tierOf } from '../resilience/priority-admission';
 import { classifyTurnError, isAccountWide, type TurnBackend, type TurnError } from './turn-error';
+// WI-38316: the `grant_type=refresh_token` exchange that revives a rejected-but-locally-valid
+// Claude OAuth token in place, plus the diagnosis text for when it can't.
+import {
+  refreshClaudeOauthCredential,
+  describeClaudeAuthFailure,
+  type ClaudeRefreshOutcome,
+} from './claude-oauth';
 
 /** Default cap on a CLI spawn's wait for a shared-governor permit (RB-012). Long enough to
     wait out a normal 429's retry-after, short enough that a multi-hour subscription lockout
@@ -765,6 +772,17 @@ export function readClaudeOauthToken(): string | null {
 }
 
 /**
+ * The recorded expiry (ms epoch) of the CURRENTLY CACHED Claude OAuth token, or null when
+ * there is none / it carries no expiry. WI-38316: the confusing auth failure is the one where
+ * this is comfortably in the FUTURE and the API still rejects the token — the diagnosis has to
+ * be able to say so.
+ */
+export function readClaudeOauthExpiry(): number | null {
+  if (_claudeTokenCache === undefined) _claudeTokenCache = loadClaudeCreds();
+  return _claudeTokenCache?.expires ?? null;
+}
+
+/**
  * Drop the cached Claude OAuth token so the next read hits
  * `~/.claude/.credentials.json` again. The claude CLI refreshes that
  * file; a long-lived process (the operator) holding the per-process
@@ -1195,6 +1213,12 @@ async function* statelessAgentChat(
   const RETRY_MAX = 8;
   const RETRY_CAP_MS = 60_000;
   let lastErr: unknown;
+  // WI-38316 auth-diagnosis state: what the local credential claimed at the moment it was
+  // rejected, and what the one-shot refresh attempt made of it. Both feed the error text so a
+  // failure that survives the retry ladder explains ITSELF instead of reading as misconfig.
+  let refreshAttempted = false;
+  let refreshOutcome: ClaudeRefreshOutcome | undefined;
+  let authExpiresAt: number | null = null;
   for (let attempt = 1; attempt <= RETRY_MAX; attempt++) {
     if (opts.signal?.aborted) {
       yield { type: 'error', message: 'anthropic-direct: aborted' };
@@ -1248,6 +1272,7 @@ async function* statelessAgentChat(
       // the SAME token, the session is genuinely dead — fail normally.
       if (isAuthFailure(err)) {
         const staleTok = transport.token;
+        authExpiresAt = readClaudeOauthExpiry();
         invalidateClaudeTokenCache();
         const freshTok = readClaudeOauthToken();
         if (freshTok && freshTok !== staleTok) {
@@ -1258,11 +1283,38 @@ async function* statelessAgentChat(
           );
           continue;
         }
+        // WI-38316: the on-disk token is UNCHANGED, so this is not a rotation we lost a race
+        // to — the API is rejecting the credential we still hold (revoked, or rotated out from
+        // under this host). The same bundle carries a refresh token; spend it rather than
+        // surfacing a hard non-retryable 401 that takes out every in-process LLM caller until
+        // a human notices. ONE attempt per call: the refresh token is single-use and rotates,
+        // so a retry ladder here would burn its own successors. Only for `anthropic-direct` —
+        // on a `gateway-pool` transport the rejected credential is the GATEWAY's pool account,
+        // not this host's bundle, so refreshing ours would spend a refresh token to fix
+        // nothing.
+        if (!refreshAttempted && transport.label === 'anthropic-direct') {
+          refreshAttempted = true;
+          refreshOutcome = await refreshClaudeOauthCredential({ rejectedAccessToken: staleTok });
+          if (refreshOutcome.ok) {
+            invalidateClaudeTokenCache();
+            const refreshedTok = readClaudeOauthToken();
+            if (refreshedTok && refreshedTok !== staleTok) {
+              transport = anthropicDirectTransport(refreshedTok);
+              client = mkClient(transport);
+              console.warn(
+                `[anthropic-direct] auth failure with an unrotated on-disk token — ${
+                  refreshOutcome.adopted ? 'adopted a peer-refreshed' : 'refreshed the'
+                } Claude OAuth session and retrying (WI-38316)`,
+              );
+              continue;
+            }
+          }
+        }
       }
       if (!isTransientLlmError(err) || attempt === RETRY_MAX) {
         yield {
           type: 'error',
-          message: `${transport.label} error: ${err instanceof Error ? err.message : String(err)}${statelessErrorContext(transport, err)}`,
+          message: `${transport.label} error: ${err instanceof Error ? err.message : String(err)}${statelessErrorContext(transport, err, { expiresAt: authExpiresAt, refreshOutcome })}`,
         };
         return;
       }
@@ -1274,7 +1326,7 @@ async function* statelessAgentChat(
       if (retryLadderDeadlineExceeded(opts.retryDeadlineMs, backoffMs)) {
         yield {
           type: 'error',
-          message: `${transport.label} error: ${err instanceof Error ? err.message : String(err)} (retry ladder stopped at attempt ${attempt}/${RETRY_MAX}: caller retry deadline reached)${statelessErrorContext(transport, err)}`,
+          message: `${transport.label} error: ${err instanceof Error ? err.message : String(err)} (retry ladder stopped at attempt ${attempt}/${RETRY_MAX}: caller retry deadline reached)${statelessErrorContext(transport, err, { expiresAt: authExpiresAt, refreshOutcome })}`,
         };
         return;
       }
@@ -1286,7 +1338,7 @@ async function* statelessAgentChat(
   }
   yield {
     type: 'error',
-    message: `${transport.label}: exhausted ${RETRY_MAX} retries: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}${statelessErrorContext(transport, lastErr)}`,
+    message: `${transport.label}: exhausted ${RETRY_MAX} retries: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}${statelessErrorContext(transport, lastErr, { expiresAt: authExpiresAt, refreshOutcome })}`,
   };
 }
 
@@ -1297,7 +1349,20 @@ async function* statelessAgentChat(
  * gateway. Say so explicitly on the tick ledger instead of a bare
  * "fetch failed" that hides the missing-local-token half.
  */
-function statelessErrorContext(transport: StatelessTransport, err: unknown): string {
+function statelessErrorContext(
+  transport: StatelessTransport,
+  err: unknown,
+  auth?: { expiresAt: number | null; refreshOutcome?: ClaudeRefreshOutcome },
+): string {
+  // WI-38316: an auth rejection on the direct transport is the case where every LOCAL check
+  // passes (file present, token unexpired) and only the 401 body knows the truth — so the
+  // error has to carry the local credential's own claim plus the refresh verdict.
+  if (transport.label === 'anthropic-direct' && isAuthFailure(err)) {
+    return describeClaudeAuthFailure({
+      expiresAt: auth?.expiresAt ?? readClaudeOauthExpiry(),
+      refreshOutcome: auth?.refreshOutcome,
+    });
+  }
   if (transport.label !== 'gateway-pool') return '';
   if (isConnectionFailure(err)) {
     return (
