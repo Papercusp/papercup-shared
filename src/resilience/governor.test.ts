@@ -507,7 +507,18 @@ test('RateLimitGovernor.acquire — bounded denial carries a typed admission rea
   const r = await g.acquire({}, { maxWaitMs: 0, onDenied: (d) => (denial = d) });
   assert.equal(r, null);
   // via:'governor' is the attestation stamp the capacity classifier requires (WI-5391).
-  assert.deepEqual(denial, { reason: 'no-free-slot', via: 'governor', governorReason: 'concurrency', freeSlots: 0 });
+  // gate:'bucket' + real occupancy is WI-38062: with no globalGate wired, THIS bucket's own
+  // maxConcurrent is what refused, and freeSlots is now measured (limit - inFlight) rather than
+  // the literal 0 it used to be — same value here, but for a reason instead of by assumption.
+  assert.deepEqual(denial, {
+    reason: 'no-free-slot',
+    via: 'governor',
+    governorReason: 'concurrency',
+    gate: 'bucket',
+    gateInFlight: 1,
+    gateLimit: 1,
+    freeSlots: 0,
+  });
   held!();
 });
 // WI-5391 item 3: pool counters stamped at the denial mint make a governor-attested
@@ -537,8 +548,125 @@ test('RateLimitGovernor.acquire — a throwing poolCounters dep still mints the 
   let denial: import('./governor').AdmissionDenial | undefined;
   const r = await g.acquire({}, { maxWaitMs: 0, onDenied: (d) => (denial = d) });
   assert.equal(r, null);
-  assert.deepEqual(denial, { reason: 'no-free-slot', via: 'governor', governorReason: 'concurrency', freeSlots: 0 });
+  assert.deepEqual(denial, {
+    reason: 'no-free-slot',
+    via: 'governor',
+    governorReason: 'concurrency',
+    gate: 'bucket',
+    gateInFlight: 1,
+    gateLimit: 1,
+    freeSlots: 0,
+  });
   held!();
+});
+// WI-38062: a `no-free-slot` denial has TWO independent sources — this bucket's own
+// maxConcurrent, and the registry's shared fleet-wide gate — and used to mint BYTE-IDENTICAL
+// evidence for both, so no reader could tell them apart. They have opposite fixes, and only one
+// of them is a defect (the other is real capacity exhaustion), so the pair below is written as a
+// DISCRIMINATION test: same reason, same governorReason, different `gate`. If a future change
+// re-collapses the attribution, exactly one of these two fails.
+test('RateLimitGovernor.acquire — a FLEET-gate denial is attributed to the fleet, with the fleet gate\'s numbers', async () => {
+  // The bucket has plenty of room (4 slots, none held); the FLEET cap is what refuses.
+  const g = new RateLimitGovernor(
+    { maxConcurrent: 4 },
+    {
+      globalGate: {
+        tryAcquire: () => false,
+        release: () => {},
+        snapshot: () => ({ inFlight: 12, limit: 12 }),
+      },
+    },
+  );
+  let denial: import('./governor').AdmissionDenial | undefined;
+  const r = await g.acquire({}, { maxWaitMs: 0, onDenied: (d) => (denial = d) });
+  assert.equal(r, null);
+  assert.equal(denial?.reason, 'no-free-slot');
+  assert.equal(denial?.gate, 'fleet');
+  // The reported numbers must be the FLEET gate's, never this bucket's — reporting the bucket's
+  // 4 free slots beside a fleet denial is the exact misattribution this stamp exists to end.
+  assert.equal(denial?.gateInFlight, 12);
+  assert.equal(denial?.gateLimit, 12);
+  assert.equal(denial?.freeSlots, 0);
+});
+test('RateLimitGovernor.acquire — a BUCKET denial is attributed to the bucket even when a fleet gate is wired', async () => {
+  // Control for the test above: identical denial reason, but the fleet gate always has room, so
+  // the bucket's own cap is what refuses. A permissive gate must not launder a bucket denial.
+  let released = 0;
+  const g = new RateLimitGovernor(
+    { maxConcurrent: 1 },
+    {
+      globalGate: {
+        tryAcquire: () => true,
+        release: () => { released += 1; },
+        snapshot: () => ({ inFlight: 1, limit: 99 }),
+      },
+    },
+  );
+  const held = await g.acquire({});
+  let denial: import('./governor').AdmissionDenial | undefined;
+  const r = await g.acquire({}, { maxWaitMs: 0, onDenied: (d) => (denial = d) });
+  assert.equal(r, null);
+  assert.equal(denial?.reason, 'no-free-slot');
+  assert.equal(denial?.gate, 'bucket');
+  assert.equal(denial?.gateInFlight, 1);
+  assert.equal(denial?.gateLimit, 1); // the BUCKET's cap, not the fleet gate's 99
+  assert.equal(denial?.freeSlots, 0);
+  held!();
+  assert.equal(released, 1);
+});
+test('RateLimitGovernor.acquire — an UNBOUNDED fleet limit is omitted, not reported as a number', async () => {
+  // A cap-less gate's limit is Infinity, which carries no information and does not survive JSON
+  // (it serializes to null and reads back as a real value). Omit it, and omit the derived
+  // freeSlots with it, rather than persisting a lie.
+  const g = new RateLimitGovernor(
+    { maxConcurrent: 4 },
+    {
+      globalGate: {
+        tryAcquire: () => false,
+        release: () => {},
+        snapshot: () => ({ inFlight: 7, limit: Infinity }),
+      },
+    },
+  );
+  let denial: import('./governor').AdmissionDenial | undefined;
+  await g.acquire({}, { maxWaitMs: 0, onDenied: (d) => (denial = d) });
+  assert.equal(denial?.gate, 'fleet');
+  assert.equal(denial?.gateInFlight, 7);
+  assert.equal(denial?.gateLimit, undefined);
+  assert.equal(denial?.freeSlots, undefined);
+});
+test('RateLimitGovernor.acquire — a fleet gate with no/throwing snapshot still mints an attributed denial', async () => {
+  // The evidence read is best-effort: a gate that cannot report numbers must still produce a
+  // denial that says WHICH gate refused, and must never break admission.
+  for (const snapshot of [undefined, () => { throw new Error('gate unavailable'); }]) {
+    const g = new RateLimitGovernor(
+      { maxConcurrent: 4 },
+      { globalGate: { tryAcquire: () => false, release: () => {}, ...(snapshot ? { snapshot } : {}) } },
+    );
+    let denial: import('./governor').AdmissionDenial | undefined;
+    const r = await g.acquire({}, { maxWaitMs: 0, onDenied: (d) => (denial = d) });
+    assert.equal(r, null);
+    assert.equal(denial?.gate, 'fleet');
+    assert.equal(denial?.gateInFlight, undefined);
+    assert.equal(denial?.freeSlots, undefined);
+  }
+});
+test('RateLimitGovernor.acquire — a RATE denial carries no gate stamp (it is not a concurrency denial)', async () => {
+  // `gate` answers "which concurrency gate refused". A pause/rate denial has no concurrency gate,
+  // and stamping one would invent an attribution — absent must stay readable as "not applicable",
+  // never silently defaulted to 'bucket'.
+  let clock = 0;
+  const g = new RateLimitGovernor(
+    { maxConcurrent: 4 },
+    { now: () => clock, sleep: async (ms) => { clock += ms; } },
+  );
+  g.penalize({ retryAfterMs: 60 * 60 * 1000 });
+  let denial: import('./governor').AdmissionDenial | undefined;
+  const r = await g.acquire({}, { maxWaitMs: 1000, onDenied: (d) => (denial = d) });
+  assert.equal(r, null);
+  assert.equal(denial?.reason, 'rate-limit-blocked');
+  assert.equal(denial?.gate, undefined);
+  assert.equal(denial?.freeSlots, undefined);
 });
 test('RateLimitGovernor.acquire — returns null when the abort signal is already aborted', async () => {
   const g = new RateLimitGovernor({ maxConcurrent: 1 }, { now: () => 0, sleep: async () => {} });
