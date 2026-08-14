@@ -44,7 +44,7 @@ import { basename, delimiter, join } from 'node:path';
 // import nothing from this file, so there's no cycle and ~no load cost when the flag is off.
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
 import { governorForBackend, BACKEND_PROFILES } from './governor-registry';
-import { ROLLING_WINDOW_REPROBE_MS } from '../resilience/governor';
+import { RateLimitGovernor, ROLLING_WINDOW_REPROBE_MS } from '../resilience/governor';
 import { tierOf } from '../resilience/priority-admission';
 import { classifyTurnError, isAccountWide, type TurnBackend, type TurnError } from './turn-error';
 // WI-38316: the `grant_type=refresh_token` exchange that revives a rejected-but-locally-valid
@@ -600,8 +600,10 @@ export interface RunAgentChatOptions {
    */
   retryDeadlineMs?: number;
   /**
-   * Fired once the process-local shared governor ADMITS this call — i.e. immediately before
-   * the underlying HTTP request is issued — and again on each retry attempt.
+   * Fired once local admission completes — i.e. immediately before the underlying HTTP
+   * request is issued — and again on each retry attempt. Direct-provider calls use the shared
+   * provider governor; loopback-gateway calls use a request-local retry governor because the
+   * gateway is already the shared pooled-admission authority (EI-20394554339706750).
    *
    * IMPORTANT: when the transport points at Papercusp's inference gateway, the request can
    * still queue behind the gateway's own admission/account governors after this callback.
@@ -984,6 +986,30 @@ function resolveStatelessTransport(): StatelessTransport {
   return choice === 'anthropic-direct'
     ? anthropicDirectTransport(claudeTok!)
     : gatewayPoolTransport();
+}
+
+/**
+ * Governor for one stateless HTTP call. A loopback transport is Papercusp's local inference
+ * gateway, which already owns pooled account selection, cross-account admission, priority
+ * tiers, per-account pacing, and failover. Putting the account-blind process singleton in
+ * front of that queue creates a duplicate maxConcurrent=3 choke point: three unrelated
+ * in-process calls can reject a fourth even while the gateway pool has free accounts.
+ *
+ * Keep a REQUEST-LOCAL governor for gateway calls rather than dropping `runAgentTurn`: it
+ * preserves the classified retry loop and its retry-after sleep between this call's attempts,
+ * but cannot couple concurrent calls through a fake single-provider bucket. A real remote
+ * provider transport keeps the shared singleton exactly as before.
+ *
+ * Exported as the regression seam so tests can prove four pooled gateway calls do not share
+ * the historical 3-slot bucket without standing up the Anthropic SDK or gateway.
+ */
+export function governorForStatelessTransport(
+  transport: { baseURL: string },
+  model: string,
+): RateLimitGovernor {
+  return isLocalhostUrl(transport.baseURL)
+    ? new RateLimitGovernor({ maxConcurrent: 1 })
+    : governorForBackend('anthropic-direct', model);
 }
 
 export type StatelessTransportProbe =
@@ -1407,10 +1433,11 @@ export function headersToRecord(h: unknown): Record<string, string | undefined> 
 
 /**
  * Governed stateless request (agent-turn-robustness P-004): the SAME single request as the
- * loop above, but run through `runAgentTurn` + the shared `RateLimitGovernor` —
- * concurrency-capped, paced under the provider RPM, and on a 429 it penalizes the governor
- * with the server's `retry-after` (so the NEXT acquire waits exactly that long, across all
- * callers) instead of a blind exponential backoff. Yields the same delta/result/error.
+ * loop above, but run through `runAgentTurn` + a transport-appropriate `RateLimitGovernor`.
+ * Direct-provider traffic uses the shared provider bucket. Loopback-gateway traffic uses a
+ * request-local governor because the gateway already owns pooled shared admission; this keeps
+ * classified retries and the current call's retry-after wait without imposing a duplicate
+ * account-blind concurrency ceiling. Yields the same delta/result/error.
  */
 async function* governedStatelessChat(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1460,7 +1487,9 @@ async function* governedStatelessChat(
     console.warn('[anthropic-direct] governed path recovered a rejected Claude OAuth session — retrying (WI-38316)');
     return auth.mkClient(auth.transport);
   };
-  const governor = governorForBackend('anthropic-direct', model);
+  const governor = auth
+    ? governorForStatelessTransport(auth.transport, model)
+    : governorForBackend('anthropic-direct', model);
   type V = { finalText: string; tokensIn: number; tokensOut: number; costUsd: number };
   const result = await runAgentTurn<V>(
     // No estTokens: max_tokens does NOT count toward OTPM (only tokens actually produced),
@@ -1517,9 +1546,11 @@ async function* governedStatelessChat(
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async function issueOnce(client: any): Promise<TurnOutcome<V>> {
-        // LOCAL admission only: the governor has granted a permit and we are about to issue
-        // the HTTP request. The request may still queue inside the inference gateway, so the
-        // generation timer must wait for stream 'connect' below (EI-11417).
+        // LOCAL admission only: the transport-appropriate governor has granted a permit and
+        // we are about to issue the HTTP request. The request may still queue inside the
+        // inference gateway, so the generation timer must wait for stream 'connect' below
+        // (EI-11417). For loopback traffic this local permit is deliberately request-scoped;
+        // the gateway is the shared pooled-admission authority (EI-20394554339706750).
         try {
           opts.onAdmitted?.();
         } catch {

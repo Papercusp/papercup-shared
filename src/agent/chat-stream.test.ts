@@ -4,7 +4,31 @@
  */
 import { test, afterEach } from 'vitest';
 import assert from 'node:assert/strict';
-import { normalizeModelForClaude, headersToRecord, buildSystemParam, CLAUDE_CODE_IDENTIFIER, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, GATEWAY_PRIORITY_HEADER, retryLadderDeadlineExceeded } from './chat-stream';
+import { normalizeModelForClaude, headersToRecord, buildSystemParam, CLAUDE_CODE_IDENTIFIER, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, GATEWAY_PRIORITY_HEADER, retryLadderDeadlineExceeded, governorForStatelessTransport } from './chat-stream';
+
+// EI-20394554339706750: the local inference gateway is already the pooled admission authority.
+// The process-local provider singleton used to sit in front of it with maxConcurrent=3, so three
+// unrelated stateless calls could manufacture a no-free-slot denial while the gateway had spare
+// accounts. Gateway calls must get isolated retry governors; direct provider calls still share.
+test('governorForStatelessTransport — four local pooled-gateway calls do not share the 3-slot provider bucket', async () => {
+  const governors = Array.from({ length: 4 }, () =>
+    governorForStatelessTransport({ baseURL: 'http://127.0.0.1:8788' }, 'claude-opus-4-8'),
+  );
+  assert.equal(new Set(governors).size, 4);
+
+  const releases = await Promise.all(governors.map((governor) => governor.acquire({}, { maxWaitMs: 0 })));
+  try {
+    assert.ok(releases.every((release) => release !== null));
+  } finally {
+    for (const release of releases) release?.();
+  }
+});
+
+test('governorForStatelessTransport — remote direct-provider calls retain the shared provider governor', () => {
+  const a = governorForStatelessTransport({ baseURL: 'https://api.anthropic.com' }, 'claude-opus-4-8');
+  const b = governorForStatelessTransport({ baseURL: 'https://api.anthropic.com' }, 'claude-opus-4-8');
+  assert.strictEqual(a, b);
+});
 
 // retryLadderDeadlineExceeded (WI-5391): the anthropic-direct transient-retry ladder must
 // never start a backoff sleep that crosses the caller's absolute retry deadline — a
