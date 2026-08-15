@@ -158,13 +158,29 @@ const TIMEOUT_RE = /(\b408\b|timed? ?out|deadline exceeded)/i;
 const CONTEXT_OVERFLOW_RE =
   /prompt is too long|input (?:length )?is too long|\bcontext[_ -]?length[_ -]?exceeded\b|maximum context length|input length and `?max_tokens`? exceed|exceeds? the (?:model'?s )?maximum (?:context|(?:number of )?(?:input )?tokens)|reduce the length of (?:the )?(?:messages|prompt|input)/i;
 
+/** Month-name prefixes for the date-qualified usage-reset form ("resets Aug 20, 7am"). */
+const USAGE_RESET_MONTHS: Record<string, number> = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+};
+
 /**
  * Best-effort reset extraction from a subscription usage-limit MESSAGE (the subprocess path,
  * where structured `*-reset` headers aren't visible). Handles the relative form
  * ("resets in 2h 30m", "try again in 90 minutes") and the absolute clock form Claude prints
- * ("resets 4:20am", "resets at 11 pm", "resets 16:00"). Returns epoch ms, or undefined when no
+ * ("resets 4:20am", "resets at 11 pm", "resets 16:00"), plus the DATE-QUALIFIED form Claude
+ * prints for a WEEKLY limit ("resets Aug 20, 7am"). Returns epoch ms, or undefined when no
  * reset is parseable (the caller still pauses + surfaces, just without a precise time). Pure:
  * `now` is injected so the absolute-clock "next occurrence" math is testable.
+ *
+ * ⚠ The date-qualified branch is not cosmetic — it is the case that matters MOST, and it used to
+ * be the ONLY one that failed (EI-20542327908037306). Both older branches require a DIGIT
+ * immediately after "resets", so `resets Aug 20, 7am` matched neither and returned undefined.
+ * Every SHORT wall (hours away) parsed; only the LONG wall (days away) did not — so a loop that
+ * died on a multi-day weekly limit got no hold at all and re-fired into the closed window every
+ * ~90 minutes, each COLD fire burning a destructive context reset for zero work (measured
+ * 2026-08-15: 91 such turns across 5 owners in 48h). Keep this branch AHEAD of the bare-clock
+ * one: `resets Aug 20, 7am` must resolve to Aug 20, never to "7am tomorrow".
  */
 export function parseUsageResetMs(text: string, now: number = Date.now()): number | undefined {
   // Relative: "resets in 2h", "try again in 90 minutes", "in 2h 30m", "in 45s".
@@ -181,6 +197,36 @@ export function parseUsageResetMs(text: string, now: number = Date.now()): numbe
       ms += u.startsWith('h') ? n * 3_600_000 : u.startsWith('m') ? n * 60_000 : n * 1000;
     }
     if (matched && ms > 0) return now + ms;
+  }
+  // Date-qualified absolute: "resets Aug 20, 7am", "resets Jun 18 7:30pm", "resets Sep 3, 16:00".
+  // MUST precede the bare-clock branch below, which would otherwise never see these anyway (it
+  // needs a digit right after "resets") but would misread a reordered variant as "today/tomorrow".
+  const absDate =
+    /resets?\s+(?:at\s+)?([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?\s*,?\s*(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i.exec(
+      text,
+    );
+  if (absDate) {
+    const mon = USAGE_RESET_MONTHS[absDate[1].slice(0, 3).toLowerCase()];
+    // A non-month word ("resets tomorrow 7am") falls through to the branches below rather than
+    // resolving to a wrong instant.
+    if (mon !== undefined) {
+      const day = parseInt(absDate[2], 10);
+      let h = parseInt(absDate[3], 10);
+      const min = absDate[4] ? parseInt(absDate[4], 10) : 0;
+      const ap = absDate[5]?.toLowerCase();
+      if (ap === 'pm' && h < 12) h += 12;
+      if (ap === 'am' && h === 12) h = 0;
+      if (day >= 1 && day <= 31 && h <= 23 && min <= 59) {
+        const d = new Date(now);
+        d.setMonth(mon, day);
+        d.setHours(h, min, 0, 0);
+        // The message names no year and a reset is always ahead of us, so a constructed instant
+        // in the past means a year rollover (a late-December wall resetting in January).
+        if (d.getTime() <= now) d.setFullYear(d.getFullYear() + 1);
+        const t = d.getTime();
+        if (Number.isFinite(t)) return t;
+      }
+    }
   }
   // Absolute clock: "resets 4:20am", "resets at 11 pm", "resets 16:00" → the NEXT occurrence.
   const abs = /resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i.exec(text);
