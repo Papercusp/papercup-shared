@@ -275,7 +275,7 @@ export function parseUsageReset(text: string, now: number = Date.now()): UsageRe
         // Sanity horizon. A subscription reset is inherently near-future (weekly ⇒ ≤7d), so a
         // parse landing months out is a MISREAD, not a long wall — and returning it would be
         // actively worse than returning nothing: not every caller clamps. classifyLoopLifecycleTurn
-        // caps at LIFECYCLE_DEATH_REARM_CAP_MS, but gateway.ts's usage-cap pause takes this instant
+        // clamps via `clampUsageRearmDelayMs`, but gateway.ts's usage-cap pause takes this instant
         // as-is, so a stale/garbled "resets Jun 18" read in August would roll to the NEXT June and
         // pause inference for a year. Fall through to undefined instead: the caller still pauses
         // and surfaces, just without a precise time — the documented degraded mode.

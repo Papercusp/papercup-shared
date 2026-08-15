@@ -7,7 +7,11 @@ import assert from 'node:assert/strict';
 import {
   parseRetryAfterMs,
   parseResetAt,
-  parseUsageResetMs,
+  parseUsageReset,
+  usageRearmCapMs,
+  clampUsageRearmDelayMs,
+  USAGE_REARM_CAP_MS,
+  USAGE_REARM_CAP_HIGH_CONFIDENCE_MS,
   classifyHttpError,
   classifySubprocessResult,
   classifyTurnError,
@@ -217,19 +221,22 @@ test('isAccountWide — rate_limited / overloaded / usage_limit pause the fleet;
   }
 });
 
-// --- parseUsageResetMs (D-001) ---
-test('parseUsageResetMs — relative durations', () => {
+// --- parseUsageReset (D-001) ---
+test('parseUsageReset — relative durations', () => {
   const now = 1_000_000;
-  assert.equal(parseUsageResetMs('resets in 90 minutes', now), now + 90 * 60_000);
-  assert.equal(parseUsageResetMs('try again in 2h 30m', now), now + (2 * 3_600_000 + 30 * 60_000));
-  assert.equal(parseUsageResetMs('wait 45s and retry', now), now + 45_000);
-  assert.equal(parseUsageResetMs('no time here', now), undefined);
+  assert.equal(parseUsageReset('resets in 90 minutes', now)?.atMs, now + 90 * 60_000);
+  assert.equal(parseUsageReset('try again in 2h 30m', now)?.atMs, now + (2 * 3_600_000 + 30 * 60_000));
+  assert.equal(parseUsageReset('wait 45s and retry', now)?.atMs, now + 45_000);
+  assert.equal(parseUsageReset('no time here', now), undefined);
+  assert.equal(parseUsageReset('resets in 90 minutes', now)?.precision, 'relative');
 });
-test('parseUsageResetMs — absolute clock → next occurrence, local hour preserved', () => {
+test('parseUsageReset — absolute clock → next occurrence, local hour preserved', () => {
   const now = Date.parse('2026-06-05T20:00:00Z');
-  const t = parseUsageResetMs('resets at 11pm', now);
-  assert.ok(t !== undefined && t > now);
-  assert.equal(new Date(t as number).getHours(), 23);
+  const r = parseUsageReset('resets at 11pm', now);
+  assert.ok(r !== undefined && r.atMs > now);
+  assert.equal(new Date(r.atMs).getHours(), 23);
+  // 'clock', not 'dated': the DAY is our inference, and that is what keeps the tight re-arm rail.
+  assert.equal(r.precision, 'clock');
 });
 
 // --- date-qualified weekly wall (EI-20542327908037306) ---
@@ -237,40 +244,104 @@ test('parseUsageResetMs — absolute clock → next occurrence, local hour prese
 // required a digit immediately after "resets" — so the ONE form that fails was the multi-day one,
 // where a correct hold matters most. A loop that got no hold re-fired into the closed window every
 // ~90min, each COLD fire burning a context reset for zero work.
-test('parseUsageResetMs — date-qualified weekly wall resolves to that DATE, not tomorrow', () => {
+test('parseUsageReset — date-qualified weekly wall resolves to that DATE, not tomorrow', () => {
   const now = Date.parse('2026-08-15T17:47:00Z'); // Sat Aug 15, 1:47pm EDT
-  const t = parseUsageResetMs("You've hit your weekly limit · resets Aug 20, 7am (America/New_York)", now);
-  assert.ok(t !== undefined, 'date-qualified reset must parse');
-  const d = new Date(t as number);
+  const r = parseUsageReset("You've hit your weekly limit · resets Aug 20, 7am (America/New_York)", now);
+  assert.ok(r !== undefined, 'date-qualified reset must parse');
+  const d = new Date(r.atMs);
   assert.equal(d.getMonth(), 7, 'August');
   assert.equal(d.getDate(), 20);
   assert.equal(d.getHours(), 7);
   // The whole point: ~5 days out, NOT the ~17h that a bare-clock read of "7am" would give.
-  assert.ok(t as number > now + 4 * 86_400_000, 'must be days out, not next-morning');
+  assert.ok(r.atMs > now + 4 * 86_400_000, 'must be days out, not next-morning');
+  assert.equal(r.precision, 'dated', 'an explicitly NAMED instant — earns the long re-arm ceiling');
 });
-test('parseUsageResetMs — date-qualified variants', () => {
+test('parseUsageReset — date-qualified variants', () => {
   const now = Date.parse('2026-08-15T17:47:00Z');
-  const sep = parseUsageResetMs('resets Sep 3, 16:00', now); // 24h clock
-  assert.equal(new Date(sep as number).getDate(), 3);
-  assert.equal(new Date(sep as number).getHours(), 16);
-  const ord = parseUsageResetMs('resets Aug 21st, 7am', now); // ordinal suffix
-  assert.equal(new Date(ord as number).getDate(), 21);
-  const nc = parseUsageResetMs('resets Aug 18 7:30pm', now); // no comma
-  assert.equal(new Date(nc as number).getHours(), 19);
-  assert.equal(new Date(nc as number).getMinutes(), 30);
+  const sep = parseUsageReset('resets Sep 3, 16:00', now); // 24h clock
+  assert.equal(new Date(sep!.atMs).getDate(), 3);
+  assert.equal(new Date(sep!.atMs).getHours(), 16);
+  const ord = parseUsageReset('resets Aug 21st, 7am', now); // ordinal suffix
+  assert.equal(new Date(ord!.atMs).getDate(), 21);
+  const nc = parseUsageReset('resets Aug 18 7:30pm', now); // no comma
+  assert.equal(new Date(nc!.atMs).getHours(), 19);
+  assert.equal(new Date(nc!.atMs).getMinutes(), 30);
+  for (const r of [sep, ord, nc]) assert.equal(r?.precision, 'dated');
 });
-test('parseUsageResetMs — a month-name read is bounded, and non-months fall through', () => {
+test('parseUsageReset — a month-name read is bounded, and non-months fall through', () => {
   const now = Date.parse('2026-08-15T17:47:00Z');
   // A PAST month names no year, so it would roll to the next one — ~10 months out. That is a
   // misread, not a long wall, and gateway.ts takes this instant as an uncapped pause, so it must
   // degrade to undefined rather than pausing inference for months.
-  assert.equal(parseUsageResetMs('resets Jun 18, 7:30pm', now), undefined);
+  assert.equal(parseUsageReset('resets Jun 18, 7:30pm', now), undefined);
   // A non-month word must not be mistaken for one.
-  assert.equal(parseUsageResetMs('resets tomorrow at 7am', now), undefined);
-  // Bare-clock and relative forms are untouched by the new branch.
-  const bare = parseUsageResetMs("You've hit your session limit · resets 4am (America/New_York)", now);
-  assert.equal(new Date(bare as number).getHours(), 4);
-  assert.equal(parseUsageResetMs('resets in 2h 30m', now), now + 2.5 * 3_600_000);
+  assert.equal(parseUsageReset('resets tomorrow at 7am', now), undefined);
+  // Bare-clock and relative forms are untouched by the new branch — and must NOT claim 'dated',
+  // which would hand an INFERRED day the multi-day re-arm ceiling (EI-20544023385610622).
+  const bare = parseUsageReset("You've hit your session limit · resets 4am (America/New_York)", now);
+  assert.equal(new Date(bare!.atMs).getHours(), 4);
+  assert.equal(bare!.precision, 'clock');
+  assert.equal(parseUsageReset('resets in 2h 30m', now)?.atMs, now + 2.5 * 3_600_000);
+  assert.equal(parseUsageReset('resets in 2h 30m', now)?.precision, 'relative');
+});
+
+// --- the two-tier re-arm ceiling (EI-20544023385610622) ---
+// The parser learning the weekly form was only half the fix: the caller then clipped the
+// correctly-parsed ~113h hold to a 6h cap tuned for DAILY walls, so a walled loop still re-fired
+// ~4x/day into a window it already knew was closed. The ceiling now follows the CONFIDENCE of the
+// instant rather than a single number for every case.
+test('usageRearmCapMs — only a NAMED instant earns the long ceiling', () => {
+  assert.equal(usageRearmCapMs('dated'), USAGE_REARM_CAP_HIGH_CONFIDENCE_MS);
+  assert.equal(usageRearmCapMs('header'), USAGE_REARM_CAP_HIGH_CONFIDENCE_MS);
+  // INFERRED or short-range → the tight sanity rail is unchanged.
+  assert.equal(usageRearmCapMs('clock'), USAGE_REARM_CAP_MS);
+  assert.equal(usageRearmCapMs('relative'), USAGE_REARM_CAP_MS);
+  // Absent precision must FAIL CLOSED: a legacy/hand-built error that never set one must not
+  // inherit the multi-day hold by omission.
+  assert.equal(usageRearmCapMs(undefined), USAGE_REARM_CAP_MS);
+  assert.ok(USAGE_REARM_CAP_HIGH_CONFIDENCE_MS > USAGE_REARM_CAP_MS);
+});
+test('clampUsageRearmDelayMs — a weekly wall is held in full; a bare-clock guess is still clipped', () => {
+  const interval = 60_000;
+  const weeklyMs = 113 * 3_600_000; // the real measured shape: ~4.7 days out
+  // THE BUG: this used to come back as 6h.
+  assert.equal(clampUsageRearmDelayMs(weeklyMs, interval, 'dated'), weeklyMs);
+  assert.equal(clampUsageRearmDelayMs(weeklyMs, interval, 'clock'), USAGE_REARM_CAP_MS);
+  assert.equal(clampUsageRearmDelayMs(weeklyMs, interval, undefined), USAGE_REARM_CAP_MS);
+  // The rail still exists for a NAMED instant — it is widened, not removed. A garbled dated parse
+  // (the parser admits up to 35d) is bounded to one week, not slept on for a month.
+  assert.equal(clampUsageRearmDelayMs(30 * 86_400_000, interval, 'dated'), USAGE_REARM_CAP_HIGH_CONFIDENCE_MS);
+  // The interval floor is unchanged: never fire sooner than the loop's own cadence.
+  assert.equal(clampUsageRearmDelayMs(5, interval, 'dated'), interval);
+  // A DAILY wall — the regime the 6h cap was tuned for — is unaffected either way.
+  assert.equal(clampUsageRearmDelayMs(3 * 3_600_000, interval, 'clock'), 3 * 3_600_000);
+});
+test('classifySubprocessResult — a weekly wall carries BOTH the instant and its precision', () => {
+  const now = Date.parse('2026-08-15T17:47:00Z');
+  const err = classifySubprocessResult(
+    { exitCode: 1, stdout: "You've hit your weekly limit · resets Aug 20, 7am (America/New_York)" },
+    'anthropic',
+    now,
+  );
+  assert.equal(err.class, 'usage_limit');
+  assert.equal(err.resetPrecision, 'dated');
+  // End-to-end: the precision must survive onto the TurnError, or the consumer silently falls back
+  // to the tight rail and the fix is inert on the very path a walled loop dies on.
+  assert.equal(clampUsageRearmDelayMs(err.resetAt! - now, 60_000, err.resetPrecision), err.resetAt! - now);
+});
+test('classifyHttpError — a provider *-reset header is high-confidence', () => {
+  const now = Date.parse('2026-08-15T17:47:00Z');
+  const err = classifyHttpError(
+    {
+      status: 429,
+      message: 'usage limit reached',
+      headers: { 'anthropic-ratelimit-requests-reset': new Date(now + 90 * 3_600_000).toISOString() },
+    },
+    'anthropic',
+    now,
+  );
+  assert.equal(err.class, 'usage_limit');
+  assert.equal(err.resetPrecision, 'header');
 });
 
 // --- classifyTurnError dispatch ---
