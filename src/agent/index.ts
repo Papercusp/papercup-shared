@@ -67,11 +67,17 @@ export {
   classifySubprocessResult,
   classifyHttpError,
   isAccountWide,
-  parseUsageResetMs,
+  parseUsageReset,
+  usageRearmCapMs,
+  clampUsageRearmDelayMs,
+  USAGE_REARM_CAP_MS,
+  USAGE_REARM_CAP_HIGH_CONFIDENCE_MS,
   type TurnError,
   type TurnBackend,
   type TurnProvider,
   type TurnErrorClass,
+  type UsageReset,
+  type UsageResetPrecision,
 } from './turn-error';
 export {
   governorForBackend,

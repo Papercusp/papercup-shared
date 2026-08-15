@@ -28,6 +28,39 @@ export type TurnErrorClass =
 export type TurnBackend = 'anthropic-direct' | 'claude-code' | 'omp' | 'codex';
 export type TurnProvider = 'anthropic' | 'openai' | 'unknown';
 
+/**
+ * HOW a `resetAt` was derived — the CONFIDENCE a backoff policy is entitled to place in it.
+ *
+ * This exists because a re-arm ceiling must distinguish "the provider told us the exact instant"
+ * from "we guessed which day 7am meant". EI-20544023385610622: a single 6h sanity cap served both,
+ * so a correctly-parsed multi-day WEEKLY wall was clipped to 6h and the loop re-fired ~4x/day into
+ * a window it already knew was closed — each COLD fire burning a full context reset for zero work.
+ *
+ * HIGH confidence (`header`, `dated`) names an explicit absolute instant and may be trusted for a
+ * long hold; LOW confidence (`relative`, `clock`) is either inherently short-range or partly
+ * INFERRED, and keeps the tight ceiling. See `usageRearmCapMs`.
+ */
+export type UsageResetPrecision =
+  /** A provider `*-reset` header — structured, authoritative. HIGH. */
+  | 'header'
+  /** Message named an explicit calendar date + time ("resets Aug 20, 7am"). HIGH. */
+  | 'dated'
+  /** Message named a duration ("resets in 2h 30m") — exact, but inherently short-range. LOW. */
+  | 'relative'
+  /** Message named a bare clock time ("resets 7am"); the DAY is inferred as "next occurrence". LOW. */
+  | 'clock';
+
+/** A parsed usage-reset instant together with how it was derived. */
+export interface UsageReset {
+  /** Epoch ms the limit resets at. */
+  atMs: number;
+  /** How `atMs` was derived — see `UsageResetPrecision`. Never `'header'` from text parsing. */
+  precision: Exclude<UsageResetPrecision, 'header'>;
+}
+
+/** The precisions a backoff policy may trust for a LONG hold. */
+const HIGH_CONFIDENCE_RESET: ReadonlySet<UsageResetPrecision> = new Set<UsageResetPrecision>(['header', 'dated']);
+
 export interface TurnError {
   class: TurnErrorClass;
   message: string;
@@ -35,6 +68,9 @@ export interface TurnError {
   retryAfterMs?: number;
   /** Epoch ms when the limiting bucket replenishes (from `*-reset`). */
   resetAt?: number;
+  /** How `resetAt` was derived — gates how long a caller may back off on it (`usageRearmCapMs`).
+   *  Absent when there is no `resetAt`, or on a legacy/hand-built error that never set one. */
+  resetPrecision?: UsageResetPrecision;
   provider: TurnProvider;
   /** Convenience: is this class worth another attempt (with the right wait)? */
   retryable: boolean;
@@ -188,8 +224,13 @@ const USAGE_RESET_MONTHS: Record<string, number> = {
  * ~90 minutes, each COLD fire burning a destructive context reset for zero work (measured
  * 2026-08-15: 91 such turns across 5 owners in 48h). Keep this branch AHEAD of the bare-clock
  * one: `resets Aug 20, 7am` must resolve to Aug 20, never to "7am tomorrow".
+ *
+ * ⚠ Returns the instant WITH its `precision`, not a bare number (EI-20544023385610622). Parsing
+ * the weekly wall correctly was only half the fix: the caller then clipped it to a 6h sanity cap
+ * tuned for daily walls. A ceiling cannot be widened safely without knowing whether the instant
+ * was NAMED or INFERRED, so the derivation travels with the value rather than being re-guessed.
  */
-export function parseUsageResetMs(text: string, now: number = Date.now()): number | undefined {
+export function parseUsageReset(text: string, now: number = Date.now()): UsageReset | undefined {
   // Relative: "resets in 2h", "try again in 90 minutes", "in 2h 30m", "in 45s".
   const rel = /(?:resets?|try again|again|wait)\b[^0-9]{0,12}((?:\d+\s*(?:h|hr|hrs|hours?|m|min|mins|minutes?|s|sec|secs|seconds?)\b\s*)+)/i.exec(text);
   if (rel) {
@@ -203,7 +244,7 @@ export function parseUsageResetMs(text: string, now: number = Date.now()): numbe
       const u = mm[2].toLowerCase();
       ms += u.startsWith('h') ? n * 3_600_000 : u.startsWith('m') ? n * 60_000 : n * 1000;
     }
-    if (matched && ms > 0) return now + ms;
+    if (matched && ms > 0) return { atMs: now + ms, precision: 'relative' };
   }
   // Date-qualified absolute: "resets Aug 20, 7am", "resets Jun 18 7:30pm", "resets Sep 3, 16:00".
   // MUST precede the bare-clock branch below, which would otherwise never see these anyway (it
@@ -238,7 +279,7 @@ export function parseUsageResetMs(text: string, now: number = Date.now()): numbe
         // as-is, so a stale/garbled "resets Jun 18" read in August would roll to the NEXT June and
         // pause inference for a year. Fall through to undefined instead: the caller still pauses
         // and surfaces, just without a precise time — the documented degraded mode.
-        if (Number.isFinite(t) && t - now <= USAGE_RESET_MAX_HORIZON_MS) return t;
+        if (Number.isFinite(t) && t - now <= USAGE_RESET_MAX_HORIZON_MS) return { atMs: t, precision: 'dated' };
       }
     }
   }
@@ -255,10 +296,65 @@ export function parseUsageResetMs(text: string, now: number = Date.now()): numbe
       d.setHours(h, min, 0, 0);
       let t = d.getTime();
       if (t <= now) t += 86_400_000; // already passed today → tomorrow
-      return t;
+      // 'clock', not 'dated': the message named an hour, and the DAY is our inference. That guess
+      // is why this precision keeps the tight re-arm ceiling — see `usageRearmCapMs`.
+      return { atMs: t, precision: 'clock' };
     }
   }
   return undefined;
+}
+
+/**
+ * Re-arm backoff ceiling for a LOW-CONFIDENCE reset (`relative` / `clock` / none) — a SANITY rail
+ * on a bogus parse, not a normal bound.
+ *
+ * WI-6852: this was 1h, which BOUND in practice rather than acting as a rail — measured
+ * 2026-08-02, 13 of 15 lifecycle-death re-arms landed on EXACTLY 60m, i.e. `resetAt - now`
+ * exceeded the cap every time and each re-arm was clipped and therefore UNDER-waited. Provider
+ * walls here commonly run ~3-5h (observed: a "resets 9am" wall active from 10:17Z to 13:00Z).
+ * 6h clears a real DAILY wall while still refusing to park a loop for a day on a mis-parse.
+ */
+export const USAGE_REARM_CAP_MS = 6 * 3_600_000;
+
+/**
+ * Re-arm ceiling for a HIGH-CONFIDENCE reset (`header` / `dated`) — an instant the provider NAMED
+ * rather than one we inferred.
+ *
+ * EI-20544023385610622: `USAGE_REARM_CAP_MS` was tuned for the daily/session wall regime and never
+ * contemplated a WEEKLY limit, which resets in DAYS. Once `parseUsageReset` learned the
+ * date-qualified form (EI-20542327908037306) a weekly wall parsed correctly to ~113h out and was
+ * then clipped to 6h — ~4 wakes/day into a window already known to be closed, each COLD one
+ * burning a full context reset for zero work. Raising the single cap blindly was rejected: it
+ * would trade this bug for the mis-parse hazard the rail exists to prevent, for EVERY loop on the
+ * box. Widening only for a NAMED instant keeps the rail where the guess is.
+ *
+ * 7d, not the parser's 35d `USAGE_RESET_MAX_HORIZON_MS`: a weekly limit resets within 7d BY
+ * DEFINITION, so a high-confidence instant beyond that is a monthly cap or a stale message, and
+ * re-checking beats sleeping. Bounds the worst case (a garbled dated parse) to one week while
+ * clearing every real weekly wall exactly.
+ */
+export const USAGE_REARM_CAP_HIGH_CONFIDENCE_MS = 7 * 86_400_000;
+
+/** The re-arm ceiling a reset of this precision earns. Absent precision ⇒ the tight rail. */
+export function usageRearmCapMs(precision: UsageResetPrecision | undefined): number {
+  return precision && HIGH_CONFIDENCE_RESET.has(precision) ? USAGE_REARM_CAP_HIGH_CONFIDENCE_MS : USAGE_REARM_CAP_MS;
+}
+
+/**
+ * The one clamp every usage-wall re-arm goes through: never sooner than the caller's own cadence,
+ * never longer than the ceiling this reset's `precision` earns.
+ *
+ * Lives HERE, beside the precision it consults, rather than as a private constant in each
+ * consumer: `reconcile-loop-routines.ts` and `loop-turn-outcome.ts` each carried their own copy of
+ * the 6h number with a comment asking the other to be kept in step, and a two-tier policy
+ * duplicated twice is a drift waiting to happen. Both import this instead.
+ */
+export function clampUsageRearmDelayMs(
+  hintMs: number,
+  intervalMs: number,
+  precision: UsageResetPrecision | undefined,
+): number {
+  return Math.min(Math.max(hintMs, intervalMs), usageRearmCapMs(precision));
 }
 
 /** Classify an HTTP-style failure (anthropic-direct in-process call, or an API error). */
@@ -279,7 +375,15 @@ export function classifyHttpError(
   // pause-until-reset + surface, do NOT retry. Checked before the transient-429 branch since the
   // disposition is opposite (D-001). The header reset (if any) IS the cap's reset time.
   if (USAGE_LIMIT_RE.test(msg) && !TRANSIENT_OVERRIDE_RE.test(msg) && (st === 429 || st === undefined)) {
-    return mk('usage_limit', msg, provider, { retryAfterMs, resetAt, ...(input.admissionDenial ? { admissionDenial: input.admissionDenial } : {}) });
+    return mk('usage_limit', msg, provider, {
+      retryAfterMs,
+      resetAt,
+      // A `*-reset` header is the provider's own structured field — the highest-confidence reset
+      // there is, so it earns the long re-arm ceiling (`usageRearmCapMs`). Only stamped when a
+      // header actually produced one; an absent reset must not read as a trusted one.
+      ...(resetAt !== undefined ? { resetPrecision: 'header' as const } : {}),
+      ...(input.admissionDenial ? { admissionDenial: input.admissionDenial } : {}),
+    });
   }
   if (st === 429 || (st === undefined && (RATE_RE.test(msg) || TRANSIENT_OVERRIDE_RE.test(msg)))) {
     // Fail-closed mint discipline (WI-5391 Part B): only a REAL HTTP 429 status attests a
@@ -292,6 +396,10 @@ export function classifyHttpError(
     return mk('rate_limited', msg, provider, {
       retryAfterMs,
       resetAt,
+      // Stamped honestly (it IS a header-derived instant) even though a transient RPM bucket is
+      // never a candidate for a long hold — the CLASS gate for that lives at the consumer
+      // (`computeDeathRearmMs`), so neither layer has to lie about where its value came from.
+      ...(resetAt !== undefined ? { resetPrecision: 'header' as const } : {}),
       ...(input.admissionDenial
         ? { admissionDenial: input.admissionDenial }
         : st === 429
@@ -335,8 +443,13 @@ export function classifySubprocessResult(
   // Plan/usage CAP first (opposite disposition to a transient 429): pause-until-reset + surface,
   // no retry. The CLI prints the reset in the message ("resets 4:20am"), so parse it best-effort.
   if (USAGE_LIMIT_RE.test(scan) && !TRANSIENT_OVERRIDE_RE.test(scan)) {
-    const resetAt = parseUsageResetMs(scan, now);
-    return mk('usage_limit', errText.slice(0, 200) || 'usage limit reached', provider, resetAt !== undefined ? { resetAt } : undefined);
+    const reset = parseUsageReset(scan, now);
+    return mk(
+      'usage_limit',
+      errText.slice(0, 200) || 'usage limit reached',
+      provider,
+      reset !== undefined ? { resetAt: reset.atMs, resetPrecision: reset.precision } : undefined,
+    );
   }
   if (RATE_RE.test(scan)) {
     // Some CLIs print "retry after 30s" / "try again in 12 seconds".
