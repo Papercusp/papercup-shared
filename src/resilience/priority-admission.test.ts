@@ -140,7 +140,7 @@ test('a task that throws rejects its run() and frees the slot', async () => {
 test('maxQueued — sheds load (QueueFullError) when slots busy AND queue at cap; frees up after drain', async () => {
   const q = new PriorityAdmissionQueue({ maxConcurrent: 1, maxQueued: 2 });
   let release: () => void = () => {};
-  const blocker = q.run(0, () => new Promise<void>((r) => { release = r; })); // occupies the single slot
+  void q.run(0, () => new Promise<void>((r) => { release = r; })); // occupies the single slot
   await tick();
   const w1 = q.run(0, async () => 'w1'); // queued (1/2)
   const w2 = q.run(0, async () => 'w2'); // queued (2/2 — at cap)

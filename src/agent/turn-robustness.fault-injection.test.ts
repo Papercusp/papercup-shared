@@ -18,7 +18,6 @@ import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { RateLimitGovernor } from '../resilience/governor';
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
-import type { TurnBackend } from './turn-error';
 
 /** A fake clock whose `sleep` advances time instantly — so governor pauses/backoff don't
     actually block the test, and we can measure simulated wall-clock. */

@@ -381,7 +381,7 @@ describe('resolveRouteAccountId (B4/F5 hard-pin footgun guard)', () => {
     process.env[KEY] = 'aviynw6';
     expect(mod.resolveRouteAccountId()).toBe('aviynw6');
     expect(mod.resolveRouteAccountId()).toBe('aviynw6'); // 2nd call
-    const pinWarns = warnSpy.mock.calls.filter((c) => String(c[0]).includes('PAPERCUSP_ROUTE_ACCOUNT'));
+    const pinWarns = warnSpy.mock.calls.filter((c: unknown[]) => String(c[0]).includes('PAPERCUSP_ROUTE_ACCOUNT'));
     expect(pinWarns.length).toBe(1); // one-shot, both calls returned the value
   });
 
@@ -389,7 +389,7 @@ describe('resolveRouteAccountId (B4/F5 hard-pin footgun guard)', () => {
     vi.resetModules();
     const mod = await import('./chat-stream');
     expect(mod.resolveRouteAccountId()).toBeUndefined();
-    const pinWarns = warnSpy.mock.calls.filter((c) => String(c[0]).includes('PAPERCUSP_ROUTE_ACCOUNT'));
+    const pinWarns = warnSpy.mock.calls.filter((c: unknown[]) => String(c[0]).includes('PAPERCUSP_ROUTE_ACCOUNT'));
     expect(pinWarns.length).toBe(0);
   });
 });
