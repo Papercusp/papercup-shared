@@ -232,6 +232,47 @@ test('parseUsageResetMs — absolute clock → next occurrence, local hour prese
   assert.equal(new Date(t as number).getHours(), 23);
 });
 
+// --- date-qualified weekly wall (EI-20542327908037306) ---
+// The WEEKLY limit message is date-qualified ("resets Aug 20, 7am"), and both older branches
+// required a digit immediately after "resets" — so the ONE form that fails was the multi-day one,
+// where a correct hold matters most. A loop that got no hold re-fired into the closed window every
+// ~90min, each COLD fire burning a context reset for zero work.
+test('parseUsageResetMs — date-qualified weekly wall resolves to that DATE, not tomorrow', () => {
+  const now = Date.parse('2026-08-15T17:47:00Z'); // Sat Aug 15, 1:47pm EDT
+  const t = parseUsageResetMs("You've hit your weekly limit · resets Aug 20, 7am (America/New_York)", now);
+  assert.ok(t !== undefined, 'date-qualified reset must parse');
+  const d = new Date(t as number);
+  assert.equal(d.getMonth(), 7, 'August');
+  assert.equal(d.getDate(), 20);
+  assert.equal(d.getHours(), 7);
+  // The whole point: ~5 days out, NOT the ~17h that a bare-clock read of "7am" would give.
+  assert.ok(t as number > now + 4 * 86_400_000, 'must be days out, not next-morning');
+});
+test('parseUsageResetMs — date-qualified variants', () => {
+  const now = Date.parse('2026-08-15T17:47:00Z');
+  const sep = parseUsageResetMs('resets Sep 3, 16:00', now); // 24h clock
+  assert.equal(new Date(sep as number).getDate(), 3);
+  assert.equal(new Date(sep as number).getHours(), 16);
+  const ord = parseUsageResetMs('resets Aug 21st, 7am', now); // ordinal suffix
+  assert.equal(new Date(ord as number).getDate(), 21);
+  const nc = parseUsageResetMs('resets Aug 18 7:30pm', now); // no comma
+  assert.equal(new Date(nc as number).getHours(), 19);
+  assert.equal(new Date(nc as number).getMinutes(), 30);
+});
+test('parseUsageResetMs — a month-name read is bounded, and non-months fall through', () => {
+  const now = Date.parse('2026-08-15T17:47:00Z');
+  // A PAST month names no year, so it would roll to the next one — ~10 months out. That is a
+  // misread, not a long wall, and gateway.ts takes this instant as an uncapped pause, so it must
+  // degrade to undefined rather than pausing inference for months.
+  assert.equal(parseUsageResetMs('resets Jun 18, 7:30pm', now), undefined);
+  // A non-month word must not be mistaken for one.
+  assert.equal(parseUsageResetMs('resets tomorrow at 7am', now), undefined);
+  // Bare-clock and relative forms are untouched by the new branch.
+  const bare = parseUsageResetMs("You've hit your session limit · resets 4am (America/New_York)", now);
+  assert.equal(new Date(bare as number).getHours(), 4);
+  assert.equal(parseUsageResetMs('resets in 2h 30m', now), now + 2.5 * 3_600_000);
+});
+
 // --- classifyTurnError dispatch ---
 test('classifyTurnError — dispatches by backend shape', () => {
   assert.equal(classifyTurnError('anthropic-direct', { status: 429, headers: { 'retry-after': '5' } }).class, 'rate_limited');

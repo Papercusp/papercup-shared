@@ -158,6 +158,13 @@ const TIMEOUT_RE = /(\b408\b|timed? ?out|deadline exceeded)/i;
 const CONTEXT_OVERFLOW_RE =
   /prompt is too long|input (?:length )?is too long|\bcontext[_ -]?length[_ -]?exceeded\b|maximum context length|input length and `?max_tokens`? exceed|exceeds? the (?:model'?s )?maximum (?:context|(?:number of )?(?:input )?tokens)|reduce the length of (?:the )?(?:messages|prompt|input)/i;
 
+/**
+ * Furthest-out instant a parsed usage reset may name before we treat it as a misread. Weekly
+ * limits reset within 7d and monthly within ~31d; 35d leaves headroom without letting a garbled
+ * date pause a caller for months.
+ */
+const USAGE_RESET_MAX_HORIZON_MS = 35 * 86_400_000;
+
 /** Month-name prefixes for the date-qualified usage-reset form ("resets Aug 20, 7am"). */
 const USAGE_RESET_MONTHS: Record<string, number> = {
   jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
@@ -224,7 +231,14 @@ export function parseUsageResetMs(text: string, now: number = Date.now()): numbe
         // in the past means a year rollover (a late-December wall resetting in January).
         if (d.getTime() <= now) d.setFullYear(d.getFullYear() + 1);
         const t = d.getTime();
-        if (Number.isFinite(t)) return t;
+        // Sanity horizon. A subscription reset is inherently near-future (weekly ⇒ ≤7d), so a
+        // parse landing months out is a MISREAD, not a long wall — and returning it would be
+        // actively worse than returning nothing: not every caller clamps. classifyLoopLifecycleTurn
+        // caps at LIFECYCLE_DEATH_REARM_CAP_MS, but gateway.ts's usage-cap pause takes this instant
+        // as-is, so a stale/garbled "resets Jun 18" read in August would roll to the NEXT June and
+        // pause inference for a year. Fall through to undefined instead: the caller still pauses
+        // and surfaces, just without a precise time — the documented degraded mode.
+        if (Number.isFinite(t) && t - now <= USAGE_RESET_MAX_HORIZON_MS) return t;
       }
     }
   }
