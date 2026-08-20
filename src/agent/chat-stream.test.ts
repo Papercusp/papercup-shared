@@ -283,18 +283,23 @@ test('parseClaudeResultEvent — full claude result event maps every reported fi
   );
 });
 
-test('parseClaudeResultEvent — omits unreported keys (no cache / no turns / no usage)', () => {
-  // A minimal result event (no usage block, no num_turns) returns ONLY what it
-  // carried, so the loop keeps prior streamed accumulators for absent fields.
+test('parseClaudeResultEvent — preserves reported values and marks incomplete usage evidence', () => {
+  // A minimal result event returns what it carried and marks the missing token
+  // evidence, so callers cannot mistake an absent measurement for a measured 0.
   assert.deepEqual(parseClaudeResultEvent({ type: 'result', total_cost_usd: 0.01 }), {
     costUsd: 0.01,
+    unreportedFrames: 1,
   });
-  // A partial usage block surfaces only the present token fields.
+  // A partial usage block surfaces only the present token fields and marks the
+  // missing cost measurement.
   assert.deepEqual(
     parseClaudeResultEvent({ type: 'result', usage: { input_tokens: 10, output_tokens: 20 } }),
-    { tokensIn: 10, tokensOut: 20 },
+    { tokensIn: 10, tokensOut: 20, unreportedFrames: 1 },
   );
-  // Non-numeric / missing → empty (never coerces a bogus 0).
-  assert.deepEqual(parseClaudeResultEvent({ type: 'result', num_turns: 'x', usage: {} }), {});
-  assert.deepEqual(parseClaudeResultEvent({}), {});
+  // Non-numeric / missing values are never coerced to 0, but the missing
+  // terminal measurement remains explicit.
+  assert.deepEqual(parseClaudeResultEvent({ type: 'result', num_turns: 'x', usage: {} }), {
+    unreportedFrames: 1,
+  });
+  assert.deepEqual(parseClaudeResultEvent({}), { unreportedFrames: 1 });
 });
