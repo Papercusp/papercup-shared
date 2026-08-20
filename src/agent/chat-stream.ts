@@ -689,6 +689,10 @@ export interface ClaudeResultUsage {
   unreportedFrames?: number;
 }
 
+function hasFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
 /**
  * Extract the terminal-usage slice from a claude-code `--output-format
  * stream-json` `result` event (`{type:'result', usage:{input_tokens,
@@ -1282,8 +1286,13 @@ async function* statelessAgentChat(
       for (const block of (resp.content ?? []) as Array<any>) {
         if (block?.type === 'text' && typeof block.text === 'string') finalText += block.text;
       }
-      const inputTokens = resp.usage?.input_tokens ?? 0;
-      const outputTokens = resp.usage?.output_tokens ?? 0;
+      const reportedInputTokens = resp.usage?.input_tokens;
+      const reportedOutputTokens = resp.usage?.output_tokens;
+      const inputTokens = hasFiniteNumber(reportedInputTokens) ? reportedInputTokens : 0;
+      const outputTokens = hasFiniteNumber(reportedOutputTokens) ? reportedOutputTokens : 0;
+      const unreportedFrames = hasFiniteNumber(reportedInputTokens) && hasFiniteNumber(reportedOutputTokens)
+        ? undefined
+        : 1;
       const p = anthropicPriceFor(opts.model);
       const costUsd = (inputTokens * p.in + outputTokens * p.out) / 1_000_000;
       // Usage telemetry (D-002 capture point 1): tokens + the raw response's ratelimit headers.
@@ -1298,7 +1307,14 @@ async function* statelessAgentChat(
         attribution: opts.usageAttribution,
       });
       if (finalText) yield { type: 'delta', text: finalText };
-      yield { type: 'result', costUsd, tokensIn: inputTokens, tokensOut: outputTokens, finalText };
+      yield {
+        type: 'result',
+        costUsd,
+        tokensIn: inputTokens,
+        tokensOut: outputTokens,
+        finalText,
+        ...(unreportedFrames !== undefined ? { unreportedFrames } : {}),
+      };
       return;
     } catch (err) {
       lastErr = err;
@@ -1500,7 +1516,13 @@ async function* governedStatelessChat(
   const governor = auth
     ? governorForStatelessTransport(auth.transport, model)
     : governorForBackend('anthropic-direct', model);
-  type V = { finalText: string; tokensIn: number; tokensOut: number; costUsd: number };
+  type V = {
+    finalText: string;
+    tokensIn: number;
+    tokensOut: number;
+    costUsd: number;
+    unreportedFrames?: number;
+  };
   const result = await runAgentTurn<V>(
     // No estTokens: max_tokens does NOT count toward OTPM (only tokens actually produced),
     // so estimating OTPM as max_tokens would massively over-charge the budget. Until we
@@ -1541,7 +1563,16 @@ async function* governedStatelessChat(
   );
   if (result.ok) {
     if (result.value.finalText) yield { type: 'delta', text: result.value.finalText };
-    yield { type: 'result', costUsd: result.value.costUsd, tokensIn: result.value.tokensIn, tokensOut: result.value.tokensOut, finalText: result.value.finalText };
+    yield {
+      type: 'result',
+      costUsd: result.value.costUsd,
+      tokensIn: result.value.tokensIn,
+      tokensOut: result.value.tokensOut,
+      finalText: result.value.finalText,
+      ...(result.value.unreportedFrames !== undefined
+        ? { unreportedFrames: result.value.unreportedFrames }
+        : {}),
+    };
   } else {
     // result.error IS a TurnError — pass it through so the caller can pause/resume on a
     // rate_limited class instead of re-parsing the message (RB-006). WI-38316: append the
@@ -1581,8 +1612,13 @@ async function* governedStatelessChat(
           for (const block of (resp.content ?? []) as Array<any>) {
             if (block?.type === 'text' && typeof block.text === 'string') finalText += block.text;
           }
-          const tokensIn = resp.usage?.input_tokens ?? 0;
-          const tokensOut = resp.usage?.output_tokens ?? 0;
+          const reportedInputTokens = resp.usage?.input_tokens;
+          const reportedOutputTokens = resp.usage?.output_tokens;
+          const tokensIn = hasFiniteNumber(reportedInputTokens) ? reportedInputTokens : 0;
+          const tokensOut = hasFiniteNumber(reportedOutputTokens) ? reportedOutputTokens : 0;
+          const unreportedFrames = hasFiniteNumber(reportedInputTokens) && hasFiniteNumber(reportedOutputTokens)
+            ? undefined
+            : 1;
           const p = anthropicPriceFor(model);
           const costUsd = (tokensIn * p.in + tokensOut * p.out) / 1_000_000;
           const headers = headersToRecord(stream.response?.headers);
@@ -1599,7 +1635,17 @@ async function* governedStatelessChat(
           });
           // Returning headers lets runWithRetry feed governor.recordResponse → header-driven
           // pacing (limits auto-tune, low-headroom soft pacing) activates on API-key paths.
-          return { ok: true, value: { finalText, tokensIn, tokensOut, costUsd }, ...(headers ? { headers } : {}) };
+          return {
+            ok: true,
+            value: {
+              finalText,
+              tokensIn,
+              tokensOut,
+              costUsd,
+              ...(unreportedFrames !== undefined ? { unreportedFrames } : {}),
+            },
+            ...(headers ? { headers } : {}),
+          };
         } catch (err) {
           // WI-38316: keep the RAW error — `isAuthFailure` reads `.status` off the SDK error
           // object, which the flattened `raw` record no longer carries as a throwable.
@@ -2217,12 +2263,18 @@ export async function* runAgentChat(
   let costUsd = 0;
   let tokensIn = 0;
   let tokensOut = 0;
+  let unreportedFrames = 0;
   // Surfaced on the terminal `result` event when the backend reports them
   // (claude-code: num_turns + cache_read/creation_input_tokens). Undefined
   // otherwise so a consumer can tell "0 turns" from "not reported".
   let numTurns: number | undefined;
   let cacheReadTokens: number | undefined;
   let cacheCreationTokens: number | undefined;
+  let claudeTerminalUsageSeen = false;
+  let ompUsageSeen = false;
+  let ompUsageComplete = false;
+  let codexUsageSeen = false;
+  let codexUsageComplete = false;
   // Buffer events from the line-parser; the generator drains this queue.
   const queue: ChatEvent[] = [];
   let resolveTick: (() => void) | null = null;
@@ -2265,12 +2317,14 @@ export async function* runAgentChat(
         queue.push({ type: 'tool_call', name: filtered, input: parsed });
       }
     } else if (ev.type === 'result') {
+      claudeTerminalUsageSeen = true;
       const u = parseClaudeResultEvent(ev);
       if (u.tokensIn !== undefined) tokensIn = u.tokensIn;
       if (u.tokensOut !== undefined) tokensOut = u.tokensOut;
       if (u.cacheReadTokens !== undefined) cacheReadTokens = u.cacheReadTokens;
       if (u.cacheCreationTokens !== undefined) cacheCreationTokens = u.cacheCreationTokens;
       if (u.costUsd !== undefined) costUsd = u.costUsd;
+      if (u.unreportedFrames !== undefined) unreportedFrames = Math.max(unreportedFrames, u.unreportedFrames);
       if (u.numTurns !== undefined) numTurns = u.numTurns;
       // Sometimes the terminal `result.result` is the most complete
       // assistant text — prefer it if longer than the streamed accum.
@@ -2297,10 +2351,7 @@ export async function* runAgentChat(
       } else if (ame.type === 'done' && ame.message) {
         // Capture token usage from the final assistant message.
         const u = ame.message.usage;
-        if (u) {
-          tokensIn = (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
-          tokensOut = u.output ?? tokensOut;
-        }
+        if (u) recordOmpUsage(u);
       }
       return;
     }
@@ -2324,12 +2375,22 @@ export async function* runAgentChat(
       const reconstructed = parts.join('');
       if (reconstructed.length > finalText.length) finalText = reconstructed;
       const u = ev.message.usage;
-      if (u) {
-        tokensIn = (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
-        tokensOut = u.output ?? tokensOut;
-      }
+      if (u) recordOmpUsage(u);
       return;
     }
+  };
+
+  const recordOmpUsage = (u: any) => {
+    ompUsageSeen = true;
+    const input = u?.input;
+    const output = u?.output;
+    const cacheRead = hasFiniteNumber(u?.cacheRead) ? u.cacheRead : 0;
+    const cacheWrite = hasFiniteNumber(u?.cacheWrite) ? u.cacheWrite : 0;
+    tokensIn = (hasFiniteNumber(input) ? input : 0) + cacheRead + cacheWrite;
+    tokensOut = hasFiniteNumber(output) ? output : tokensOut;
+    const reportedCost = u?.costUsd ?? u?.cost ?? u?.totalCost;
+    if (hasFiniteNumber(reportedCost)) costUsd = reportedCost;
+    ompUsageComplete = hasFiniteNumber(input) && hasFiniteNumber(output) && hasFiniteNumber(reportedCost);
   };
 
   /**
@@ -2401,10 +2462,14 @@ export async function* runAgentChat(
 
     if (ev.type === 'turn.completed' && ev.usage && typeof ev.usage === 'object') {
       const u = ev.usage;
+      codexUsageSeen = true;
       // input_tokens already includes cached_input_tokens in codex's
       // accounting; keep the raw total for tokensIn.
-      tokensIn = (u.input_tokens ?? tokensIn);
-      tokensOut = (u.output_tokens ?? 0) + (u.reasoning_output_tokens ?? 0);
+      const hasInput = hasFiniteNumber(u.input_tokens);
+      const hasOutput = hasFiniteNumber(u.output_tokens);
+      tokensIn = hasInput ? u.input_tokens : tokensIn;
+      tokensOut = (hasOutput ? u.output_tokens : 0) + (hasFiniteNumber(u.reasoning_output_tokens) ? u.reasoning_output_tokens : 0);
+      codexUsageComplete = hasInput && hasOutput;
       // codex emits NO cost field — derive from the price table.
       const p = codexPriceFor(opts.model ? normalizeModelForClaude(opts.model) : undefined);
       costUsd = (tokensIn * p.in + tokensOut * p.out) / 1_000_000;
@@ -2588,6 +2653,13 @@ export async function* runAgentChat(
       ...(cliTurn ? { turn: cliTurn } : {}),
     };
   } else {
+    if (
+      (backend === 'claude-code' && !claudeTerminalUsageSeen) ||
+      (backend === 'omp' && (!ompUsageSeen || !ompUsageComplete)) ||
+      (backend === 'codex' && (!codexUsageSeen || !codexUsageComplete))
+    ) {
+      unreportedFrames = Math.max(unreportedFrames, 1);
+    }
     yield {
       type: 'result',
       costUsd,
@@ -2597,6 +2669,7 @@ export async function* runAgentChat(
       ...(numTurns !== undefined ? { numTurns } : {}),
       ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
       ...(cacheCreationTokens !== undefined ? { cacheCreationTokens } : {}),
+      ...(unreportedFrames > 0 ? { unreportedFrames } : {}),
     };
   }
   } finally {
