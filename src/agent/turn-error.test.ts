@@ -130,6 +130,17 @@ test('classifySubprocessResult — prompt overflow in STDOUT on a FAILED exit �
   assert.equal(e.retryable, false);
   assert.equal(e.surfaceToUser, true);
 });
+test('classifySubprocessResult — autocompact-thrashing death in STDOUT → context_overflow, not agent_crash (EI-20314829458383612)', () => {
+  const e = classifySubprocessResult({
+    exitCode: 1,
+    stderr: '',
+    stdout:
+      'Autocompact is thrashing: the context refilled to the limit within 3 turns of the previous compact, 3 times in a row.',
+  }, 'anthropic');
+  assert.equal(e.class, 'context_overflow');
+  assert.equal(e.retryable, false);
+  assert.equal(e.surfaceToUser, true);
+});
 test('classifySubprocessResult — "rate limit" in STDOUT on a CLEAN exit is NOT misclassified (false-positive guard)', () => {
   // A successful bee whose OUTPUT merely discusses rate limits must stay a success, not rate_limited.
   const e = classifySubprocessResult({ exitCode: 0, stderr: '', stdout: 'I added rate limit handling to the governor. Done.' });

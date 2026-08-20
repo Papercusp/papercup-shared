@@ -192,7 +192,7 @@ const TIMEOUT_RE = /(\b408\b|timed? ?out|deadline exceeded)/i;
 // transient provider wall. Keep this ahead of the 429/usage scans because some
 // provider messages include a generic API-error prefix alongside the real cause.
 const CONTEXT_OVERFLOW_RE =
-  /prompt is too long|input (?:length )?is too long|\bcontext[_ -]?length[_ -]?exceeded\b|maximum context length|input length and `?max_tokens`? exceed|exceeds? the (?:model'?s )?maximum (?:context|(?:number of )?(?:input )?tokens)|reduce the length of (?:the )?(?:messages|prompt|input)/i;
+  /autocompact(?:ion)? is thrashing|prompt is too long|input (?:length )?is too long|\bcontext[_ -]?length[_ -]?exceeded\b|maximum context length|input length and `?max_tokens`? exceed|exceeds? the (?:model'?s )?maximum (?:context|(?:number of )?(?:input )?tokens)|reduce the length of (?:the )?(?:messages|prompt|input)/i;
 
 /**
  * Furthest-out instant a parsed usage reset may name before we treat it as a misread. Weekly
