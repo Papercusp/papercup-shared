@@ -656,6 +656,10 @@ export type ChatEvent =
           (@papercusp/model-pricing). Undefined when not reported. */
       cacheReadTokens?: number;
       cacheCreationTokens?: number;
+      /** Number of terminal usage frames whose cost/token measurement was incomplete.
+          The numeric totals remain backward-compatible, but this marker prevents a
+          missing usage field from being mistaken for a measured zero. */
+      unreportedFrames?: number;
     }
   | {
       type: 'error';
@@ -681,6 +685,8 @@ export interface ClaudeResultUsage {
   costUsd?: number;
   numTurns?: number;
   resultText?: string;
+  /** 1 when the terminal result omitted required cost or token usage evidence. */
+  unreportedFrames?: number;
 }
 
 /**
@@ -696,17 +702,21 @@ export interface ClaudeResultUsage {
 export function parseClaudeResultEvent(ev: any): ClaudeResultUsage {
   const out: ClaudeResultUsage = {};
   const usage = ev?.usage;
+  const hasInputTokens = typeof usage?.input_tokens === 'number' && Number.isFinite(usage.input_tokens);
+  const hasOutputTokens = typeof usage?.output_tokens === 'number' && Number.isFinite(usage.output_tokens);
+  const hasCost = typeof ev?.total_cost_usd === 'number' && Number.isFinite(ev.total_cost_usd);
   if (usage) {
-    if (typeof usage.input_tokens === 'number') out.tokensIn = usage.input_tokens;
-    if (typeof usage.output_tokens === 'number') out.tokensOut = usage.output_tokens;
+    if (hasInputTokens) out.tokensIn = usage.input_tokens;
+    if (hasOutputTokens) out.tokensOut = usage.output_tokens;
     if (typeof usage.cache_read_input_tokens === 'number')
       out.cacheReadTokens = usage.cache_read_input_tokens;
     if (typeof usage.cache_creation_input_tokens === 'number')
       out.cacheCreationTokens = usage.cache_creation_input_tokens;
   }
-  if (typeof ev?.total_cost_usd === 'number') out.costUsd = ev.total_cost_usd;
+  if (hasCost) out.costUsd = ev.total_cost_usd;
   if (typeof ev?.num_turns === 'number') out.numTurns = ev.num_turns;
   if (typeof ev?.result === 'string') out.resultText = ev.result;
+  if (!hasInputTokens || !hasOutputTokens || !hasCost) out.unreportedFrames = 1;
   return out;
 }
 
