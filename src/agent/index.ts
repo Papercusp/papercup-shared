@@ -18,6 +18,13 @@ export {
   resolveAnthropicBaseUrl,
   probeStatelessTransport,
   type StatelessTransportProbe,
+  // P-007 (own-tui-full-divorce-2026-08-24): the agent-loop ModelPort adapter
+  // reuses the stateless family's transport resolution, admission-tier headers
+  // and OAuth-framed system param instead of duplicating them.
+  resolveStatelessTransport,
+  type StatelessTransport,
+  priorityTierHeaders,
+  buildSystemParam,
   // EI-18685386548651513 / WI-5391 — the delegated-gateway transport choice (EI-12940): a
   // caller with no local Claude OAuth session (every in-process bg-host/Scout ideator call —
   // register-scout-action.ts's FB-16 wiring) egresses via the LOCAL inference gateway's account

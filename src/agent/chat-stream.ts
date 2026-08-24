@@ -811,7 +811,7 @@ export function invalidateClaudeTokenCache(): void {
   _claudeTokenCache = undefined;
 }
 
-interface StatelessTransport {
+export interface StatelessTransport {
   baseURL: string;
   token: string;
   headers: Record<string, string>;
@@ -994,7 +994,12 @@ export function chooseStatelessTransport(args: {
   return args.claudeTok ? 'anthropic-direct' : 'gateway-pool';
 }
 
-function resolveStatelessTransport(): StatelessTransport {
+/** Exported (P-007 own-tui-full-divorce-2026-08-24): the agent-loop's
+ *  gateway-native ModelPort adapter rides the EXACT transport resolution the
+ *  stateless family uses — same OAuth/delegation choice, same route-account
+ *  pin, same base-URL precedence — so the owned loop can never disagree with
+ *  the proven call path. */
+export function resolveStatelessTransport(): StatelessTransport {
   const claudeTok = readClaudeOauthToken();
   const choice = chooseStatelessTransport({ claudeTok });
   return choice === 'anthropic-direct'
