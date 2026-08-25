@@ -4,7 +4,7 @@
  */
 import { test, afterEach } from 'vitest';
 import assert from 'node:assert/strict';
-import { normalizeModelForClaude, headersToRecord, buildSystemParam, CLAUDE_CODE_IDENTIFIER, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, GATEWAY_PRIORITY_HEADER, retryLadderDeadlineExceeded, governorForStatelessTransport } from './chat-stream';
+import { normalizeModelForClaude, headersToRecord, buildSystemParam, CLAUDE_CODE_IDENTIFIER, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, routeAccountHeaders, GATEWAY_PRIORITY_HEADER, ROUTE_ACCOUNT_HEADER, retryLadderDeadlineExceeded, governorForStatelessTransport } from './chat-stream';
 
 // EI-20394554339706750: the local inference gateway is already the pooled admission authority.
 // The process-local provider singleton used to sit in front of it with maxConcurrent=3, so three
@@ -65,6 +65,12 @@ test('priorityTierHeaders — absent/blank label → no header (untiered call)',
   assert.deepEqual(priorityTierHeaders(undefined), {});
   assert.deepEqual(priorityTierHeaders(''), {});
   assert.deepEqual(priorityTierHeaders('   '), {});
+});
+
+test('routeAccountHeaders — a concrete account pins one request; blank keeps auto-routing', () => {
+  assert.deepEqual(routeAccountHeaders(' acct-7 '), { [ROUTE_ACCOUNT_HEADER]: 'acct-7' });
+  assert.deepEqual(routeAccountHeaders(undefined), {});
+  assert.deepEqual(routeAccountHeaders('   '), {});
 });
 
 // claudeSpawnEnvOverrides (voice-persona P-009): disableToolSearch →

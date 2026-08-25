@@ -24,6 +24,8 @@ export {
   resolveStatelessTransport,
   type StatelessTransport,
   priorityTierHeaders,
+  routeAccountHeaders,
+  ROUTE_ACCOUNT_HEADER,
   buildSystemParam,
   // EI-18685386548651513 / WI-5391 — the delegated-gateway transport choice (EI-12940): a
   // caller with no local Claude OAuth session (every in-process bg-host/Scout ideator call —
