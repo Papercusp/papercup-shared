@@ -884,6 +884,14 @@ export function resolveAnthropicBaseUrl(): string {
  *  bare const here because papercusp-shared must not import operator-core (dependency direction). */
 export const ROUTE_ACCOUNT_HEADER = 'x-papercusp-account';
 
+/** Per-request account routing for in-process model calls. A blank value is the
+ * gateway's auto-routing mode (no pin); a concrete id is an explicit hard
+ * route for this one request. */
+export function routeAccountHeaders(accountId: string | undefined): Record<string, string> {
+  const id = accountId?.trim();
+  return id ? { [ROUTE_ACCOUNT_HEADER]: id } : {};
+}
+
 /**
  * The pool account this IN-PROCESS anthropic-direct call should egress through, when the operator has
  * resolved one (account-aware-rate-governor-routing Phase 2). The operator sets `PAPERCUSP_ROUTE_ACCOUNT`
@@ -935,9 +943,9 @@ function anthropicDirectTransport(claudeTok: string): StatelessTransport {
  * (2026-07-16) while a 12-account pool sat idle behind a running gateway.
  * Keeps the route-account pin + tier headers at parity with the direct path.
  */
-function gatewayPoolTransport(): StatelessTransport {
+function gatewayPoolTransport(accountId?: string): StatelessTransport {
   const headers: Record<string, string> = { 'anthropic-beta': 'oauth-2025-04-20' };
-  const routeAccount = resolveRouteAccountId();
+  const routeAccount = accountId?.trim() || resolveRouteAccountId();
   if (routeAccount) headers[ROUTE_ACCOUNT_HEADER] = routeAccount;
   return {
     baseURL: resolveDelegatedGatewayUrl(),
@@ -999,7 +1007,10 @@ export function chooseStatelessTransport(args: {
  *  stateless family uses — same OAuth/delegation choice, same route-account
  *  pin, same base-URL precedence — so the owned loop can never disagree with
  *  the proven call path. */
-export function resolveStatelessTransport(): StatelessTransport {
+export function resolveStatelessTransport(accountId?: string): StatelessTransport {
+  // A concrete per-request account selection necessarily rides the local
+  // gateway: a direct Anthropic endpoint cannot interpret the routing header.
+  if (accountId?.trim()) return gatewayPoolTransport(accountId);
   const claudeTok = readClaudeOauthToken();
   const choice = chooseStatelessTransport({ claudeTok });
   return choice === 'anthropic-direct'
