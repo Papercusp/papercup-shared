@@ -1,6 +1,6 @@
 /**
  * Tests for the RateLimitGovernor pure decision-core (agent-turn-robustness P-002).
- * Run: npx vitest run libs/papercusp-shared/src/agent/governor.test.ts
+ * Run: npx vitest run libs/papercusp-shared/src/resilience/governor.test.ts
  */
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
