@@ -260,7 +260,7 @@ function formatMalformedAuthorizationDiagnostic(text: string): string {
   const chars = Array.from(value).length;
   return (
     `malformed Authorization header: value shape bytes=${bytes}, chars=${chars}, classes=${classes.join(',')}; ` +
-    `redacted head=${JSON.stringify(head)}, tail=${JSON.stringify(tail)}`
+    `redacted head=${JSON.stringify(head)}, redacted tail=${JSON.stringify(tail)}`
   );
 }
 

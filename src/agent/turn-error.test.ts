@@ -189,6 +189,33 @@ test('classifySubprocessResult — Codex authorization-header UTF-8 failure → 
   assert.equal(e.retryable, false);
   assert.equal(e.surfaceToUser, true);
 });
+test('classifySubprocessResult — malformed Authorization diagnostics preserve safe shape and suffix without the bearer', () => {
+  const bearer = 'Bearer abcDEF123456';
+  const malformedValue = `${bearer} fired — WI-40086${String.fromCharCode(7)}`;
+  const e = classifySubprocessResult({
+    exitCode: 1,
+    stderr:
+      `codex_api::endpoint::responses_websocket: failed to connect to websocket: UTF-8 encoding error: ` +
+      `failed to convert header to a str for header name 'authorization'\nwith value: "${malformedValue}"`,
+  }, 'openai');
+
+  assert.equal(e.class, 'auth');
+  assert.match(e.message, /malformed Authorization header: value shape bytes=\d+, chars=\d+, classes=whitespace,non-ASCII,control/);
+  assert.match(e.message, /redacted head=/);
+  assert.match(e.message, /redacted tail=/);
+  assert.match(e.message, /WI-40086/); // The post-token event suffix survives for root-cause tracing.
+  assert.equal(e.message.includes(bearer), false);
+  assert.equal(e.message.includes('abcDEF123456'), false);
+  assert.equal(/[\u0000-\u001f\u007f-\u009f]/.test(e.message), false);
+});
+test('classifySubprocessResult — ordinary auth diagnostics retain their existing bounded message', () => {
+  const stderr = '401 Unauthorized: Bearer ordinary-auth-marker';
+  const e = classifySubprocessResult({ exitCode: 1, stderr }, 'openai');
+
+  assert.equal(e.class, 'auth');
+  assert.equal(e.message, stderr.slice(0, 200));
+  assert.equal(e.message.includes('malformed Authorization header'), false);
+});
 test('classifySubprocessResult — nonzero exit, no known pattern → agent_crash', () => {
   const e = classifySubprocessResult({ exitCode: 2, stderr: 'TypeError: boom' });
   assert.equal(e.class, 'agent_crash');
