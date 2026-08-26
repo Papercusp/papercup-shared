@@ -185,6 +185,7 @@ const OVERLOAD_RE = /(\b529\b|overloaded|service unavailable|\b50[0234]\b)/i;
 // Codex can surface a malformed/undecodable authorization header as a Rust WebSocket
 // conversion error rather than an HTTP 401/403. Treat this exact signature as an auth
 // failure so the loop does not retry a credential that cannot be encoded.
+const MALFORMED_AUTH_HEADER_RE = /failed to convert header to a str for header name ['"]authorization['"]/i;
 const AUTH_RE = /(\b401\b|\b403\b|unauthorized|forbidden|invalid api key|authentication|failed to convert header to a str for header name ['"]authorization['"])/i;
 const IO_RE = /(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|network|fetch failed)/i;
 const TIMEOUT_RE = /(\b408\b|timed? ?out|deadline exceeded)/i;
@@ -193,6 +194,75 @@ const TIMEOUT_RE = /(\b408\b|timed? ?out|deadline exceeded)/i;
 // provider messages include a generic API-error prefix alongside the real cause.
 const CONTEXT_OVERFLOW_RE =
   /autocompact(?:ion)? is thrashing|prompt is too long|input (?:length )?is too long|\bcontext[_ -]?length[_ -]?exceeded\b|maximum context length|input length and `?max_tokens`? exceed|exceeds? the (?:model'?s )?maximum (?:context|(?:number of )?(?:input )?tokens)|reduce the length of (?:the )?(?:messages|prompt|input)/i;
+
+const AUTH_HEADER_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/;
+const MALFORMED_AUTH_SAMPLE_CHARS = 32;
+
+/** Extract only the value from Codex's malformed-header diagnostic. */
+function malformedAuthorizationValue(text: string): string | undefined {
+  const signature = MALFORMED_AUTH_HEADER_RE.exec(text);
+  if (!signature) return undefined;
+  const afterSignature = text.slice(signature.index + signature[0].length);
+  const marker = /\bwith value:\s*/i.exec(afterSignature);
+  if (!marker) return undefined;
+
+  const candidate = afterSignature.slice(marker.index + marker[0].length);
+  if (!candidate) return '';
+  const quote = candidate[0];
+  if (quote !== '"' && quote !== "'") return candidate.split(/\r?\n/, 1)[0].trimEnd();
+
+  // The CLI uses a quoted debug representation. Stop at the matching unescaped quote;
+  // if the provider cut the diagnostic before the close, keep only the first line.
+  let escaped = false;
+  for (let i = 1; i < candidate.length; i += 1) {
+    const char = candidate[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (char === quote) return candidate.slice(1, i);
+  }
+  return candidate.slice(1).split(/\r?\n/, 1)[0];
+}
+
+/** Preserve only the auth scheme and post-token context; never persist bearer characters. */
+function redactMalformedAuthorizationValue(value: string): string {
+  const scheme = /^(\s*(?:bearer|basic|token)\s+)(\S+)/i.exec(value);
+  if (!scheme) return '[redacted]';
+  const credentialStart = scheme.index + scheme[1].length;
+  const credentialEnd = credentialStart + scheme[2].length;
+  return `${value.slice(0, credentialStart)}[redacted]${value.slice(credentialEnd)}`;
+}
+
+/**
+ * Keep the malformed-auth signal useful without copying a credential into durable diagnostics.
+ * The shape is measured from the extracted header value; head/tail are taken only after the
+ * credential run has been replaced, so a well-formed bearer cannot leak through this path.
+ */
+function formatMalformedAuthorizationDiagnostic(text: string): string {
+  const value = malformedAuthorizationValue(text);
+  if (value === undefined) return 'malformed Authorization header: value unavailable (raw value redacted)';
+
+  const classes: string[] = [];
+  if (/\s/.test(value) || /\\x(?:09|0a|0d|20)/i.test(value)) classes.push('whitespace');
+  if (/[^\x00-\x7f]/.test(value) || /\\x(?:[89a-f][0-9a-f])/i.test(value)) classes.push('non-ASCII');
+  if (AUTH_HEADER_CONTROL_RE.test(value) || /\\x(?:0[0-9a-f]|1[0-9a-f]|7f|9[0-9a-f])/i.test(value)) classes.push('control');
+  if (classes.length === 0) classes.push('ASCII');
+
+  const redacted = redactMalformedAuthorizationValue(value);
+  const head = redacted.slice(0, MALFORMED_AUTH_SAMPLE_CHARS);
+  const tail = redacted.slice(-MALFORMED_AUTH_SAMPLE_CHARS);
+  const bytes = new TextEncoder().encode(value).byteLength;
+  const chars = Array.from(value).length;
+  return (
+    `malformed Authorization header: value shape bytes=${bytes}, chars=${chars}, classes=${classes.join(',')}; ` +
+    `redacted head=${JSON.stringify(head)}, tail=${JSON.stringify(tail)}`
+  );
+}
 
 /**
  * Furthest-out instant a parsed usage reset may name before we treat it as a misread. Weekly
@@ -434,6 +504,12 @@ export function classifySubprocessResult(
   const failed = !!input.signal || (input.exitCode !== 0 && input.exitCode !== null);
   const scan = failed ? `${stderr}\n${input.stdout ?? ''}` : stderr;
   const errText = stderr.trim() ? stderr : failed ? input.stdout ?? '' : '';
+  // This error embeds the Authorization value in the provider diagnostic. Handle it before
+  // every generic pattern and never apply the ordinary 200-character raw slice: that slice can
+  // cut off the only useful suffix, while a wider one could persist a live bearer credential.
+  if (MALFORMED_AUTH_HEADER_RE.test(scan)) {
+    return mk('auth', formatMalformedAuthorizationDiagnostic(scan), provider);
+  }
   // Prompt-size deaths are terminal until the launch configuration or prompt is
   // fixed. Detect them before provider-wall patterns so a descriptive 400/429
   // wrapper cannot turn a context failure into a retryable backoff class.
