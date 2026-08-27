@@ -312,6 +312,11 @@ export function normalizeModelForClaude(model: string): string {
  *  gateway (kept as a literal here so this shared lib stays free of the operator import). */
 export const GATEWAY_PRIORITY_HEADER = 'x-papercusp-priority';
 
+/** Stable owner identity carried on in-process requests so the inference gateway can
+ * attribute routing, stalls, and failures to the durable caller (the subprocess
+ * spawn path carries the same header through `ANTHROPIC_CUSTOM_HEADERS`). */
+export const GATEWAY_OWNER_HEADER = 'x-papercusp-owner';
+
 /**
  * The inference-gateway admission-tier headers for an in-process `anthropic-direct`
  * call. Returns `{ 'x-papercusp-priority': <role> }` when a non-blank priority/role
@@ -324,6 +329,14 @@ export const GATEWAY_PRIORITY_HEADER = 'x-papercusp-priority';
 export function priorityTierHeaders(priority: string | undefined): Record<string, string> {
   const label = priority?.trim();
   return label ? { [GATEWAY_PRIORITY_HEADER]: label } : {};
+}
+
+/** Build the owner header for an in-process gateway request. Blank identities are
+ * omitted so callers cannot accidentally turn an anonymous request into a shared
+ * empty owner bucket. */
+export function ownerHeaders(ownerId: string | undefined): Record<string, string> {
+  const owner = ownerId?.trim();
+  return owner ? { [GATEWAY_OWNER_HEADER]: owner } : {};
 }
 
 /** Escape a string for a double-quoted TOML basic value. */
@@ -632,6 +645,10 @@ export interface RunAgentChatOptions {
    * for an untiered call.
    */
   priority?: string;
+  /** Stable caller identity for inference-gateway owner attribution. For the
+   * in-process `anthropic-direct` backend this becomes `x-papercusp-owner`;
+   * subprocess callers carry the equivalent through their spawn environment. */
+  ownerId?: string;
 }
 
 export type ChatEvent =
@@ -1224,11 +1241,12 @@ async function* statelessAgentChat(
   // load — the root cause of the scout's 12-day ideation outage (it routed through
   // the gateway via gatewayLlmEnv but never identified itself as `scout`).
   const tierHeaders = priorityTierHeaders(opts.priority);
+  const callerHeaders = ownerHeaders(opts.ownerId);
   const mkClient = (t: StatelessTransport) =>
     new Anthropic({
       baseURL: t.baseURL,
       authToken: t.token,
-      defaultHeaders: { ...t.headers, ...tierHeaders },
+      defaultHeaders: { ...t.headers, ...tierHeaders, ...callerHeaders },
       maxRetries: 2,
     });
   let client = mkClient(transport);
