@@ -24,6 +24,8 @@ export {
   resolveStatelessTransport,
   type StatelessTransport,
   priorityTierHeaders,
+  ownerHeaders,
+  headersToRecord,
   routeAccountHeaders,
   ROUTE_ACCOUNT_HEADER,
   buildSystemParam,
