@@ -4,7 +4,7 @@
  */
 import { test, afterEach } from 'vitest';
 import assert from 'node:assert/strict';
-import { normalizeModelForClaude, headersToRecord, buildSystemParam, CLAUDE_CODE_IDENTIFIER, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, routeAccountHeaders, GATEWAY_PRIORITY_HEADER, ROUTE_ACCOUNT_HEADER, retryLadderDeadlineExceeded, governorForStatelessTransport } from './chat-stream';
+import { normalizeModelForClaude, headersToRecord, buildSystemParam, CLAUDE_CODE_IDENTIFIER, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, ownerHeaders, GATEWAY_PRIORITY_HEADER, GATEWAY_OWNER_HEADER, ROUTE_ACCOUNT_HEADER, retryLadderDeadlineExceeded, governorForStatelessTransport } from './chat-stream';
 
 // EI-20394554339706750: the local inference gateway is already the pooled admission authority.
 // The process-local provider singleton used to sit in front of it with maxConcurrent=3, so three
@@ -65,6 +65,13 @@ test('priorityTierHeaders — absent/blank label → no header (untiered call)',
   assert.deepEqual(priorityTierHeaders(undefined), {});
   assert.deepEqual(priorityTierHeaders(''), {});
   assert.deepEqual(priorityTierHeaders('   '), {});
+});
+
+test('ownerHeaders — a stable owner id becomes the x-papercusp-owner header', () => {
+  assert.deepEqual(ownerHeaders('bulk-dedup:run-1'), { [GATEWAY_OWNER_HEADER]: 'bulk-dedup:run-1' });
+  assert.deepEqual(ownerHeaders('  run-2  '), { 'x-papercusp-owner': 'run-2' });
+  assert.deepEqual(ownerHeaders(undefined), {});
+  assert.deepEqual(ownerHeaders('   '), {});
 });
 
 test('routeAccountHeaders — a concrete account pins one request; blank keeps auto-routing', () => {
