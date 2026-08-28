@@ -105,6 +105,9 @@ export {
   setGovernorStore,
   setGlobalConcurrencyCap,
   setGlobalConcurrencyFloor,
+  setGlobalConcurrencySeed,
+  setGlobalGateClock,
+  GLOBAL_CONSTRAINT_TTL_MS,
   setAimdTuning,
   getAimdTuning,
   setProviderFloorOverride,
@@ -127,6 +130,7 @@ export type {
   GovernorStore,
   GovernorLimits,
   GlobalConcurrencyGate,
+  GlobalFeedbackEvent,
 } from '../resilience/governor';
 export { LEGACY_RATE_LIMIT_BLOCKED_REASON } from '../resilience/governor';
 export {
