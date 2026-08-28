@@ -113,9 +113,53 @@ let aimdCleanStreak = 0;
 let aimdCleanTurnsPerStep = AIMD_CLEAN_TURNS_PER_STEP;
 let aimdDecreaseFactor = 0.5;
 
+// --- P-009: the global window is a PROBE, not a baked maximum ---------------------------------
+// spec capless-p009-provider-governor@1: "Provider and global rate observations contract only the
+// causally affected account/model lane and resume probing when the observed constraint expires."
+//
+// Two properties this block adds, each defeating one arm of that clause's falsifier:
+//  (1) CAUSAL SCOPE — an ACCOUNT-KEYED lane's provider 429 no longer contracts the fleet window.
+//      That lane is still governed by its own per-bucket state (rpmFactor + a bounded re-probe
+//      pause), which already recovers on its own clock; what is removed is the fleet-wide DOUBLE
+//      penalty that punished every healthy sibling for one account's budget.
+//  (2) EXPIRY — a contraction is an OBSERVATION with a shelf life, not a permanent verdict. Once
+//      it ages past the TTL the window resumes probing from where it had already proven it could
+//      run (`aimdPeak`), so a recovered lane can never stay pinned below its prior probe window
+//      just because the fleet went quiet and produced no clean turns to ramp it back.
+/** How long a global contraction stands before the window resumes probing. Env-tunable. */
+export const GLOBAL_CONSTRAINT_TTL_MS = Number(process.env.PAPERCUSP_GLOBAL_CONSTRAINT_TTL_MS) || 5 * 60_000;
+/** Bootstrap window when no explicit user cap is set — a SEED to start observing from, never a maximum. */
+let globalSeed: number | undefined;
+/** The largest effective window this gate has actually sustained — the "prior probe window" to resume to. */
+let aimdPeak = 0;
+/** Epoch ms of the most recent contraction (anchors TTL expiry). 0 = not contracted. */
+let aimdContractedAt = 0;
+/** Injectable clock so a test can advance the freshness clock (the clause's own probeMethod). */
+let gateNow: () => number = () => Date.now();
+
+/** Test/host hook: drive the gate's expiry clock. Pass undefined to restore `Date.now`. */
+export function setGlobalGateClock(fn: (() => number) | undefined): void {
+  gateNow = fn ?? (() => Date.now());
+}
+
+/**
+ * The effective global window at `now`, AFTER expiry.
+ *
+ * A contraction older than GLOBAL_CONSTRAINT_TTL_MS has expired: the observation that justified it
+ * is stale, so the window resumes probing at the peak it had previously sustained rather than
+ * remaining shrunk. Pure — callers read it, they do not mutate through it.
+ */
+function effectiveGlobalWindow(): number {
+  if (aimdEff === undefined) return Infinity;
+  if (aimdContractedAt > 0 && gateNow() - aimdContractedAt >= GLOBAL_CONSTRAINT_TTL_MS) {
+    return Math.min(globalCap, Math.max(aimdEff, aimdPeak));
+  }
+  return aimdEff;
+}
+
 const globalGate: GlobalConcurrencyGate = {
   tryAcquire(opts) {
-    const effectiveLimit = Math.min(globalCap, aimdEff ?? Infinity);
+    const effectiveLimit = Math.min(globalCap, effectiveGlobalWindow());
     // The gateway already treats tier 1 (interactive/queen/scout/overwatch) as a
     // reserved lane. Preserve that SAME contract before the request reaches the
     // gateway: when AIMD has shed the ordinary lane, tier 1 may use otherwise-idle
@@ -134,22 +178,47 @@ const globalGate: GlobalConcurrencyGate = {
   // exactly (tier 1 is measured against the hard cap, not the AIMD-shed effective limit) — read
   // via the same expression so the two can't drift into reporting a limit that was never applied.
   snapshot(opts) {
-    const effectiveLimit = Math.min(globalCap, aimdEff ?? Infinity);
+    const effectiveLimit = Math.min(globalCap, effectiveGlobalWindow());
     const limit = opts?.priorityTier === 1 ? globalCap : effectiveLimit;
     return { inFlight: globalInFlight, limit };
   },
-  noteClean() {
-    if (aimdEff === undefined) return; // AIMD inactive without a finite cap
+  noteClean(ev) {
+    // P-009 (1): recovery is scoped exactly like contraction. An account-keyed lane's clean turn is
+    // evidence about THAT account, so it must not ramp the fleet window either — otherwise the gate
+    // would drift, crediting siblings for a recovery it refused to be penalised for.
+    if (ev?.accountScoped) return;
+    if (aimdEff === undefined) return; // AIMD inactive: no seed and no cap installed
     aimdCleanStreak += 1;
     if (aimdCleanStreak >= aimdCleanTurnsPerStep) {
       aimdCleanStreak = 0;
-      if (aimdEff < globalCap) aimdEff += 1; // additive increase, never past the live cap
+      // P-009 (2): additive increase is bounded ONLY by an explicit user cap. Without one,
+      // `globalCap` is Infinity and the window PROBES UPWARD indefinitely instead of being pinned
+      // to whatever seed it happened to boot with — a seed bootstraps observation, it is not a
+      // ceiling. Reaching a new high clears the contraction anchor: the window has proven this
+      // level, so there is no stale constraint left to expire.
+      if (aimdEff < globalCap) {
+        aimdEff += 1;
+        if (aimdEff > aimdPeak) {
+          aimdPeak = aimdEff;
+          aimdContractedAt = 0;
+        }
+      }
     }
   },
-  notePenalty() {
+  notePenalty(ev) {
+    // P-009 (1): THE core fix. An account-keyed observation is one account's budget fact, never
+    // evidence about its siblings, so it must not contract the fleet-wide window. Before this, any
+    // single account's 429 halved the whole fleet — the clause's falsifier arm 1 ("a provider fault
+    // shrinks unrelated accounts"). That lane is NOT left ungoverned: penalize() already decreased
+    // its own rpmFactor and parked it with a bounded re-probe, both of which recover on their own
+    // clock. An account-BLIND lane (no '@'), or a local-saturation signal from the connection /
+    // loop-pressure governors, still legitimately contracts the fleet.
+    if (ev?.accountScoped) return;
     aimdCleanStreak = 0;
     if (aimdEff === undefined) return;
+    if (aimdEff > aimdPeak) aimdPeak = aimdEff; // remember the window we are contracting away from
     aimdEff = Math.max(globalFloor, Math.floor(aimdEff * aimdDecreaseFactor)); // multiplicative decrease to floor
+    aimdContractedAt = gateNow(); // start the shelf life (P-009 (2))
   },
 };
 
@@ -171,8 +240,32 @@ export function setGlobalConcurrencyCap(n: number | undefined): void {
     if (aimdEff < globalFloor) aimdEff = Math.min(globalFloor, globalCap);
   } else {
     globalCap = Infinity;
-    aimdEff = undefined;
+    // P-009: clearing the USER's cap must not disable adaptation. When a seed is installed the
+    // window keeps probing from it (uncapped); only with neither cap nor seed is AIMD inactive.
+    aimdEff = globalSeed;
     aimdCleanStreak = 0;
+  }
+  aimdPeak = Math.max(aimdPeak, aimdEff ?? 0);
+  aimdContractedAt = 0; // an explicit config write supersedes any standing observation
+}
+
+/**
+ * P-009: install the BOOTSTRAP window the global gate starts observing from when the user has set
+ * no explicit `maxSimultaneousAgents`.
+ *
+ * This is deliberately NOT `setGlobalConcurrencyCap`. A seed is where probing STARTS; a cap is a
+ * ceiling probing may never cross. The host derives the seed from its resource profile — a fact
+ * about the machine's starting point, not a licence to cap productive capacity — so with only a
+ * seed installed `globalCap` stays Infinity and `noteClean` probes upward past the seed. Passing
+ * `undefined` clears it (AIMD inactive again unless a cap is set).
+ */
+export function setGlobalConcurrencySeed(n: number | undefined): void {
+  globalSeed = typeof n === 'number' && n > 0 ? Math.floor(n) : undefined;
+  // Only ADOPT the seed as the live window when nothing has been learned yet: a window that has
+  // already adapted (or a user cap) outranks a boot-time guess.
+  if (aimdEff === undefined && globalSeed !== undefined && !Number.isFinite(globalCap)) {
+    aimdEff = globalSeed;
+    aimdPeak = Math.max(aimdPeak, globalSeed);
   }
 }
 
