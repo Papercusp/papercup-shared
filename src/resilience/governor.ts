@@ -560,6 +560,29 @@ export interface GovernorStore {
  * registry) so they share one counter. Domain-free: the governor knows only "ask before a slot,
  * give it back on release". Omit = no global cap (per-bucket behavior, byte-identical to before).
  */
+/**
+ * WHO observed a global-gate AIMD signal (capless-inference-gateway P-009).
+ *
+ * The gate's contraction used to be causally blind: any bucket's provider 429 halved the ONE
+ * fleet-wide window, so a single exhausted account shrank every healthy sibling's admission.
+ * With a multi-account pool that is not just unfair, it is UNSOUND — one account's 429 is
+ * evidence about THAT account's budget, not about the pool's. This event carries the lane so a
+ * gate can tell the two apart.
+ */
+export interface GlobalFeedbackEvent {
+  /** Bucket key that observed it: `provider:modelClass` (pool-wide) or `provider:modelClass@accountId`. */
+  lane?: string;
+  /**
+   * True when `lane` is ACCOUNT-KEYED — the observation belongs to one account's budget and must
+   * NOT contract the fleet-wide window. That lane is already governed, and already recovers, by
+   * its own per-bucket state (`rpmFactor` + `effectiveRpmFactor`'s linear recovery, and the
+   * bounded re-probe pause) — so scoping here removes a DOUBLE penalty, it does not remove
+   * governance. False/omitted = an account-blind or genuinely local-saturation signal, which
+   * legitimately contracts the whole fleet (event-loop / connection pressure).
+   */
+  accountScoped?: boolean;
+}
+
 export interface GlobalConcurrencyGate {
   /**
    * Atomically take a global slot iff the caller's admission band has headroom.
@@ -574,9 +597,15 @@ export interface GlobalConcurrencyGate {
    * whose turn saw no account-wide penalty (additive increase: +1 per N clean turns);
    * `notePenalty` on every account-wide penalize (multiplicative decrease: halve toward the
    * floor). Optional so a bare cap-only gate (tests, simple hosts) stays valid.
+   *
+   * CAUSAL SCOPE (capless-inference-gateway P-009, spec capless-p009-provider-governor@1):
+   * the event carries WHICH lane observed the signal. A gate must contract only the causally
+   * affected lane — an ACCOUNT-KEYED observation is one account's fact, never evidence about
+   * its siblings, so it must not shrink the fleet-wide window. Omitting the argument keeps the
+   * legacy account-blind meaning (a pool-wide signal), so existing gates stay byte-compatible.
    */
-  noteClean?(): void;
-  notePenalty?(): void;
+  noteClean?(ev?: GlobalFeedbackEvent): void;
+  notePenalty?(ev?: GlobalFeedbackEvent): void;
   /**
    * The gate's live occupancy vs its effective limit for the caller's band — read ONLY to give a
    * fleet-gate denial real numbers instead of a constant (WI-38062). Best-effort and side-effect
@@ -732,7 +761,14 @@ export class RateLimitGovernor {
         released = true;
         recordRelease(this.state);
         // AIMD feedback (D-005): a turn with no account-wide penalty in between is CLEAN.
-        if (this.penaltySeq === seqAtAcquire) this.globalGate?.noteClean?.();
+        // P-009: the clean signal carries the same lane identity as the penalty, so a gate that
+        // scopes contraction can scope recovery the same way and cannot drift between the two.
+        if (this.penaltySeq === seqAtAcquire) {
+          this.globalGate?.noteClean?.({
+            lane: this.storeKey,
+            accountScoped: this.storeKey?.includes('@') ?? false,
+          });
+        }
         this.globalGate?.release(); // give the fleet-wide slot back too (D-004)
       };
     };
@@ -927,7 +963,15 @@ export class RateLimitGovernor {
     // so it must not shrink the WHOLE fleet's concurrency (which would punish every healthy account for
     // one bad Rayobyte proxy). The pause is still set on this account's state (recordPenalty above) so
     // the gateway's pin-yield routes around the proxy; it just isn't a fleet-wide rate signal.
-    if (!opts.transport && this.state.pausedUntil > before) this.globalGate?.notePenalty?.();
+    // CAUSAL SCOPE (P-009, spec capless-p009-provider-governor@1): the lane identity rides along so the
+    // gate can refuse to contract the FLEET on one account's observation. `accountKeyed` is the same
+    // storeKey('@') test used for the re-probe tier above — an account-keyed bucket is ONE account's
+    // budget, so its 429 is not evidence about its siblings. That lane still contracts: `rpmFactor` was
+    // already multiplicatively decreased above and `recordPenalty` already parked it, both of which
+    // recover on their own clock. Only the fleet-wide DOUBLE penalty is dropped.
+    if (!opts.transport && this.state.pausedUntil > before) {
+      this.globalGate?.notePenalty?.({ lane: this.storeKey, accountScoped: accountKeyed });
+    }
     this.notifyPauseIfExtended(before, opts.transport ? 'transport' : 'penalty');
     // A 429 anywhere pauses the WHOLE account → push to the shared row so every process backs off.
     // The cross-process write must ALSO replay the rpmFactor multiplicative-decrease onto the SHARED row (C1,
