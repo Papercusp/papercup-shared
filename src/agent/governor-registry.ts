@@ -324,8 +324,29 @@ export function globalConcurrencySnapshot(): { cap: number; inFlight: number } {
 
 /** The AIMD view (D-005): the adapted effective concurrency under the cap (null = AIMD inactive,
     i.e. no finite cap installed), the floor it never drops below, and the current clean streak. */
-export function effectiveConcurrencySnapshot(): { effective: number | null; floor: number; cleanStreak: number } {
-  return { effective: aimdEff ?? null, floor: globalFloor, cleanStreak: aimdCleanStreak };
+export function effectiveConcurrencySnapshot(): {
+  effective: number | null;
+  floor: number;
+  cleanStreak: number;
+  /** P-009: the window AFTER expiry — what admission actually enforces right now. */
+  effectiveAfterExpiry: number | null;
+  /** P-009: the highest window this gate has sustained (the "prior probe window" it resumes to). */
+  peak: number;
+  /** P-009: epoch ms of the standing contraction, or null when none is in force. */
+  contractedAt: number | null;
+  /** P-009: true once the standing contraction has aged past its TTL (probing has resumed). */
+  constraintExpired: boolean;
+} {
+  const after = effectiveGlobalWindow();
+  return {
+    effective: aimdEff ?? null,
+    floor: globalFloor,
+    cleanStreak: aimdCleanStreak,
+    effectiveAfterExpiry: Number.isFinite(after) ? after : null,
+    peak: aimdPeak,
+    contractedAt: aimdContractedAt || null,
+    constraintExpired: aimdContractedAt > 0 && gateNow() - aimdContractedAt >= GLOBAL_CONSTRAINT_TTL_MS,
+  };
 }
 
 /** P5-2 (operator-scalability-event-loop-2026-06-16): apply an EXTERNAL backpressure
@@ -497,4 +518,9 @@ export function resetGovernorRegistry(): void {
   for (const k of Object.keys(providerFloorOverrides)) delete providerFloorOverrides[k as TurnProvider];
   aimdCleanTurnsPerStep = AIMD_CLEAN_TURNS_PER_STEP;
   aimdDecreaseFactor = 0.5;
+  // P-009: drop the probe/expiry state + restore the real clock so a test starts unobserved.
+  globalSeed = undefined;
+  aimdPeak = 0;
+  aimdContractedAt = 0;
+  gateNow = () => Date.now();
 }
