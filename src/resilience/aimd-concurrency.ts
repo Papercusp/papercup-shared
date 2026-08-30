@@ -56,13 +56,31 @@ export interface AimdSnapshot {
    *  (sub-threshold) throttle neither advances nor resets it — only a real decrease resets it — so a
    *  steady churn of transient 429s among successes cannot stall recovery (2026-06-21). */
   cleanStreak: number;
-  /** Lifetime count of multiplicative decreases (a wedge/storm signal for the dashboard). */
+  /** Count of multiplicative decreases SINCE `countersSinceMs` (a wedge/storm signal for the dashboard).
+   *
+   *  ⚠ SCOPE IS PRODUCER-DEPENDENT — read `countersSinceMs` before comparing two readings or concluding
+   *  anything from a 0. This field used to be documented as a "lifetime" count, which was true of
+   *  `AimdConcurrencyController.snapshot()` (its counters live as long as the instance) and FALSE of the
+   *  gateway's per-lane view, which is rebuilt on every gateway process restart. A reader who trusted the
+   *  word "lifetime" here read `decreases: 0` as "this lane has never contracted" when it actually meant
+   *  "not since this process started". That misreading is recorded twice: see the header of
+   *  `packages/operator-core/lib/inference-gateway/admission-ceiling.ts`, and EI-21842988251907640. */
   decreases: number;
-  /** Lifetime count of additive increases. */
+  /** Count of additive increases SINCE `countersSinceMs`. Same producer-dependent scope as `decreases`. */
   increases: number;
-  /** Lifetime count of `recordHardFailure()` calls (EI-7168) — the subset of `decreases` caused by an
-   *  admitted-then-died request rather than at-the-door throttle pressure crossing the threshold. */
+  /** Count of `recordHardFailure()` calls SINCE `countersSinceMs` (EI-7168) — the subset of `decreases`
+   *  caused by an admitted-then-died request rather than at-the-door throttle pressure crossing the
+   *  threshold. Same producer-dependent scope as `decreases`. */
   hardFailures: number;
+  /** EPOCH for `decreases` / `increases` / `hardFailures`: epoch-ms when those counters were last reset to
+   *  zero (controller construction, or lane registration for the gateway's per-lane view).
+   *
+   *  Optional ONLY for deploy-skew — a producer built before EI-21842988251907640 omits it. Absent means
+   *  UNKNOWN scope, never "lifetime": a consumer that cannot read an epoch must not difference two samples
+   *  or treat a 0 as history. It is deliberately not required, because making it required on this shared
+   *  interface would strand consumers outside `packages/operator-core` (which `lint:tsc` does not cover) —
+   *  fixing an observability trap by stranding callers would be the worse bug. */
+  countersSinceMs?: number;
 }
 
 export class AimdConcurrencyController {
@@ -78,6 +96,10 @@ export class AimdConcurrencyController {
   private decreases = 0;
   private increases = 0;
   private hardFailures = 0;
+  /** Epoch for the three counters above. For THIS producer they are never reset after construction, so
+   *  the epoch is construction time; publishing it lets a reader tell that apart from a producer whose
+   *  counters restart (the gateway's per-lane view) without having to know which producer it holds. */
+  private readonly countersSinceMs = Date.now();
 
   constructor(opts: AimdConcurrencyOptions) {
     this.cap = Math.max(1, Math.floor(opts.cap));
@@ -165,6 +187,7 @@ export class AimdConcurrencyController {
       decreases: this.decreases,
       increases: this.increases,
       hardFailures: this.hardFailures,
+      countersSinceMs: this.countersSinceMs,
     };
   }
 }
