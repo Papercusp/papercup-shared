@@ -660,6 +660,9 @@ export type ChatEvent =
       tokensIn: number;
       tokensOut: number;
       finalText: string;
+      /** Provider terminal reason when reported (for example Anthropic's
+          `end_turn` or `max_tokens`). Undefined on backends that do not expose it. */
+      stopReason?: string | null;
       /** Agent-loop turn count, when the backend reports it (claude-code's
           terminal `result.num_turns`). Undefined for backends that don't
           surface it (anthropic-direct/omp/codex). Lets a consumer record the
@@ -1347,6 +1350,7 @@ async function* statelessAgentChat(
         tokensIn: inputTokens,
         tokensOut: outputTokens,
         finalText,
+        stopReason: resp.stop_reason,
         ...(unreportedFrames !== undefined ? { unreportedFrames } : {}),
       };
       return;
@@ -1555,6 +1559,7 @@ async function* governedStatelessChat(
     tokensIn: number;
     tokensOut: number;
     costUsd: number;
+    stopReason?: string | null;
     unreportedFrames?: number;
   };
   const result = await runAgentTurn<V>(
@@ -1603,6 +1608,7 @@ async function* governedStatelessChat(
       tokensIn: result.value.tokensIn,
       tokensOut: result.value.tokensOut,
       finalText: result.value.finalText,
+      ...(result.value.stopReason !== undefined ? { stopReason: result.value.stopReason } : {}),
       ...(result.value.unreportedFrames !== undefined
         ? { unreportedFrames: result.value.unreportedFrames }
         : {}),
@@ -1676,6 +1682,7 @@ async function* governedStatelessChat(
               tokensIn,
               tokensOut,
               costUsd,
+              stopReason: resp.stop_reason,
               ...(unreportedFrames !== undefined ? { unreportedFrames } : {}),
             },
             ...(headers ? { headers } : {}),
