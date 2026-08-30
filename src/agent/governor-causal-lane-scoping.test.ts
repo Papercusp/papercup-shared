@@ -18,6 +18,7 @@
 import { test, beforeEach } from 'vitest';
 import assert from 'node:assert/strict';
 import {
+  createGlobalConcurrencyGate,
   getGovernor,
   resetGovernorRegistry,
   setGlobalConcurrencyCap,
@@ -48,43 +49,45 @@ function aimdDeps() {
 }
 
 test('FALSIFIER arm 1 — one account\'s 429 does NOT contract the fleet window (and a blind lane still does)', () => {
-  setGlobalConcurrencyCap(8);
-  setGlobalConcurrencyFloor(1);
-  assert.equal(effectiveConcurrencySnapshot().effective, 8);
+  const gate = createGlobalConcurrencyGate();
+  gate.setCap(8);
+  gate.setFloor(1);
+  assert.equal(gate.effectiveSnapshot().effective, 8);
 
   // An ACCOUNT-KEYED lane (store key carries '@account'): its 429 is one account's budget fact.
-  const scoped = getGovernor('anthropic', 'opus', aimdDeps(), 'account-a');
+  const scoped = getGovernor('anthropic', 'opus', { ...aimdDeps(), globalGate: gate }, 'account-a');
   scoped.penalize({ retryAfterMs: 1_000, rateLimited: true });
   assert.equal(
-    effectiveConcurrencySnapshot().effective,
+    gate.effectiveSnapshot().effective,
     8,
     'arm 1: an account-scoped provider fault contracted the fleet-wide window',
   );
 
   // CALIBRATION: the same penalty from an account-BLIND lane must still contract, which proves the
   // assertion above measured a real, delivered penalty rather than an inert instrument.
-  const blind = getGovernor('anthropic', 'sonnet', aimdDeps());
+  const blind = getGovernor('anthropic', 'sonnet', { ...aimdDeps(), globalGate: gate });
   blind.penalize({ retryAfterMs: 1_000 });
   assert.equal(
-    effectiveConcurrencySnapshot().effective,
+    gate.effectiveSnapshot().effective,
     4,
     'calibration: an account-blind penalty no longer contracts, so arm 1 above proved nothing',
   );
 });
 
 test('arm 1 (recovery half) — an account-keyed lane\'s clean turns do NOT ramp the fleet window', async () => {
-  setGlobalConcurrencyCap(8);
-  setGlobalConcurrencyFloor(1);
-  const blind = getGovernor('anthropic', 'sonnet', aimdDeps());
+  const gate = createGlobalConcurrencyGate();
+  gate.setCap(8);
+  gate.setFloor(1);
+  const blind = getGovernor('anthropic', 'sonnet', { ...aimdDeps(), globalGate: gate });
   blind.penalize({ retryAfterMs: 1_000 }); // 8 → 4, so there is headroom to ramp back into
-  assert.equal(effectiveConcurrencySnapshot().effective, 4);
+  assert.equal(gate.effectiveSnapshot().effective, 4);
 
   // Recovery is scoped exactly like contraction: a lane that was refused the right to shrink the
   // fleet must not be allowed to grow it either, or the gate drifts upward on one account's health.
-  const scoped = getGovernor('anthropic', 'opus', aimdDeps(), 'account-a');
+  const scoped = getGovernor('anthropic', 'opus', { ...aimdDeps(), globalGate: gate }, 'account-a');
   for (let i = 0; i < AIMD_CLEAN_TURNS_PER_STEP * 2; i++) (await scoped.acquire({}))!();
   assert.equal(
-    effectiveConcurrencySnapshot().effective,
+    gate.effectiveSnapshot().effective,
     4,
     'an account-scoped recovery ramped the fleet-wide window',
   );
@@ -92,10 +95,24 @@ test('arm 1 (recovery half) — an account-keyed lane\'s clean turns do NOT ramp
   // CALIBRATION: the blind lane's clean turns DO ramp it, so the assertion above is not vacuous.
   for (let i = 0; i < AIMD_CLEAN_TURNS_PER_STEP; i++) (await blind.acquire({}))!();
   assert.equal(
-    effectiveConcurrencySnapshot().effective,
+    gate.effectiveSnapshot().effective,
     5,
     'calibration: an account-blind clean streak no longer ramps the window',
   );
+});
+
+test('fresh global gates do not share AIMD state', () => {
+  const first = createGlobalConcurrencyGate();
+  const second = createGlobalConcurrencyGate();
+  first.setCap(8);
+  second.setCap(8);
+
+  first.notePenalty();
+
+  assert.equal(first.effectiveSnapshot().effective, 4);
+  assert.equal(second.effectiveSnapshot().effective, 8);
+  assert.equal(first.globalSnapshot().inFlight, 0);
+  assert.equal(second.globalSnapshot().inFlight, 0);
 });
 
 test('FALSIFIER arm 2 — an expired constraint resumes probing at the prior peak, not the contracted floor', () => {
