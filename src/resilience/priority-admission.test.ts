@@ -254,6 +254,41 @@ test('H11 (2026-06-23): setMaxConcurrent RESCALES the tier-1 reserve proportiona
   assert.equal(q.snapshot().tier1Reserve, 4, 'recovery: reserve scales back to 4');
 });
 
+test('EI-21833234632961797: the CONFIGURED reserve fraction survives growth — a small construction pool no longer locks in an inflated share', () => {
+  // The gateway constructs both lanes at INITIAL_PROVIDER_ADMISSION_WINDOW = 8, and defaultTierCaps
+  // rounds the absolute reserve UP: ceil(8 * 0.15) = 2. Deriving the fraction from that absolute
+  // gives 2/8 = 0.25, which setMaxConcurrent then applies to every later cap for the life of the
+  // process — measured live at 126/503 (Claude) and 58/231 (Codex) on 2026-08-30, holding ~51
+  // slots idle while tier 2 queued. Passing the configured fraction is what fixes it.
+  const { caps, reserve } = defaultTierCaps(8, [1, 2, 3, 4, 5], 0.15);
+  assert.equal(reserve, 2, 'the ceil() rounding that starts the problem is real, not hypothetical');
+
+  const fixed = new PriorityAdmissionQueue({
+    maxConcurrent: 8,
+    tiers: { caps, tier1Reserve: reserve, reserveFrac: 0.15 },
+  });
+  fixed.setMaxConcurrent(503);
+  assert.equal(fixed.snapshot().tier1Reserve, 75, 'grown pool holds the CONFIGURED 15% (round(503 × 0.15))');
+
+  // CONTROL: the same queue WITHOUT the configured fraction reproduces the live defect exactly.
+  // Without this the test above would pass just as happily against a queue that ignores the field.
+  const legacy = new PriorityAdmissionQueue({
+    maxConcurrent: 8,
+    tiers: { caps, tier1Reserve: reserve },
+  });
+  legacy.setMaxConcurrent(503);
+  assert.equal(legacy.snapshot().tier1Reserve, 126, 'derived-fraction fallback still reproduces the observed 25%');
+
+  // The fallback is retained deliberately for callers that only ever supply an absolute reserve,
+  // and it is CORRECT whenever the construction pool is large enough that ceil() does not distort.
+  const large = new PriorityAdmissionQueue({
+    maxConcurrent: 283,
+    tiers: { caps: { 1: 283, 2: 240 }, tier1Reserve: 43 },
+  });
+  large.setMaxConcurrent(503);
+  assert.equal(large.snapshot().tier1Reserve, 76, 'derived fraction from a large pool lands within 1 of the intended 75');
+});
+
 test('defaultTierCaps — tier 1 gets the whole pool; implementation tiers share; benchmark/default bands are bounded', () => {
   const { caps, reserve } = defaultTierCaps(20, [1, 2, 3, 4, 5], 0.15);
   assert.equal(reserve, 3, 'ceil(20*0.15)=3');
