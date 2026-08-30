@@ -48,6 +48,16 @@ export interface TierAdmissionConfig {
    *  a saturated batch backlog. Clamped to [0, maxConcurrent-1] so at least one slot is always shared.
    *  Default 0 (no reservation). */
   tier1Reserve?: number;
+  /** The CONFIGURED reserve fraction that `tier1Reserve` was sized from (for example 0.15).
+   *
+   *  Supply it whenever the reserve came from a fraction, because `setMaxConcurrent` rescales the
+   *  reserve as the live cap moves and needs to know the INTENDED share. Without it the queue can
+   *  only infer the fraction as `tier1Reserve / maxConcurrent` at construction — which is wrong
+   *  whenever the construction pool is small, since `defaultTierCaps` rounds the absolute reserve
+   *  UP: at the gateway's seed window of 8, `ceil(8 * 0.15) = 2` and the inferred fraction is
+   *  0.25, then locked in for the process's life (EI-21833234632961797 — measured live at 126/503
+   *  and 58/231 on the two lanes, holding ~51 slots idle while tier 2 queued). */
+  reserveFrac?: number;
 }
 
 export interface PriorityAdmissionOptions {
@@ -94,8 +104,15 @@ interface Waiter<T> {
 /** Per-tier admission breakdown (priority-tiers /stats). */
 export interface TierSnapshot {
   tier: number;
-  /** Configured per-tier in-flight cap, or null when uncapped. */
-  cap: number | null;
+  /** This tier's GUARANTEED MINIMUM SHARE of in-flight slots, or null when it has none.
+   *
+   *  NOT a ceiling, and deliberately no longer NAMED one: since WI-4541 a tier at its share
+   *  BORROWS an otherwise-idle slot whenever no more-important tier is waiting, so live
+   *  `inFlight` routinely sits far above it (measured 2026-08-30: tier 2 at 377 in flight
+   *  against a share of 6, nothing refused). While this field was called `cap`, that gap read
+   *  as a broken ceiling rather than working cap-borrowing — it cost a P-014 reviewer a
+   *  false-defect investigation, which is why the readback now says what the number is. */
+  minShare: number | null;
   /** Tasks of this tier running right now. */
   inFlight: number;
   /** Tasks of this tier waiting in the queue. */
@@ -146,7 +163,17 @@ export class PriorityAdmissionQueue {
         if (Number.isFinite(tier) && Number.isFinite(v)) this.tierCaps.set(tier, Math.max(1, Math.floor(v)));
       }
       this.tier1Reserve = this.clampReserve(opts.tiers.tier1Reserve ?? 0);
-      this.reserveFrac = this.maxConcurrent > 0 ? (opts.tiers.tier1Reserve ?? 0) / this.maxConcurrent : 0;
+      // Prefer the CONFIGURED fraction over re-deriving it from the absolute reserve. Deriving it
+      // (the fallback, for callers that only ever supply an absolute) reads `ceil()` rounding as
+      // intent: at the gateway's construction window of 8, ceil(8 * 0.15) = 2 makes the inferred
+      // fraction 0.25, and setMaxConcurrent then holds 25% of every later cap for tier 1 forever.
+      const configuredFrac = opts.tiers.reserveFrac;
+      this.reserveFrac =
+        typeof configuredFrac === 'number' && Number.isFinite(configuredFrac) && configuredFrac >= 0
+          ? configuredFrac
+          : this.maxConcurrent > 0
+            ? (opts.tiers.tier1Reserve ?? 0) / this.maxConcurrent
+            : 0;
     } else {
       this.tierCaps = null;
     }
@@ -345,14 +372,14 @@ export class PriorityAdmissionQueue {
     if (!this.tiered) return base; // flag-OFF: byte-identical to the legacy snapshot
     const queuedByTier = new Map<number, number>();
     for (const w of this.waiters) queuedByTier.set(w.tier, (queuedByTier.get(w.tier) ?? 0) + 1);
-    // Union of every tier that has a cap, an in-flight task, or a waiter — so /stats shows a known
-    // tier even at zero load.
+    // Union of every tier that has a share, an in-flight task, or a waiter — so /stats shows a
+    // known tier even at zero load.
     const tiers = new Set<number>([...this.tierCaps!.keys(), ...this.inFlightByTier.keys(), ...queuedByTier.keys()]);
     base.byTier = [...tiers]
       .sort((a, b) => a - b)
       .map((tier) => ({
         tier,
-        cap: this.tierCaps!.get(tier) ?? null,
+        minShare: this.tierCaps!.get(tier) ?? null,
         inFlight: this.inFlightByTier.get(tier) ?? 0,
         queued: queuedByTier.get(tier) ?? 0,
       }));

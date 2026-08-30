@@ -424,8 +424,11 @@ test('snapshot byTier — {cap, inFlight, queued} per tier + tier1Reserve', asyn
   assert.equal(s.tier1Reserve, 1);
   const t1 = s.byTier!.find((t) => t.tier === 1)!;
   const t3 = s.byTier!.find((t) => t.tier === 3)!;
-  assert.deepEqual({ cap: t1.cap, inFlight: t1.inFlight }, { cap: 2, inFlight: 1 });
-  assert.deepEqual({ cap: t3.cap, inFlight: t3.inFlight, queued: t3.queued }, { cap: 1, inFlight: 1, queued: 1 });
+  assert.deepEqual({ minShare: t1.minShare, inFlight: t1.inFlight }, { minShare: 2, inFlight: 1 });
+  assert.deepEqual(
+    { minShare: t3.minShare, inFlight: t3.inFlight, queued: t3.queued },
+    { minShare: 1, inFlight: 1, queued: 1 },
+  );
   releases.forEach((r) => r());
 });
 
@@ -446,7 +449,11 @@ test('setTierCap raises the yield-free guaranteed share (tier-aware un-shed)', a
   const snap = q.snapshot();
   assert.equal(snap.byTier!.find((t) => t.tier === 3)!.inFlight, 2, 'tier 3 borrowed above its cap of 1');
   q.setTierCap(3, 2); // raise the guaranteed share to match what it is actually holding
-  assert.equal(q.snapshot().byTier!.find((t) => t.tier === 3)!.cap, 2, 'raised cap is live in the snapshot');
+  assert.equal(
+    q.snapshot().byTier!.find((t) => t.tier === 3)!.minShare,
+    2,
+    'raised share is live in the snapshot',
+  );
   releases.forEach((r) => r());
 });
 
