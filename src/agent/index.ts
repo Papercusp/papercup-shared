@@ -107,6 +107,7 @@ export {
   setGlobalConcurrencyFloor,
   setGlobalConcurrencySeed,
   setGlobalGateClock,
+  createGlobalConcurrencyGate,
   GLOBAL_CONSTRAINT_TTL_MS,
   setAimdTuning,
   getAimdTuning,
@@ -121,6 +122,10 @@ export {
   type LimitModel,
   type GovernorSnapshot,
   type GovernorPauseListener,
+  type GlobalConcurrencyGateController,
+  type GlobalConcurrencyGateOptions,
+  type GlobalConcurrencySnapshot,
+  type EffectiveConcurrencySnapshot,
 } from './governor-registry';
 export type {
   AdmissionDenial,
