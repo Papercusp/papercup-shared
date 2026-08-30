@@ -88,165 +88,261 @@ const registry = new Map<string, RateLimitGovernor>();
 // --- Fleet-wide concurrency cap (rate-limit-layer-v2 D-004) ------------------------------------
 // A single shared counter + cap that EVERY governor consults on top of its own per-bucket
 // maxConcurrent, so the TOTAL concurrent agents across all (provider,modelClass) buckets is
-// bounded by the user's live `maxSimultaneousAgents`. The host (operator-core) pushes the live
-// value via setGlobalConcurrencyCap() — read by the governor IMMEDIATELY (next acquire), no
-// restart. Default Infinity = unbounded (legacy behavior; tests that don't set a cap are
-// byte-identical). The gate object is shared by reference into every governor the registry makes.
-let globalCap = Infinity;
-let globalInFlight = 0;
-
+// bounded by the user's live `maxSimultaneousAgents`. The production registry uses one default
+// gate, while tests and embedders can create independent instances.
+//
 // --- AIMD adaptive concurrency (rate-limit-layer-v2 D-005) -------------------------------------
-// The user's cap is the HARD ceiling; the gate runs an EFFECTIVE concurrency `eff ≤ cap` that
+// The user's cap is the HARD ceiling; each gate runs an EFFECTIVE concurrency `eff ≤ cap` that
 // additively increases (+1 per N consecutive clean turns) and multiplicatively decreases (halve
-// toward the floor) on an account-wide penalty — so the fleet self-throttles to the safe level
-// under the user's max instead of slamming the cap into a 429 wall. Inactive (eff undefined,
-// legacy-identical) until a finite cap is installed; headers govern RATE, this governs CONCURRENCY.
+// toward the floor) on an account-wide penalty. Inactive (eff undefined, legacy-identical) until
+// a finite cap or seed is installed; headers govern RATE, this governs CONCURRENCY.
 export const AIMD_CLEAN_TURNS_PER_STEP = 5;
-let globalFloor = 1;
-let aimdEff: number | undefined;
-let aimdCleanStreak = 0;
-// P-021 (live-configurability-audit): the AIMD response-curve is host-tunable at runtime
-// (operator:rate_limit_config → setAimdTuning). The exported const above stays the DEFAULT/cold value
-// (back-compat + tests); the gate reads these mutable vars. `cleanTurnsPerStep` = additive-increase
-// cadence (+1 eff per N clean turns); `decreaseFactor` ∈ (0,1) = the multiplicative decrease on a
-// penalty (0.5 = halve toward the floor). Defaults reproduce the prior baked behaviour exactly.
-let aimdCleanTurnsPerStep = AIMD_CLEAN_TURNS_PER_STEP;
-let aimdDecreaseFactor = 0.5;
 
 // --- P-009: the global window is a PROBE, not a baked maximum ---------------------------------
 // spec capless-p009-provider-governor@1: "Provider and global rate observations contract only the
 // causally affected account/model lane and resume probing when the observed constraint expires."
-//
-// Two properties this block adds, each defeating one arm of that clause's falsifier:
-//  (1) CAUSAL SCOPE — an ACCOUNT-KEYED lane's provider 429 no longer contracts the fleet window.
-//      That lane is still governed by its own per-bucket state (rpmFactor + a bounded re-probe
-//      pause), which already recovers on its own clock; what is removed is the fleet-wide DOUBLE
-//      penalty that punished every healthy sibling for one account's budget.
-//  (2) EXPIRY — a contraction is an OBSERVATION with a shelf life, not a permanent verdict. Once
-//      it ages past the TTL the window resumes probing from where it had already proven it could
-//      run (`aimdPeak`), so a recovered lane can never stay pinned below its prior probe window
-//      just because the fleet went quiet and produced no clean turns to ramp it back.
 /** How long a global contraction stands before the window resumes probing. Env-tunable. */
 export const GLOBAL_CONSTRAINT_TTL_MS = Number(process.env.PAPERCUSP_GLOBAL_CONSTRAINT_TTL_MS) || 5 * 60_000;
-/** Bootstrap window when no explicit user cap is set — a SEED to start observing from, never a maximum. */
-let globalSeed: number | undefined;
-/** The largest effective window this gate has actually sustained — the "prior probe window" to resume to. */
-let aimdPeak = 0;
-/** Epoch ms of the most recent contraction (anchors TTL expiry). 0 = not contracted. */
-let aimdContractedAt = 0;
-/** Injectable clock so a test can advance the freshness clock (the clause's own probeMethod). */
-let gateNow: () => number = () => Date.now();
+const DEFAULT_AIMD_DECREASE_FACTOR = 0.5;
+const DEFAULT_GLOBAL_FLOOR = 1;
 
-/** Test/host hook: drive the gate's expiry clock. Pass undefined to restore `Date.now`. */
-export function setGlobalGateClock(fn: (() => number) | undefined): void {
-  gateNow = fn ?? (() => Date.now());
+export interface GlobalConcurrencySnapshot {
+  cap: number;
+  inFlight: number;
+}
+
+export interface EffectiveConcurrencySnapshot {
+  effective: number | null;
+  floor: number;
+  cleanStreak: number;
+  /** P-009: the window AFTER expiry — what admission actually enforces right now. */
+  effectiveAfterExpiry: number | null;
+  /** P-009: the highest window this gate has sustained (the "prior probe window" it resumes to). */
+  peak: number;
+  /** P-009: epoch ms of the standing contraction, or null when none is in force. */
+  contractedAt: number | null;
+  /** P-009: true once the standing contraction has aged past its TTL (probing has resumed). */
+  constraintExpired: boolean;
 }
 
 /**
- * The effective global window at `now`, AFTER expiry.
- *
- * A contraction older than GLOBAL_CONSTRAINT_TTL_MS has expired: the observation that justified it
- * is stale, so the window resumes probing at the peak it had previously sustained rather than
- * remaining shrunk. Pure — callers read it, they do not mutate through it.
+ * The instance controller extends the generic gate with the live configuration/readback seams
+ * used by the production wrappers and hermetic tests.
  */
-function effectiveGlobalWindow(): number {
-  if (aimdEff === undefined) return Infinity;
-  if (aimdContractedAt > 0 && gateNow() - aimdContractedAt >= GLOBAL_CONSTRAINT_TTL_MS) {
-    return Math.min(globalCap, Math.max(aimdEff, aimdPeak));
-  }
-  return aimdEff;
+export interface GlobalConcurrencyGateController extends GlobalConcurrencyGate {
+  setCap(n: number | undefined): void;
+  setFloor(n: number | undefined): void;
+  setSeed(n: number | undefined): void;
+  setClock(fn: (() => number) | undefined): void;
+  setTuning(t: { cleanTurnsPerStep?: number; decreaseFactor?: number } | undefined): void;
+  getTuning(): { cleanTurnsPerStep: number; decreaseFactor: number };
+  globalSnapshot(): GlobalConcurrencySnapshot;
+  effectiveSnapshot(): EffectiveConcurrencySnapshot;
+  /** Reset transient state using the legacy registry semantics (configured cap/floor remain live). */
+  reset(): void;
 }
 
-const globalGate: GlobalConcurrencyGate = {
-  tryAcquire(opts) {
-    const effectiveLimit = Math.min(globalCap, effectiveGlobalWindow());
-    // The gateway already treats tier 1 (interactive/queen/scout/overwatch) as a
-    // reserved lane. Preserve that SAME contract before the request reaches the
-    // gateway: when AIMD has shed the ordinary lane, tier 1 may use otherwise-idle
-    // hard-cap headroom. Per-bucket maxConcurrent still bounds each producer, and
-    // the gateway remains the authoritative cross-account admission queue.
-    const limit = opts?.priorityTier === 1 ? globalCap : effectiveLimit;
-    if (globalInFlight >= limit) return false;
-    globalInFlight += 1;
-    return true;
-  },
-  release() {
-    globalInFlight = Math.max(0, globalInFlight - 1);
-  },
-  // WI-38062: the fleet gate's live occupancy vs the limit for the CALLER'S band, so a denial it
-  // produced carries real numbers instead of a constant. Mirrors tryAcquire's band selection
-  // exactly (tier 1 is measured against the hard cap, not the AIMD-shed effective limit) — read
-  // via the same expression so the two can't drift into reporting a limit that was never applied.
-  snapshot(opts) {
-    const effectiveLimit = Math.min(globalCap, effectiveGlobalWindow());
-    const limit = opts?.priorityTier === 1 ? globalCap : effectiveLimit;
-    return { inFlight: globalInFlight, limit };
-  },
-  noteClean(ev) {
-    // P-009 (1): recovery is scoped exactly like contraction. An account-keyed lane's clean turn is
-    // evidence about THAT account, so it must not ramp the fleet window either — otherwise the gate
-    // would drift, crediting siblings for a recovery it refused to be penalised for.
-    if (ev?.accountScoped) return;
-    if (aimdEff === undefined) return; // AIMD inactive: no seed and no cap installed
-    aimdCleanStreak += 1;
-    if (aimdCleanStreak >= aimdCleanTurnsPerStep) {
-      aimdCleanStreak = 0;
-      // P-009 (2): additive increase is bounded ONLY by an explicit user cap. Without one,
-      // `globalCap` is Infinity and the window PROBES UPWARD indefinitely instead of being pinned
-      // to whatever seed it happened to boot with — a seed bootstraps observation, it is not a
-      // ceiling. Reaching a new high clears the contraction anchor: the window has proven this
-      // level, so there is no stale constraint left to expire.
-      if (aimdEff < globalCap) {
-        aimdEff += 1;
-        if (aimdEff > aimdPeak) {
-          aimdPeak = aimdEff;
-          aimdContractedAt = 0;
+export interface GlobalConcurrencyGateOptions {
+  now?: () => number;
+}
+
+/**
+ * Create an instance-scoped fleet concurrency gate.
+ *
+ * All mutable AIMD/counter/clock state lives in this closure. The registry keeps one production
+ * instance for backwards-compatible module-level wrappers, while tests and embedders can inject
+ * another instance through `GovernorDeps.globalGate`. Two consumers in one process therefore
+ * cannot race over one ambient window unless they explicitly choose to share a gate.
+ */
+export function createGlobalConcurrencyGate(options: GlobalConcurrencyGateOptions = {}): GlobalConcurrencyGateController {
+  let globalCap = Infinity;
+  let globalInFlight = 0;
+  let globalFloor = DEFAULT_GLOBAL_FLOOR;
+  let aimdEff: number | undefined;
+  let aimdCleanStreak = 0;
+  // P-021 (live-configurability-audit): the AIMD response-curve is host-tunable at runtime.
+  let aimdCleanTurnsPerStep = AIMD_CLEAN_TURNS_PER_STEP;
+  let aimdDecreaseFactor = DEFAULT_AIMD_DECREASE_FACTOR;
+  /** Bootstrap window when no explicit user cap is set — a SEED to start observing from, never a maximum. */
+  let globalSeed: number | undefined;
+  /** The largest effective window this gate has actually sustained — the prior probe window. */
+  let aimdPeak = 0;
+  /** Epoch ms of the most recent contraction (anchors TTL expiry). 0 = not contracted. */
+  let aimdContractedAt = 0;
+  /** Injectable clock so a test can advance the freshness clock (the clause's own probeMethod). */
+  let gateNow: () => number = options.now ?? (() => Date.now());
+
+  /**
+   * The effective global window at `now`, AFTER expiry.
+   *
+   * A contraction older than GLOBAL_CONSTRAINT_TTL_MS has expired: the observation that justified it
+   * is stale, so the window resumes probing at the peak it had previously sustained rather than
+   * remaining shrunk. Pure — callers read it, they do not mutate through it.
+   */
+  function effectiveGlobalWindow(): number {
+    if (aimdEff === undefined) return Infinity;
+    if (aimdContractedAt > 0 && gateNow() - aimdContractedAt >= GLOBAL_CONSTRAINT_TTL_MS) {
+      return Math.min(globalCap, Math.max(aimdEff, aimdPeak));
+    }
+    return aimdEff;
+  }
+
+  const gate: GlobalConcurrencyGateController = {
+    tryAcquire(opts) {
+      const effectiveLimit = Math.min(globalCap, effectiveGlobalWindow());
+      // The gateway already treats tier 1 (interactive/queen/scout/overwatch) as a
+      // reserved lane. Preserve that SAME contract before the request reaches the
+      // gateway: when AIMD has shed the ordinary lane, tier 1 may use otherwise-idle
+      // hard-cap headroom. Per-bucket maxConcurrent still bounds each producer, and the
+      // gateway remains the authoritative cross-account admission queue.
+      const limit = opts?.priorityTier === 1 ? globalCap : effectiveLimit;
+      if (globalInFlight >= limit) return false;
+      globalInFlight += 1;
+      return true;
+    },
+    release() {
+      globalInFlight = Math.max(0, globalInFlight - 1);
+    },
+    // WI-38062: the fleet gate's live occupancy vs the limit for the CALLER'S band, so a denial it
+    // produced carries real numbers instead of a constant. Mirrors tryAcquire's band selection
+    // exactly (tier 1 is measured against the hard cap, not the AIMD-shed effective limit) — read
+    // via the same expression so the two can't drift into reporting a limit that was never applied.
+    snapshot(opts) {
+      const effectiveLimit = Math.min(globalCap, effectiveGlobalWindow());
+      const limit = opts?.priorityTier === 1 ? globalCap : effectiveLimit;
+      return { inFlight: globalInFlight, limit };
+    },
+    noteClean(ev) {
+      // P-009 (1): recovery is scoped exactly like contraction. An account-keyed lane's clean turn is
+      // evidence about THAT account, so it must not ramp the fleet window either — otherwise the gate
+      // would drift, crediting siblings for a recovery it refused to be penalised for.
+      if (ev?.accountScoped) return;
+      if (aimdEff === undefined) return; // AIMD inactive: no seed and no cap installed
+      aimdCleanStreak += 1;
+      if (aimdCleanStreak >= aimdCleanTurnsPerStep) {
+        aimdCleanStreak = 0;
+        // P-009 (2): additive increase is bounded ONLY by an explicit user cap. Without one,
+        // `globalCap` is Infinity and the window PROBES UPWARD indefinitely instead of being pinned
+        // to whatever seed it happened to boot with — a seed bootstraps observation, it is not a
+        // ceiling. Reaching a new high clears the contraction anchor: the window has proven this
+        // level, so there is no stale constraint left to expire.
+        if (aimdEff < globalCap) {
+          aimdEff += 1;
+          if (aimdEff > aimdPeak) {
+            aimdPeak = aimdEff;
+            aimdContractedAt = 0;
+          }
         }
       }
-    }
-  },
-  notePenalty(ev) {
-    // P-009 (1): THE core fix. An account-keyed observation is one account's budget fact, never
-    // evidence about its siblings, so it must not contract the fleet-wide window. Before this, any
-    // single account's 429 halved the whole fleet — the clause's falsifier arm 1 ("a provider fault
-    // shrinks unrelated accounts"). That lane is NOT left ungoverned: penalize() already decreased
-    // its own rpmFactor and parked it with a bounded re-probe, both of which recover on their own
-    // clock. An account-BLIND lane (no '@'), or a local-saturation signal from the connection /
-    // loop-pressure governors, still legitimately contracts the fleet.
-    if (ev?.accountScoped) return;
-    aimdCleanStreak = 0;
-    if (aimdEff === undefined) return;
-    if (aimdEff > aimdPeak) aimdPeak = aimdEff; // remember the window we are contracting away from
-    aimdEff = Math.max(globalFloor, Math.floor(aimdEff * aimdDecreaseFactor)); // multiplicative decrease to floor
-    aimdContractedAt = gateNow(); // start the shelf life (P-009 (2))
-  },
-};
+    },
+    notePenalty(ev) {
+      // P-009 (1): THE core fix. An account-keyed observation is one account's budget fact, never
+      // evidence about its siblings, so it must not contract the fleet-wide window. Before this, any
+      // single account's 429 halved the whole fleet — the clause's falsifier arm 1 ("a provider fault
+      // shrinks unrelated accounts"). That lane is NOT left ungoverned: penalize() already decreased
+      // its own rpmFactor and parked it with a bounded re-probe, both of which recover on their own
+      // clock. An account-BLIND lane (no '@'), or a local-saturation signal from the connection /
+      // loop-pressure governors, still legitimately contracts the fleet.
+      if (ev?.accountScoped) return;
+      aimdCleanStreak = 0;
+      if (aimdEff === undefined) return;
+      if (aimdEff > aimdPeak) aimdPeak = aimdEff; // remember the window we are contracting away from
+      aimdEff = Math.max(globalFloor, Math.floor(aimdEff * aimdDecreaseFactor)); // multiplicative decrease to floor
+      aimdContractedAt = gateNow(); // start the shelf life (P-009 (2))
+    },
+    setCap(n) {
+      if (typeof n === 'number' && n > 0) {
+        const prevCap = globalCap;
+        globalCap = n;
+        // The user's edit is honored LIVE: when eff is not adapted-down (fresh, or sitting at the old
+        // cap) it follows the edit in both directions. Only a penalty-adapted eff (< old cap) holds
+        // its safe level on a raise and ramps up via clean turns.
+        if (aimdEff === undefined || !Number.isFinite(prevCap) || aimdEff >= prevCap) {
+          aimdEff = n;
+        } else {
+          aimdEff = Math.min(aimdEff, n);
+        }
+        if (aimdEff < globalFloor) aimdEff = Math.min(globalFloor, globalCap);
+      } else {
+        globalCap = Infinity;
+        // P-009: clearing the USER's cap must not disable adaptation. When a seed is installed the
+        // window keeps probing from it (uncapped); only with neither cap nor seed is AIMD inactive.
+        aimdEff = globalSeed;
+        aimdCleanStreak = 0;
+      }
+      aimdPeak = Math.max(aimdPeak, aimdEff ?? 0);
+      aimdContractedAt = 0; // an explicit config write supersedes any standing observation
+    },
+    setSeed(n) {
+      globalSeed = typeof n === 'number' && n > 0 ? Math.floor(n) : undefined;
+      // Only ADOPT the seed as the live window when nothing has been learned yet: a window that has
+      // already adapted (or a user cap) outranks a boot-time guess.
+      if (aimdEff === undefined && globalSeed !== undefined && !Number.isFinite(globalCap)) {
+        aimdEff = globalSeed;
+        aimdPeak = Math.max(aimdPeak, globalSeed);
+      }
+    },
+    setFloor(n) {
+      globalFloor = typeof n === 'number' && n >= 1 ? Math.floor(n) : DEFAULT_GLOBAL_FLOOR;
+      if (aimdEff !== undefined && aimdEff < globalFloor) aimdEff = Math.min(globalFloor, globalCap);
+    },
+    setClock(fn) {
+      gateNow = fn ?? (() => Date.now());
+    },
+    setTuning(t) {
+      if (typeof t?.cleanTurnsPerStep === 'number' && t.cleanTurnsPerStep >= 1) {
+        aimdCleanTurnsPerStep = Math.floor(t.cleanTurnsPerStep);
+      }
+      if (typeof t?.decreaseFactor === 'number' && t.decreaseFactor > 0 && t.decreaseFactor < 1) {
+        aimdDecreaseFactor = t.decreaseFactor;
+      }
+    },
+    getTuning() {
+      return { cleanTurnsPerStep: aimdCleanTurnsPerStep, decreaseFactor: aimdDecreaseFactor };
+    },
+    globalSnapshot() {
+      return { cap: globalCap, inFlight: globalInFlight };
+    },
+    effectiveSnapshot() {
+      const after = effectiveGlobalWindow();
+      return {
+        effective: aimdEff ?? null,
+        floor: globalFloor,
+        cleanStreak: aimdCleanStreak,
+        effectiveAfterExpiry: Number.isFinite(after) ? after : null,
+        peak: aimdPeak,
+        contractedAt: aimdContractedAt || null,
+        constraintExpired: aimdContractedAt > 0 && gateNow() - aimdContractedAt >= GLOBAL_CONSTRAINT_TTL_MS,
+      };
+    },
+    reset() {
+      // Preserve configured cap/floor/effective state to match resetGovernorRegistry's historical
+      // semantics; callers explicitly clear configuration through setCap/setFloor when required.
+      globalInFlight = 0;
+      aimdCleanStreak = 0;
+      aimdCleanTurnsPerStep = AIMD_CLEAN_TURNS_PER_STEP;
+      aimdDecreaseFactor = DEFAULT_AIMD_DECREASE_FACTOR;
+      globalSeed = undefined;
+      aimdPeak = 0;
+      aimdContractedAt = 0;
+      gateNow = () => Date.now();
+    },
+  };
+  return gate;
+}
+
+const globalGate = createGlobalConcurrencyGate();
+
+/** Test/host hook: drive the gate's expiry clock. Pass undefined to restore `Date.now`. */
+export function setGlobalGateClock(fn: (() => number) | undefined): void {
+  globalGate.setClock(fn);
+}
 
 /** Set the fleet-wide concurrent-agent cap (the user's live `maxSimultaneousAgents`). `undefined`
     or ≤0 clears it (Infinity = unbounded, AIMD inactive). Honored by the very next `acquire`
     across all buckets; the AIMD effective concurrency starts at the cap and adapts under it. */
 export function setGlobalConcurrencyCap(n: number | undefined): void {
-  if (typeof n === 'number' && n > 0) {
-    const prevCap = globalCap;
-    globalCap = n;
-    // The user's edit is honored LIVE: when eff is not adapted-down (fresh, or sitting at the old
-    // cap) it follows the edit in both directions. Only a penalty-adapted eff (< old cap) holds
-    // its safe level on a raise and ramps up via clean turns.
-    if (aimdEff === undefined || !Number.isFinite(prevCap) || aimdEff >= prevCap) {
-      aimdEff = n;
-    } else {
-      aimdEff = Math.min(aimdEff, n);
-    }
-    if (aimdEff < globalFloor) aimdEff = Math.min(globalFloor, globalCap);
-  } else {
-    globalCap = Infinity;
-    // P-009: clearing the USER's cap must not disable adaptation. When a seed is installed the
-    // window keeps probing from it (uncapped); only with neither cap nor seed is AIMD inactive.
-    aimdEff = globalSeed;
-    aimdCleanStreak = 0;
-  }
-  aimdPeak = Math.max(aimdPeak, aimdEff ?? 0);
-  aimdContractedAt = 0; // an explicit config write supersedes any standing observation
+  globalGate.setCap(n);
 }
 
 /**
@@ -260,19 +356,12 @@ export function setGlobalConcurrencyCap(n: number | undefined): void {
  * `undefined` clears it (AIMD inactive again unless a cap is set).
  */
 export function setGlobalConcurrencySeed(n: number | undefined): void {
-  globalSeed = typeof n === 'number' && n > 0 ? Math.floor(n) : undefined;
-  // Only ADOPT the seed as the live window when nothing has been learned yet: a window that has
-  // already adapted (or a user cap) outranks a boot-time guess.
-  if (aimdEff === undefined && globalSeed !== undefined && !Number.isFinite(globalCap)) {
-    aimdEff = globalSeed;
-    aimdPeak = Math.max(aimdPeak, globalSeed);
-  }
+  globalGate.setSeed(n);
 }
 
 /** Set the AIMD floor (D-005) — the effective concurrency never adapts below it. */
 export function setGlobalConcurrencyFloor(n: number | undefined): void {
-  globalFloor = typeof n === 'number' && n >= 1 ? Math.floor(n) : 1;
-  if (aimdEff !== undefined && aimdEff < globalFloor) aimdEff = Math.min(globalFloor, globalCap);
+  globalGate.setFloor(n);
 }
 
 /** P-021: tune the AIMD response curve live — the additive-increase cadence (`cleanTurnsPerStep`,
@@ -280,17 +369,12 @@ export function setGlobalConcurrencyFloor(n: number | undefined): void {
     penalty. Only valid fields are taken; omitted/invalid keep the current value. Honored by the very
     next clean turn / penalty across all buckets (the gate reads the live vars). */
 export function setAimdTuning(t: { cleanTurnsPerStep?: number; decreaseFactor?: number } | undefined): void {
-  if (typeof t?.cleanTurnsPerStep === 'number' && t.cleanTurnsPerStep >= 1) {
-    aimdCleanTurnsPerStep = Math.floor(t.cleanTurnsPerStep);
-  }
-  if (typeof t?.decreaseFactor === 'number' && t.decreaseFactor > 0 && t.decreaseFactor < 1) {
-    aimdDecreaseFactor = t.decreaseFactor;
-  }
+  globalGate.setTuning(t);
 }
 
 /** The live AIMD response-curve tuning (for observability / the config readback). */
 export function getAimdTuning(): { cleanTurnsPerStep: number; decreaseFactor: number } {
-  return { cleanTurnsPerStep: aimdCleanTurnsPerStep, decreaseFactor: aimdDecreaseFactor };
+  return globalGate.getTuning();
 }
 
 /** P-021: override (or clear, when `limits` omits a field / is undefined) a provider's conservative
@@ -318,35 +402,14 @@ export function getProviderFloorOverrides(): Partial<Record<TurnProvider, Partia
 }
 
 /** The live fleet-wide cap + current total in-flight — surfaced by the rate read-model / top-bar. */
-export function globalConcurrencySnapshot(): { cap: number; inFlight: number } {
-  return { cap: globalCap, inFlight: globalInFlight };
+export function globalConcurrencySnapshot(): GlobalConcurrencySnapshot {
+  return globalGate.globalSnapshot();
 }
 
 /** The AIMD view (D-005): the adapted effective concurrency under the cap (null = AIMD inactive,
     i.e. no finite cap installed), the floor it never drops below, and the current clean streak. */
-export function effectiveConcurrencySnapshot(): {
-  effective: number | null;
-  floor: number;
-  cleanStreak: number;
-  /** P-009: the window AFTER expiry — what admission actually enforces right now. */
-  effectiveAfterExpiry: number | null;
-  /** P-009: the highest window this gate has sustained (the "prior probe window" it resumes to). */
-  peak: number;
-  /** P-009: epoch ms of the standing contraction, or null when none is in force. */
-  contractedAt: number | null;
-  /** P-009: true once the standing contraction has aged past its TTL (probing has resumed). */
-  constraintExpired: boolean;
-} {
-  const after = effectiveGlobalWindow();
-  return {
-    effective: aimdEff ?? null,
-    floor: globalFloor,
-    cleanStreak: aimdCleanStreak,
-    effectiveAfterExpiry: Number.isFinite(after) ? after : null,
-    peak: aimdPeak,
-    contractedAt: aimdContractedAt || null,
-    constraintExpired: aimdContractedAt > 0 && gateNow() - aimdContractedAt >= GLOBAL_CONSTRAINT_TTL_MS,
-  };
+export function effectiveConcurrencySnapshot(): EffectiveConcurrencySnapshot {
+  return globalGate.effectiveSnapshot();
 }
 
 /** P5-2 (operator-scalability-event-loop-2026-06-16): apply an EXTERNAL backpressure
@@ -513,14 +576,7 @@ export function governorForBackend(backend: TurnBackend, model: string, deps?: G
     call setGlobalConcurrencyCap(undefined) to also clear the cap). */
 export function resetGovernorRegistry(): void {
   registry.clear();
-  globalInFlight = 0;
+  globalGate.reset();
   // P-021: drop runtime floor overrides + restore the default AIMD curve so a test starts baked.
   for (const k of Object.keys(providerFloorOverrides)) delete providerFloorOverrides[k as TurnProvider];
-  aimdCleanTurnsPerStep = AIMD_CLEAN_TURNS_PER_STEP;
-  aimdDecreaseFactor = 0.5;
-  // P-009: drop the probe/expiry state + restore the real clock so a test starts unobserved.
-  globalSeed = undefined;
-  aimdPeak = 0;
-  aimdContractedAt = 0;
-  gateNow = () => Date.now();
 }
