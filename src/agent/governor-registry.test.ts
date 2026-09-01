@@ -29,12 +29,13 @@ beforeEach(() => {
   setGlobalConcurrencyFloor(undefined);
 });
 
-test('BACKEND_PROFILES — provider + self-pacing per backend', () => {
-  assert.equal(BACKEND_PROFILES['anthropic-direct'].provider, 'anthropic');
-  assert.equal(BACKEND_PROFILES['claude-code'].provider, 'anthropic');
-  assert.equal(BACKEND_PROFILES.codex.provider, 'openai');
-  assert.equal(BACKEND_PROFILES.omp.selfPacing, true); // model-agnostic + fallback chaining
-  assert.equal(BACKEND_PROFILES['anthropic-direct'].selfPacing, false);
+test('BACKEND_PROFILES drives the actual governor bucket for every backend', () => {
+  for (const [backend, profile] of Object.entries(BACKEND_PROFILES)) {
+    const model = 'claude-opus-4-8';
+    const actual = governorForBackend(backend as keyof typeof BACKEND_PROFILES, model);
+    const expected = getGovernor(profile.provider, profile.selfPacing ? 'self' : modelClassOf(model));
+    assert.equal(actual, expected);
+  }
 });
 
 // D-006: limitModel is a RUNTIME credential fact, not a compile-time const.
