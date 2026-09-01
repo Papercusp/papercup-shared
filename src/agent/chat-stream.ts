@@ -306,6 +306,35 @@ export function normalizeModelForClaude(model: string): string {
   return slash > 0 ? model.slice(slash + 1) : model;
 }
 
+const REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+/**
+ * Split Papercusp's `<model>[:<effort>]` selector at the subprocess boundary.
+ * A colon is also legal inside some provider model ids, so only a suffix from
+ * the shared reasoning vocabulary is treated as effort; every other colon is
+ * part of the model id and passes through unchanged.
+ */
+export function splitCliModelSpec(spec: string): { model: string; effort?: string } {
+  const normalized = normalizeModelForClaude(spec);
+  const separator = normalized.lastIndexOf(':');
+  if (separator <= 0) return { model: normalized };
+  const effort = normalized.slice(separator + 1).toLowerCase();
+  if (!REASONING_EFFORTS.has(effort)) return { model: normalized };
+  return { model: normalized.slice(0, separator), effort };
+}
+
+/** Exact argv fragment for Claude Code's model + reasoning selectors. */
+export function claudeModelSelectionArgs(spec: string): string[] {
+  const { model, effort } = splitCliModelSpec(spec);
+  return ['--model', model, ...(effort ? ['--effort', effort] : [])];
+}
+
+/** Exact argv fragment for Codex's model + reasoning selectors. */
+export function codexModelSelectionArgs(spec: string): string[] {
+  const { model, effort } = splitCliModelSpec(spec);
+  return ['-m', model, ...(effort ? ['-c', `model_reasoning_effort="${effort}"`] : [])];
+}
+
 /** The standard request header carrying a caller's inference-gateway admission-tier
  *  label — the in-process counterpart of the spawn chokepoint's `ANTHROPIC_CUSTOM_HEADERS`
  *  priority line (gateway-priority-tiers-2026-06-22). Mirrors `PRIORITY_HEADER` in the
@@ -1844,7 +1873,7 @@ export async function* runAgentChat(
 
   if (backend === 'claude-code') {
     args.push('-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages');
-    if (opts.model) args.push('--model', normalizeModelForClaude(opts.model));
+    if (opts.model) args.push(...claudeModelSelectionArgs(opts.model));
     if (opts.mcpConfig) {
       args.push('--mcp-config', JSON.stringify(opts.mcpConfig));
     }
@@ -1921,7 +1950,7 @@ export async function* runAgentChat(
     }
     // Model: codex wants a bare id (`gpt-5.5`); strip any `provider/`
     // prefix the same way the claude branch normalizes.
-    if (opts.model) args.push('-m', normalizeModelForClaude(opts.model));
+    if (opts.model) args.push(...codexModelSelectionArgs(opts.model));
 
     // codex has NO --system-prompt flag and NO inline --mcp-config flag.
     // Both surfaces are configured through a per-spawn CODEX_HOME:
