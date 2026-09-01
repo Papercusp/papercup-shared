@@ -4,7 +4,7 @@
  */
 import { test, afterEach } from 'vitest';
 import assert from 'node:assert/strict';
-import { normalizeModelForClaude, splitCliModelSpec, claudeModelSelectionArgs, codexModelSelectionArgs, estimateCodexUsageCost, headersToRecord, buildSystemParam, CLAUDE_CODE_IDENTIFIER, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, ownerHeaders, routeAccountHeaders, GATEWAY_PRIORITY_HEADER, GATEWAY_OWNER_HEADER, ROUTE_ACCOUNT_HEADER, retryLadderDeadlineExceeded, governorForStatelessTransport } from './chat-stream';
+import { normalizeModelForClaude, splitCliModelSpec, claudeModelSelectionArgs, codexModelSelectionArgs, estimateCodexUsageCost, codexMcpToolFilterInput, headersToRecord, buildSystemParam, CLAUDE_CODE_IDENTIFIER, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, ownerHeaders, routeAccountHeaders, GATEWAY_PRIORITY_HEADER, GATEWAY_OWNER_HEADER, ROUTE_ACCOUNT_HEADER, retryLadderDeadlineExceeded, governorForStatelessTransport } from './chat-stream';
 
 // EI-20394554339706750: the local inference gateway is already the pooled admission authority.
 // The process-local provider singleton used to sit in front of it with maxConcurrent=3, so three
@@ -260,6 +260,18 @@ test('estimateCodexUsageCost — an unknown model is explicitly unpriced, never 
     usd: 0,
     priced: false,
   });
+});
+
+test('codexMcpToolFilterInput — reconstructs the shared qualified MCP name', () => {
+  assert.equal(
+    codexMcpToolFilterInput('agentmcp', 'plans_get'),
+    'mcp__agentmcp__plans_get',
+  );
+  assert.equal(codexMcpToolFilterInput('', 'plans_get'), 'plans_get');
+  assert.equal(
+    codexMcpToolFilterInput('agentmcp', 'mcp__agentmcp__plans_get'),
+    'mcp__agentmcp__plans_get',
+  );
 });
 
 // buildSystemParam (RB-008 + claude-code-system-framing 2026-06-30): the FIRST block is ALWAYS the
