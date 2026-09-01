@@ -1165,6 +1165,18 @@ export function estimateCodexUsageCost(
   });
 }
 
+/**
+ * Codex JSON events split an MCP call's server and tool into separate fields,
+ * while Claude reports the qualified `mcp__<server>__<tool>` name that shared
+ * filters already consume. Reconstruct that backend-neutral filter input, but
+ * keep an already-qualified or serverless tool unchanged.
+ */
+export function codexMcpToolFilterInput(server: unknown, tool: string): string {
+  if (tool.startsWith('mcp__')) return tool;
+  const normalizedServer = typeof server === 'string' ? server.trim() : '';
+  return normalizedServer ? `mcp__${normalizedServer}__${tool}` : tool;
+}
+
 function isTransientLlmError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   // Anthropic SDK APIError surfaces as `<status> <body>` in .message.
@@ -2534,9 +2546,10 @@ export async function* runAgentChat(
       if (item.type === 'mcp_tool_call') {
         // MCP tool name lives on item.tool (NOT item.name); args on
         // item.arguments. item.server names the configured server.
-        const rawName = typeof item.tool === 'string' ? item.tool : '';
-        if (!rawName) return;
-        const filtered = opts.toolEventFilter ? opts.toolEventFilter(rawName) : rawName;
+        const toolName = typeof item.tool === 'string' ? item.tool : '';
+        if (!toolName) return;
+        const filterInput = codexMcpToolFilterInput(item.server, toolName);
+        const filtered = opts.toolEventFilter ? opts.toolEventFilter(filterInput) : toolName;
         if (filtered) {
           queue.push({ type: 'tool_call', name: filtered, input: item.arguments ?? {} });
         }
