@@ -116,6 +116,22 @@ describe('resolveAgentBin', () => {
     expect(resolveAgentBin(opts({ agentCmd: '/explicit/omp' }), 'omp')).toBe('/explicit/omp');
   });
 
+  it('an explicit per-call backend selects its compatible binary above ambient AGENT_CMD', () => {
+    process.env.AGENT_CMD = 'claude -p';
+    expect(resolveAgentBin(opts({ backend: 'codex' }), 'codex')).toBe('codex');
+    expect(resolveAgentBin(opts({ backend: 'omp' }), 'omp')).toBe('omp');
+
+    process.env.AGENT_CMD = 'codex exec';
+    expect(resolveAgentBin(opts({ backend: 'claude-code' }), 'claude-code')).toBe('claude');
+  });
+
+  it('opts.agentCmd still permits a deliberate non-default binary for an explicit backend', () => {
+    process.env.AGENT_CMD = 'claude -p';
+    expect(
+      resolveAgentBin(opts({ backend: 'codex', agentCmd: '/opt/wrapped-codex' }), 'codex'),
+    ).toBe('/opt/wrapped-codex');
+  });
+
   it('AGENT_CMD env wins over the legacy CLAUDE_CMD', () => {
     process.env.AGENT_CMD = '/new/agent';
     process.env.CLAUDE_CMD = '/legacy/claude';
