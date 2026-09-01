@@ -251,11 +251,20 @@ export function resolveBackend(opts: RunAgentChatOptions): AgentBackend {
 }
 
 /**
- * Resolve the agent binary. AGENT_CMD wins over the legacy CLAUDE_CMD;
- * default tracks the resolved backend.
+ * Resolve the agent binary. A caller-supplied `agentCmd` is the explicit
+ * binary override. Otherwise an explicit per-call backend selects that
+ * backend's compatible default binary; ambient AGENT_CMD / CLAUDE_CMD apply
+ * only when the backend itself was inherited. This ordering is load-bearing
+ * for per-surface overrides: `backends.portal='codex'` must not launch the
+ * process-wide `AGENT_CMD='claude -p'` with Codex argv.
  */
 export function resolveAgentBin(opts: RunAgentChatOptions, backend: AgentBackend): string {
   if (opts.agentCmd) return opts.agentCmd;
+  if (opts.backend) {
+    if (opts.backend === 'omp') return 'omp';
+    if (opts.backend === 'codex') return 'codex';
+    return 'claude';
+  }
   const fromEnv = process.env.AGENT_CMD ?? process.env.CLAUDE_CMD;
   if (fromEnv && fromEnv.trim()) return fromEnv;
   if (backend === 'omp') return 'omp';
