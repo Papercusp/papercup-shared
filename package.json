@@ -20,7 +20,8 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.81.0",
-    "@papercusp/grid-core": "*"
+    "@papercusp/grid-core": "*",
+    "@papercusp/model-pricing": "*"
   },
   "scripts": {
     "test": "vitest run"

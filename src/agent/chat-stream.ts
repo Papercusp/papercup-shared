@@ -40,6 +40,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, delimiter, join } from 'node:path';
+import { costFromTokens, type CostEstimate } from '@papercusp/model-pricing';
 // Agent-turn robustness (opt-in via PAPERCUSP_AGENT_GOVERNOR=1). These modules are pure +
 // import nothing from this file, so there's no cycle and ~no load cost when the flag is off.
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
@@ -289,6 +290,7 @@ export function resolveAgentBin(opts: RunAgentChatOptions, backend: AgentBackend
 export function withAgentBinDirs(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const home = env.HOME ?? process.env.HOME ?? homedir();
   const wellKnown = [
+    join(home, '.papercusp', 'bin'), // Papercusp-managed CLIs (codex)
     join(home, '.local', 'bin'), // claude native installer
     join(home, '.bun', 'bin'), // bun-installed CLIs (omp)
     join(home, '.cargo', 'bin'),
@@ -1142,25 +1144,25 @@ function anthropicPriceFor(model: string): ModelPrice {
   return prefix ? ANTHROPIC_PRICES[prefix] : { in: 0, out: 0 };
 }
 
-// Codex (`codex exec`) emits NO cost field — only a token `usage` block on
-// `turn.completed`. We derive costUsd from this table the same way the
-// stateless anthropic-direct path does (model → in/out per 1M tokens, USD).
-// Codex runs OpenAI GPT-5 family models (logged in via ChatGPT OAuth);
-// keys are the BARE model id codex reports (`gpt-5.5`), plus the
-// `openai-codex/*` provider-prefixed form some callers pass.
-// Approximate 2026-05 reference pricing.
-const CODEX_PRICES: Record<string, ModelPrice> = {
-  'gpt-5':              { in: 1.25, out: 10.00 },
-  'gpt-5.5':            { in: 2.50, out: 20.00 },
-  'gpt-5.5:xhigh':      { in: 2.50, out: 20.00 },
-  'openai-codex/gpt-5':   { in: 1.25, out: 10.00 },
-  'openai-codex/gpt-5.5': { in: 2.50, out: 20.00 },
-};
-function codexPriceFor(model: string | undefined): ModelPrice {
-  if (!model) return CODEX_PRICES['gpt-5.5'];
-  if (CODEX_PRICES[model]) return CODEX_PRICES[model];
-  const prefix = Object.keys(CODEX_PRICES).find((m) => model.startsWith(m));
-  return prefix ? CODEX_PRICES[prefix] : { in: 0, out: 0 };
+/**
+ * Estimate a Codex turn from the canonical cross-backend price table.
+ * OpenAI's input_tokens includes cached_input_tokens, while costFromTokens
+ * expects uncached input separately, so split the two before estimating.
+ * The priced bit is load-bearing: an unknown model is incomplete telemetry,
+ * never evidence that the turn was free.
+ */
+export function estimateCodexUsageCost(
+  model: string | undefined,
+  inputTokens: number,
+  outputTokens: number,
+  cachedInputTokens = 0,
+): CostEstimate {
+  const cached = Math.max(0, Math.min(inputTokens, cachedInputTokens));
+  return costFromTokens(model ?? 'gpt-5.5', {
+    inputTokens: Math.max(0, inputTokens - cached),
+    outputTokens,
+    cacheReadTokens: cached,
+  });
 }
 
 function isTransientLlmError(err: unknown): boolean {
@@ -2566,9 +2568,13 @@ export async function* runAgentChat(
       tokensIn = hasInput ? u.input_tokens : tokensIn;
       tokensOut = (hasOutput ? u.output_tokens : 0) + (hasFiniteNumber(u.reasoning_output_tokens) ? u.reasoning_output_tokens : 0);
       codexUsageComplete = hasInput && hasOutput;
-      // codex emits NO cost field — derive from the price table.
-      const p = codexPriceFor(opts.model ? normalizeModelForClaude(opts.model) : undefined);
-      costUsd = (tokensIn * p.in + tokensOut * p.out) / 1_000_000;
+      // codex emits NO cost field — derive an ESTIMATE from the canonical
+      // cross-backend table. Unknown model prices count as an unreported frame
+      // rather than masquerading as a measured $0 turn.
+      const cachedInput = hasFiniteNumber(u.cached_input_tokens) ? u.cached_input_tokens : 0;
+      const estimate = estimateCodexUsageCost(opts.model, tokensIn, tokensOut, cachedInput);
+      costUsd = estimate.usd;
+      if (!estimate.priced) unreportedFrames = Math.max(unreportedFrames, 1);
       return;
     }
   };
