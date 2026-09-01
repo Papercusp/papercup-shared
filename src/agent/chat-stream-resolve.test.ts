@@ -437,13 +437,17 @@ describe('withAgentBinDirs (EI-11519 stripped-PATH spawn fix)', () => {
   it('appends well-known per-user bin dirs that exist but are missing from PATH', () => {
     const home = mkdtempSync(join(tmpdir(), 'wabd-'));
     try {
-      // Simulate the claude native-installer layout under a fake HOME.
+      // Simulate the Papercusp-managed Codex and claude native-installer layouts
+      // under a fake HOME.
+      const papercuspBin = join(home, '.papercusp', 'bin');
       const localBin = join(home, '.local', 'bin');
+      mkdirSync(papercuspBin, { recursive: true });
       mkdirSync(localBin, { recursive: true });
       const env = { HOME: home, PATH: '/usr/bin:/bin' };
       const out = withAgentBinDirs(env);
       const parts = (out.PATH ?? '').split(delimiter);
       expect(parts[0]).toBe('/usr/bin'); // existing entries win (append, never prepend)
+      expect(parts).toContain(papercuspBin);
       expect(parts).toContain(localBin);
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -453,11 +457,16 @@ describe('withAgentBinDirs (EI-11519 stripped-PATH spawn fix)', () => {
   it('returns the env unchanged when every existing well-known dir is already on PATH', () => {
     const home = mkdtempSync(join(tmpdir(), 'wabd-'));
     try {
+      const papercuspBin = join(home, '.papercusp', 'bin');
       const localBin = join(home, '.local', 'bin');
+      mkdirSync(papercuspBin, { recursive: true });
       mkdirSync(localBin, { recursive: true });
       // PATH already carries the only well-known dir that exists under this HOME
       // (the real linuxbrew dir may exist on the host, so include it too).
-      const env = { HOME: home, PATH: `/usr/bin:${localBin}:/home/linuxbrew/.linuxbrew/bin` };
+      const env = {
+        HOME: home,
+        PATH: `/usr/bin:${papercuspBin}:${localBin}:/home/linuxbrew/.linuxbrew/bin`,
+      };
       const out = withAgentBinDirs(env);
       expect(out).toBe(env); // identity — no copy, no mutation
     } finally {
