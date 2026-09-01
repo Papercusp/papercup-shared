@@ -4,7 +4,7 @@
  */
 import { test, afterEach } from 'vitest';
 import assert from 'node:assert/strict';
-import { normalizeModelForClaude, headersToRecord, buildSystemParam, CLAUDE_CODE_IDENTIFIER, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, ownerHeaders, routeAccountHeaders, GATEWAY_PRIORITY_HEADER, GATEWAY_OWNER_HEADER, ROUTE_ACCOUNT_HEADER, retryLadderDeadlineExceeded, governorForStatelessTransport } from './chat-stream';
+import { normalizeModelForClaude, splitCliModelSpec, claudeModelSelectionArgs, codexModelSelectionArgs, headersToRecord, buildSystemParam, CLAUDE_CODE_IDENTIFIER, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, ownerHeaders, routeAccountHeaders, GATEWAY_PRIORITY_HEADER, GATEWAY_OWNER_HEADER, ROUTE_ACCOUNT_HEADER, retryLadderDeadlineExceeded, governorForStatelessTransport } from './chat-stream';
 
 // EI-20394554339706750: the local inference gateway is already the pooled admission authority.
 // The process-local provider singleton used to sit in front of it with maxConcurrent=3, so three
@@ -216,6 +216,36 @@ test('normalizeModelForClaude — leaves a bare id or alias untouched', () => {
 
 test('normalizeModelForClaude — empty in → empty out', () => {
   assert.equal(normalizeModelForClaude(''), '');
+});
+
+test('splitCliModelSpec — recognizes only a registered reasoning suffix', () => {
+  assert.deepEqual(splitCliModelSpec('gpt-5.6-luna:low'), { model: 'gpt-5.6-luna', effort: 'low' });
+  assert.deepEqual(splitCliModelSpec('openai-codex/gpt-5.6-luna:XHIGH'), {
+    model: 'gpt-5.6-luna',
+    effort: 'xhigh',
+  });
+  // A colon-bearing model id whose tail is not an effort remains one model id.
+  assert.deepEqual(splitCliModelSpec('chatgpt:5.4'), { model: 'chatgpt:5.4' });
+});
+
+test('claudeModelSelectionArgs — sends effort through Claude Code\'s own flag', () => {
+  assert.deepEqual(claudeModelSelectionArgs('sonnet[1m]:high'), [
+    '--model',
+    'sonnet[1m]',
+    '--effort',
+    'high',
+  ]);
+  assert.deepEqual(claudeModelSelectionArgs('sonnet[1m]'), ['--model', 'sonnet[1m]']);
+});
+
+test('codexModelSelectionArgs — sends luna:low as a bare model plus reasoning config', () => {
+  assert.deepEqual(codexModelSelectionArgs('gpt-5.6-luna:low'), [
+    '-m',
+    'gpt-5.6-luna',
+    '-c',
+    'model_reasoning_effort="low"',
+  ]);
+  assert.deepEqual(codexModelSelectionArgs('gpt-5.6-luna'), ['-m', 'gpt-5.6-luna']);
 });
 
 // buildSystemParam (RB-008 + claude-code-system-framing 2026-06-30): the FIRST block is ALWAYS the
