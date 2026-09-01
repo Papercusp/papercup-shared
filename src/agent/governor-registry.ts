@@ -13,7 +13,7 @@
  * them up from the provider's `*-ratelimit-*-limit` headers when available (API-key paths).
  */
 import type { TurnBackend, TurnProvider } from './turn-error';
-import { RateLimitGovernor, type GovernorLimits, type GovernorDeps, type GovernorState, type GovernorPauseEvent, type GovernorStore, type GlobalConcurrencyGate } from '../resilience/governor';
+import { RateLimitGovernor, type GovernorLimits, type GovernorDeps, type GovernorState, type GovernorPauseEvent, type GovernorStore, type GlobalConcurrencyGate, type GlobalFeedbackEvent } from '../resilience/governor';
 
 export type LimitModel = 'subscription' | 'apiKey';
 
@@ -130,6 +130,12 @@ export interface EffectiveConcurrencySnapshot {
  * used by the production wrappers and hermetic tests.
  */
 export interface GlobalConcurrencyGateController extends GlobalConcurrencyGate {
+  // Narrowed from the base interface's optional signature: this controller's factory
+  // (createGlobalConcurrencyGate below) always implements both hooks unconditionally, so
+  // callers holding a GlobalConcurrencyGateController — unlike a generic GlobalConcurrencyGate,
+  // which some implementations may omit — never need the `?.()` guard.
+  noteClean(ev?: GlobalFeedbackEvent): void;
+  notePenalty(ev?: GlobalFeedbackEvent): void;
   setCap(n: number | undefined): void;
   setFloor(n: number | undefined): void;
   setSeed(n: number | undefined): void;
