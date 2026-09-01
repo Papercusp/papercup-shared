@@ -663,6 +663,9 @@ export type ChatEvent =
       /** Provider terminal reason when reported (for example Anthropic's
           `end_turn` or `max_tokens`). Undefined on backends that do not expose it. */
       stopReason?: string | null;
+      /** Gateway account that actually served the request. The request-side pin
+          is not authoritative because the gateway may fail over. */
+      servedAccount?: string;
       /** Agent-loop turn count, when the backend reports it (claude-code's
           terminal `result.num_turns`). Undefined for backends that don't
           surface it (anthropic-direct/omp/codex). Lets a consumer record the
@@ -1332,6 +1335,8 @@ async function* statelessAgentChat(
         : 1;
       const p = anthropicPriceFor(opts.model);
       const costUsd = (inputTokens * p.in + outputTokens * p.out) / 1_000_000;
+      const headers = headersToRecord(stream.response?.headers);
+      const servedAccount = servedAccountFromHeaders(headers);
       // Usage telemetry (D-002 capture point 1): tokens + the raw response's ratelimit headers.
       emitStatelessUsage({
         model: opts.model,
@@ -1340,7 +1345,7 @@ async function* statelessAgentChat(
         cacheReadTokens: resp.usage?.cache_read_input_tokens ?? undefined,
         cacheCreationTokens: resp.usage?.cache_creation_input_tokens ?? undefined,
         costUsd,
-        headers: headersToRecord(stream.response?.headers),
+        headers,
         attribution: opts.usageAttribution,
       });
       if (finalText) yield { type: 'delta', text: finalText };
@@ -1351,6 +1356,7 @@ async function* statelessAgentChat(
         tokensOut: outputTokens,
         finalText,
         stopReason: resp.stop_reason,
+        ...(servedAccount ? { servedAccount } : {}),
         ...(unreportedFrames !== undefined ? { unreportedFrames } : {}),
       };
       return;
@@ -1495,6 +1501,13 @@ export function headersToRecord(h: unknown): Record<string, string | undefined> 
   return o;
 }
 
+const ROUTED_ACCOUNT_HEADER = 'x-papercusp-routed-account';
+
+function servedAccountFromHeaders(headers: Record<string, string | undefined> | undefined): string | undefined {
+  const account = headers?.[ROUTED_ACCOUNT_HEADER]?.trim();
+  return account || undefined;
+}
+
 /**
  * Governed stateless request (agent-turn-robustness P-004): the SAME single request as the
  * loop above, but run through `runAgentTurn` + a transport-appropriate `RateLimitGovernor`.
@@ -1560,6 +1573,7 @@ async function* governedStatelessChat(
     tokensOut: number;
     costUsd: number;
     stopReason?: string | null;
+    servedAccount?: string;
     unreportedFrames?: number;
   };
   const result = await runAgentTurn<V>(
@@ -1609,6 +1623,7 @@ async function* governedStatelessChat(
       tokensOut: result.value.tokensOut,
       finalText: result.value.finalText,
       ...(result.value.stopReason !== undefined ? { stopReason: result.value.stopReason } : {}),
+      ...(result.value.servedAccount ? { servedAccount: result.value.servedAccount } : {}),
       ...(result.value.unreportedFrames !== undefined
         ? { unreportedFrames: result.value.unreportedFrames }
         : {}),
@@ -1662,6 +1677,7 @@ async function* governedStatelessChat(
           const p = anthropicPriceFor(model);
           const costUsd = (tokensIn * p.in + tokensOut * p.out) / 1_000_000;
           const headers = headersToRecord(stream.response?.headers);
+          const servedAccount = servedAccountFromHeaders(headers);
           // Usage telemetry (D-002 capture point 1) — tokens + ratelimit headers when present.
           emitStatelessUsage({
             model,
@@ -1683,6 +1699,7 @@ async function* governedStatelessChat(
               tokensOut,
               costUsd,
               stopReason: resp.stop_reason,
+              ...(servedAccount ? { servedAccount } : {}),
               ...(unreportedFrames !== undefined ? { unreportedFrames } : {}),
             },
             ...(headers ? { headers } : {}),
