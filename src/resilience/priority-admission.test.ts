@@ -565,10 +565,20 @@ test('an abandoned waiter is REMOVED from the queue, not left to age and outrank
   await tick();
   assert.equal(q.size, 2, 'both are waiting behind the blocker');
 
+  // Attach the rejection expectation BEFORE aborting: the queue rejects the
+  // abandoned promise synchronously inside `abort()`, so a handler attached
+  // only after the `tick()` below leaves it unhandled across a macrotask
+  // boundary — vitest's onUnhandledError then fails the FILE (measured: gate
+  // run 93ddca4e, 2026-09-02, "AdmissionAbandonedError: admission abandoned by
+  // caller after 1ms waiting" with every test in the file passing).
+  const abandonedRejects = assert.rejects(
+    abandoned,
+    (e: Error) => e.name === 'AdmissionAbandonedError',
+  );
   ac.abort();
   await tick();
   assert.equal(q.size, 1, 'the abandoned waiter is gone from the queue');
-  await assert.rejects(abandoned, (e: Error) => e.name === 'AdmissionAbandonedError');
+  await abandonedRejects;
 
   release();
   assert.equal(await live, 'live', 'the live caller still gets its slot');
