@@ -99,6 +99,21 @@ interface Waiter<T> {
   resolve: (v: T) => void;
   reject: (e: unknown) => void;
   seq: number;
+  /** Detach this waiter's abort listener. Called EXACTLY once, the moment the waiter leaves
+   *  `waiters` — whether it was admitted or abandoned — so a long-lived caller signal cannot
+   *  accumulate listeners for the life of the process. Absent when the caller passed no signal. */
+  cleanup?: () => void;
+}
+
+/** Thrown to a caller whose queued request was abandoned (its `signal` aborted) before admission.
+ *  Distinct from `QueueFullError`: nothing was refused, the CALLER left. */
+export class AdmissionAbandonedError extends Error {
+  readonly waitedMs: number;
+  constructor(waitedMs: number) {
+    super(`admission abandoned by caller after ${waitedMs}ms waiting`);
+    this.name = 'AdmissionAbandonedError';
+    this.waitedMs = waitedMs;
+  }
 }
 
 /** Per-tier admission breakdown (priority-tiers /stats). */
@@ -255,14 +270,56 @@ export class PriorityAdmissionQueue {
    *
    *  `opts.tier` (1 = highest band) drives the optional tier layer; it is IGNORED when the queue was
    *  constructed without `tiers` (legacy behavior). Omitting it ⇒ tier 1 (the privileged lane). */
-  run<T>(priority: number, task: () => Promise<T>, opts?: { tier?: number }): Promise<T> {
+  run<T>(
+    priority: number,
+    task: () => Promise<T>,
+    opts?: { tier?: number; signal?: AbortSignal },
+  ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
+      const signal = opts?.signal;
+      if (signal?.aborted) {
+        reject(new AdmissionAbandonedError(0));
+        return;
+      }
       if (this.maxQueued > 0 && this.running >= this.maxConcurrent && this.waiters.length >= this.maxQueued) {
         reject(new QueueFullError(this.waiters.length, this.maxQueued));
         return;
       }
       const tier = this.tiered ? Math.max(1, Math.floor(opts?.tier ?? 1)) : 1;
-      this.waiters.push({ priority, tier, enqueuedAt: this.now(), task, resolve, reject, seq: this.seq++ });
+      const waiter: Waiter<T> = { priority, tier, enqueuedAt: this.now(), task, resolve, reject, seq: this.seq++ };
+      this.waiters.push(waiter);
+
+      // THE ABANDONED-WAITER LEAK (WI-2140943, measured outage 2026-09-02).
+      //
+      // Before this, `run()` had NO cancellation path: a waiter could leave `waiters` only by being
+      // ADMITTED. So when a caller gave up — an agent CLI hitting its request timeout, a session
+      // killed, a client socket closed — its waiter stayed queued forever, still holding a priority
+      // and still AGING. Aging made it worse rather than self-limiting: an abandoned waiter's
+      // effective priority climbs with age, so the deadest entries outranked live traffic and were
+      // admitted first, spending a real slot on a caller that had already gone.
+      //
+      // That is a RATCHET, and it is why the queue never recovered on its own. Measured: 1,206
+      // queued against a window of 18 while upstream was clean (0 429s, 7 healthy accounts); the
+      // owner's desktop sessions timed out behind it, and RESUMING them only appended a fresh
+      // waiter to the back of the same queue. A gateway restart dropped the depth to ~5 under
+      // identical demand — proving ~1,190 of those waiters had no caller left.
+      //
+      // Removing an abandoned waiter is therefore not an optimization; it is what makes the queue's
+      // depth mean "work someone is still waiting for". Note the `indexOf` guard: once pump() has
+      // spliced this waiter out, the task OWNS the slot and abort is no longer ours to act on —
+      // tearing down an in-flight upstream call is the transport's job, not the queue's.
+      if (signal) {
+        const onAbort = () => {
+          const i = this.waiters.indexOf(waiter as Waiter<unknown>);
+          if (i < 0) return; // already admitted — the running task owns cancellation from here
+          this.waiters.splice(i, 1);
+          reject(new AdmissionAbandonedError(this.now() - waiter.enqueuedAt));
+          // A freed slot may now admit someone else, so keep the pump honest.
+          this.pump();
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        waiter.cleanup = () => signal.removeEventListener('abort', onAbort);
+      }
       this.pump();
     });
   }
@@ -288,6 +345,9 @@ export class PriorityAdmissionQueue {
       }
       if (bestIdx === -1) break; // nothing admissible (e.g. only tier > 1 waiters left, reserve held)
       const w = this.waiters.splice(bestIdx, 1)[0];
+      // Admitted: detach the abandon listener. From here the task owns the request, so a later
+      // abort must NOT reject this promise out from under a call that is already in flight.
+      w.cleanup?.();
       this.running++;
       if (this.tiered) this.inFlightByTier.set(w.tier, (this.inFlightByTier.get(w.tier) ?? 0) + 1);
       const onSettle = () => {
