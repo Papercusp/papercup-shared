@@ -543,3 +543,65 @@ test('P-005/W3: a task that never settles holds exactly its slot (the real leak,
   await tick();
   assert.equal(q.inFlight, 0, 'once the stuck task settles, running returns to 0');
 });
+
+// ── Abandoned-waiter cancellation (WI-2140943) ───────────────────────────────────────────────
+// The leak these pin: before `run()` accepted a signal, a waiter could leave `waiters` ONLY by
+// being admitted. A caller that gave up (agent CLI request timeout, killed session, closed
+// socket) left its waiter queued forever — and because effective priority AGES, the deadest
+// entries outranked live traffic and were admitted first, spending real slots on nobody.
+// Measured 2026-09-02: 1,206 queued against a window of 18 with upstream clean (0 429s);
+// a gateway restart dropped it to ~5 under identical demand, so ~1,190 had no caller left.
+
+test('an abandoned waiter is REMOVED from the queue, not left to age and outrank live traffic', async () => {
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 1 });
+  let release!: () => void;
+  void q.run(0, () => new Promise<void>((r) => (release = r)));
+  await tick();
+  assert.equal(q.inFlight, 1, 'blocker occupies the only slot');
+
+  const ac = new AbortController();
+  const abandoned = q.run(0, async () => 'must-never-run', { signal: ac.signal });
+  const live = q.run(0, async () => 'live');
+  await tick();
+  assert.equal(q.size, 2, 'both are waiting behind the blocker');
+
+  ac.abort();
+  await tick();
+  assert.equal(q.size, 1, 'the abandoned waiter is gone from the queue');
+  await assert.rejects(abandoned, (e: Error) => e.name === 'AdmissionAbandonedError');
+
+  release();
+  assert.equal(await live, 'live', 'the live caller still gets its slot');
+});
+
+test('aborting AFTER admission does not reject the in-flight task — the task owns the slot', async () => {
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 1 });
+  const ac = new AbortController();
+  let release!: (v: string) => void;
+  const running = q.run(0, () => new Promise<string>((r) => (release = r)), { signal: ac.signal });
+  await tick();
+  assert.equal(q.inFlight, 1, 'admitted immediately — nothing was waiting');
+
+  ac.abort(); // e.g. res 'close' firing on NORMAL completion
+  await tick();
+  release('completed');
+  assert.equal(await running, 'completed', 'an admitted task settles normally despite a late abort');
+});
+
+test('a signal already aborted before run() never enqueues at all', async () => {
+  const q = new PriorityAdmissionQueue({ maxConcurrent: 1 });
+  const ac = new AbortController();
+  ac.abort();
+  let ran = false;
+  const p = q.run(
+    0,
+    async () => {
+      ran = true;
+      return 'x';
+    },
+    { signal: ac.signal },
+  );
+  await assert.rejects(p, (e: Error) => e.name === 'AdmissionAbandonedError');
+  assert.equal(ran, false, 'the task never ran');
+  assert.equal(q.size, 0, 'nothing was left in the queue');
+});
