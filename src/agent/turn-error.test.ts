@@ -390,3 +390,79 @@ test('classifyTurnError — dispatches by backend shape', () => {
   assert.equal(classifyTurnError('omp', { exitCode: 0, stdout: '' }).class, 'empty_output');
   assert.equal(classifyTurnError('codex', { exitCode: 137, signal: 'SIGKILL' }).class, 'agent_crash');
 });
+
+// --- classifiedOn: the class's own evidence (WI-2143683) ---
+// `class` is decided by scanning stderr+stdout together; `message` is taken from stderr whenever
+// stderr is non-empty. So on a failed exit whose provider wall went to STDOUT, the two come from
+// different streams and the quoted message does not support the class printed beside it. Measured
+// over the 191 `LOOP WEDGED` alerts loop-turn-outcome had filed: 41 of 59 `usage_limit` ones quoted
+// a message with no usage-limit signature in it, which reads as a misclassification to the agent
+// who claims the alert. `classifiedOn` carries the text the class actually rests on.
+
+test('classifiedOn — usage wall on STDOUT with unrelated stderr: message and class disagree, classifiedOn resolves it', () => {
+  // The exact shape behind EI-21914072944446087: a SessionEnd hook failure on stderr while the
+  // provider wall printed to stdout (the normal case per classifySubprocessResult's own comment).
+  const e = classifySubprocessResult({
+    exitCode: 1,
+    stderr: 'SessionEnd hook [/home/u/.papercusp/hooks/cc/lifecycle-report.sh] failed: Hook cancelled',
+    stdout: "starting turn\nAPI Error: You've hit your usage limit · limit resets 4:20am\n",
+  });
+  assert.equal(e.class, 'usage_limit');
+  // The message is the stderr text — and on its own it is NOT evidence for `usage_limit`.
+  assert.match(e.message, /Hook cancelled/);
+  assert.doesNotMatch(e.message, /usage limit/i);
+  // classifiedOn carries what the class actually rests on.
+  assert.equal(e.classifiedOn, "API Error: You've hit your usage limit · limit resets 4:20am");
+});
+
+test('classifiedOn — is the matched LINE only, never the surrounding output', () => {
+  const e = classifySubprocessResult({
+    exitCode: 1,
+    stderr: 'hook failed',
+    stdout: 'line before\n403 Forbidden: invalid api key\nline after\n',
+  });
+  assert.equal(e.class, 'auth');
+  assert.equal(e.classifiedOn, '403 Forbidden: invalid api key');
+});
+
+test('classifiedOn — absent when the message ALREADY shows the evidence (no redundancy)', () => {
+  // stderr empty ⇒ errText falls back to stdout ⇒ message already IS the matched text.
+  const onStdout = classifySubprocessResult({ exitCode: 1, stderr: '', stdout: "You've hit your usage limit" });
+  assert.equal(onStdout.class, 'usage_limit');
+  assert.equal(onStdout.classifiedOn, undefined);
+  // Wall on stderr ⇒ message is the stderr text, which contains the match.
+  const onStderr = classifySubprocessResult({ exitCode: 1, stderr: 'Error: 429 Too Many Requests' });
+  assert.equal(onStderr.class, 'rate_limited');
+  assert.equal(onStderr.classifiedOn, undefined);
+});
+
+test('classifiedOn — never set on the malformed-Authorization branch (no raw credential echo)', () => {
+  // That branch builds its own redacted diagnostic precisely so a live bearer is never persisted;
+  // echoing a raw matched line there would reintroduce what the redaction exists to prevent.
+  const e = classifySubprocessResult({
+    exitCode: 1,
+    stderr: 'unrelated stderr noise',
+    stdout: 'failed to convert header to a str for header name "authorization": Bearer sk-ant-SECRET',
+  });
+  assert.equal(e.class, 'auth');
+  assert.equal(e.classifiedOn, undefined);
+  assert.doesNotMatch(JSON.stringify(e), /sk-ant-SECRET/);
+});
+
+test('classifiedOn — absent for classes decided without a pattern match', () => {
+  assert.equal(classifySubprocessResult({ exitCode: null, timedOut: true }).classifiedOn, undefined);
+  assert.equal(classifySubprocessResult({ exitCode: 137, signal: 'SIGKILL' }).classifiedOn, undefined);
+  assert.equal(classifySubprocessResult({ exitCode: 3, stderr: 'some ordinary crash' }).classifiedOn, undefined);
+});
+
+test('classifiedOn — does not disturb resetAt/resetPrecision on the usage branch', () => {
+  const now = Date.parse('2026-09-03T10:00:00Z');
+  const e = classifySubprocessResult(
+    { exitCode: 1, stderr: 'hook failed', stdout: "You've hit your usage limit · limit resets 4:20am" },
+    'anthropic',
+    now,
+  );
+  assert.equal(e.class, 'usage_limit');
+  assert.ok(e.classifiedOn, 'classifiedOn should be populated');
+  assert.ok(e.resetAt !== undefined, 'resetAt must still be parsed alongside classifiedOn');
+});

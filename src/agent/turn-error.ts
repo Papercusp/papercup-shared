@@ -83,6 +83,17 @@ export interface TurnError {
   surfaceToUser?: boolean;
   /** Structured admission fact from the governor/gateway; never infer this from message text. */
   admissionDenial?: AdmissionDenial;
+  /**
+   * The text the CLASS was actually decided on, when `message` does not already show it.
+   *
+   * `class` is chosen by scanning stderr and stdout TOGETHER (the CLIs print provider walls to
+   * stdout), while `message` is taken from stderr whenever stderr is non-empty — so on a failed
+   * exit with anything at all on stderr, the class rests on text `message` cannot contain, and a
+   * consumer quoting `message` displays evidence that does not support the class printed beside
+   * it. Absent when `message` is already good evidence, so its presence means "the quoted message
+   * is NOT why this was classified this way — this is". See `classifiedOnFrom` (WI-2143683).
+   */
+  classifiedOn?: string;
 }
 
 const RETRYABLE: ReadonlySet<TurnErrorClass> = new Set<TurnErrorClass>([
@@ -116,6 +127,28 @@ export function isAccountWide(cls: TurnErrorClass): boolean {
 
 function mk(cls: TurnErrorClass, message: string, provider: TurnProvider, extra?: Partial<TurnError>): TurnError {
   return { class: cls, message, provider, retryable: RETRYABLE.has(cls), surfaceToUser: SURFACE_TO_USER.has(cls), ...extra };
+}
+
+/**
+ * Populate `classifiedOn` for a pattern-decided class: the LINE of `scan` that `re` matched.
+ *
+ * A line is the unit the CLI actually printed, so the excerpt cannot sprawl the way a fixed
+ * character window around a match would, and it stays readable in an alert body. Returns nothing
+ * when `message` already contains that text (the stderr-empty case, where `message` IS the
+ * evidence) so the field is never redundant — see the `classifiedOn` doc for why it exists.
+ *
+ * Deliberately NOT applied to the malformed-Authorization branch: that one builds its own
+ * redacted diagnostic precisely so a live bearer credential is never persisted, and echoing a
+ * raw matched line there would reintroduce exactly what it exists to prevent.
+ */
+function classifiedOnFrom(scan: string, re: RegExp, message: string): Pick<TurnError, 'classifiedOn'> | undefined {
+  const m = re.exec(scan);
+  if (!m) return undefined;
+  const from = scan.lastIndexOf('\n', m.index) + 1;
+  const to = scan.indexOf('\n', m.index);
+  const text = ((to === -1 ? scan.slice(from) : scan.slice(from, to)).trim() || m[0]).trim();
+  if (!text || message.includes(text)) return undefined;
+  return { classifiedOn: text.slice(0, 200) };
 }
 
 /** `retry-after` is either delta-seconds or an HTTP-date. Returns ms, or undefined. */
@@ -514,18 +547,18 @@ export function classifySubprocessResult(
   // fixed. Detect them before provider-wall patterns so a descriptive 400/429
   // wrapper cannot turn a context failure into a retryable backoff class.
   if (CONTEXT_OVERFLOW_RE.test(scan)) {
-    return mk('context_overflow', errText.slice(0, 200) || 'context window exceeded', provider);
+    const message = errText.slice(0, 200) || 'context window exceeded';
+    return mk('context_overflow', message, provider, classifiedOnFrom(scan, CONTEXT_OVERFLOW_RE, message));
   }
   // Plan/usage CAP first (opposite disposition to a transient 429): pause-until-reset + surface,
   // no retry. The CLI prints the reset in the message ("resets 4:20am"), so parse it best-effort.
   if (USAGE_LIMIT_RE.test(scan) && !TRANSIENT_OVERRIDE_RE.test(scan)) {
     const reset = parseUsageReset(scan, now);
-    return mk(
-      'usage_limit',
-      errText.slice(0, 200) || 'usage limit reached',
-      provider,
-      reset !== undefined ? { resetAt: reset.atMs, resetPrecision: reset.precision } : undefined,
-    );
+    const message = errText.slice(0, 200) || 'usage limit reached';
+    return mk('usage_limit', message, provider, {
+      ...(reset !== undefined ? { resetAt: reset.atMs, resetPrecision: reset.precision } : {}),
+      ...classifiedOnFrom(scan, USAGE_LIMIT_RE, message),
+    });
   }
   if (RATE_RE.test(scan)) {
     // Some CLIs print "retry after 30s" / "try again in 12 seconds".
@@ -536,11 +569,21 @@ export function classifySubprocessResult(
       const unit = (m[2] ?? 's').toLowerCase();
       retryAfterMs = unit.startsWith('ms') ? n : unit.startsWith('m') ? n * 60_000 : n * 1000;
     }
-    return mk('rate_limited', errText.slice(0, 200) || 'rate limited', provider, { retryAfterMs });
+    const message = errText.slice(0, 200) || 'rate limited';
+    return mk('rate_limited', message, provider, { retryAfterMs, ...classifiedOnFrom(scan, RATE_RE, message) });
   }
-  if (OVERLOAD_RE.test(scan)) return mk('overloaded', errText.slice(0, 200), provider);
-  if (AUTH_RE.test(scan)) return mk('auth', errText.slice(0, 200), provider);
-  if (IO_RE.test(scan)) return mk('transient_io', errText.slice(0, 200), provider);
+  if (OVERLOAD_RE.test(scan)) {
+    const message = errText.slice(0, 200);
+    return mk('overloaded', message, provider, classifiedOnFrom(scan, OVERLOAD_RE, message));
+  }
+  if (AUTH_RE.test(scan)) {
+    const message = errText.slice(0, 200);
+    return mk('auth', message, provider, classifiedOnFrom(scan, AUTH_RE, message));
+  }
+  if (IO_RE.test(scan)) {
+    const message = errText.slice(0, 200);
+    return mk('transient_io', message, provider, classifiedOnFrom(scan, IO_RE, message));
+  }
   if (input.signal) return mk('agent_crash', `killed by ${input.signal}`, provider);
   if (input.exitCode !== 0 && input.exitCode !== null) {
     return mk('agent_crash', errText.slice(0, 200) || `exit ${input.exitCode}`, provider);
