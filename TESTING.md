@@ -1,4 +1,4 @@
-# TESTING — @restart/papercusp-shared
+# TESTING — @papercusp/papercusp-shared
 
 ## What this project's tests cover
 
@@ -30,8 +30,10 @@
 
 | Edit touches                        | Run                                                   |
 | ----------------------------------- | ----------------------------------------------------- |
-| Anything in this workspace          | `npm test --workspace @restart/papercusp-shared`       |
+| Anything in this workspace          | `npm test --workspace @papercusp/papercusp-shared`     |
 | Code that other workspaces depend on| `npm run test:affected` from repo root                |
 | Briefings / plugin-config schema    | `npm run test:all:integration` (operator suite picks it up) |
+
+This repository is npm-only; do not substitute `pnpm` or `yarn` for these commands.
 
 See repo-root `CLAUDE.md` and `apps/operator/content/docs/testing/` for the full strategy.
