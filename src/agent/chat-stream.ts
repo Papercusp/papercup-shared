@@ -92,6 +92,14 @@ export interface StatelessUsageAttribution {
   runId?: string;
   sessionId?: string;
   toolName?: string;
+  /** WI-2144763: which harness this spend was FOR. The host binds it straight onto
+   *  `agent_usage_samples.harness_slug`, which every `source:'headers'` row left NULL
+   *  (18,228 rows / ~$755) purely because this field did not exist — the column, the
+   *  INSERT and the sink all already carried it. Only set it when the caller genuinely
+   *  KNOWS the harness (scout/gym cycles take `harnessSlug` as a first-class param);
+   *  leave it undefined for workspace-global work rather than guessing, since a wrong
+   *  slug is worse than an honest NULL. */
+  harnessSlug?: string;
 }
 let statelessUsageSink: ((ev: StatelessUsageEvent) => void) | undefined;
 /** Install (or clear) the host's usage-telemetry sink. Call once at operator boot. */
