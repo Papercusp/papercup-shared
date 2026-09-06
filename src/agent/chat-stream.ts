@@ -1651,6 +1651,7 @@ async function* governedStatelessChat(
     {
       backend: 'anthropic-direct',
       maxAttempts: 8,
+      signal: opts.signal,
       priorityTier: tierOf(opts.priority),
       ...(opts.governorMaxWaitMs !== undefined ? { maxWaitMs: opts.governorMaxWaitMs } : {}),
     },
