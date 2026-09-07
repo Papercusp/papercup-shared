@@ -2543,6 +2543,27 @@ export async function* runAgentChat(
   const handleCodexEvent = (ev: any) => {
     if (!ev || typeof ev !== 'object') return;
 
+    // `codex exec --json` grows new item/event variants independently of this
+    // adapter. In debug runs, retain only the bounded routing fields for every
+    // non-message item plus terminal errors so an ignored compositor event is
+    // diagnosable without logging tool arguments, prompts, or credentials.
+    const debugItem = ev.item && typeof ev.item === 'object' ? ev.item : null;
+    if (
+      process.env.PAPERCUSP_AGENT_DEBUG
+      && (
+        ev.type === 'error'
+        || ev.type === 'turn.failed'
+        || (typeof ev.type === 'string' && ev.type.startsWith('item.') && debugItem?.type !== 'agent_message')
+      )
+    ) {
+      console.error(
+        '[chat-stream][codex-jsonl] ' +
+          `event=${String(ev.type ?? '')} itemType=${String(debugItem?.type ?? '')} ` +
+          `server=${String(debugItem?.server ?? '')} tool=${String(debugItem?.tool ?? debugItem?.name ?? '')} ` +
+          `status=${String(debugItem?.status ?? '')}`,
+      );
+    }
+
     if (ev.type === 'item.completed' && ev.item && typeof ev.item === 'object') {
       const item = ev.item;
       if (item.type === 'agent_message' && typeof item.text === 'string') {
