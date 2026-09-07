@@ -4,7 +4,7 @@
  */
 import { test, afterEach } from 'vitest';
 import assert from 'node:assert/strict';
-import { normalizeModelForClaude, splitCliModelSpec, claudeModelSelectionArgs, codexModelSelectionArgs, estimateCodexUsageCost, codexMcpToolFilterInput, headersToRecord, buildSystemParam, CLAUDE_CODE_IDENTIFIER, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, ownerHeaders, routeAccountHeaders, GATEWAY_PRIORITY_HEADER, GATEWAY_OWNER_HEADER, ROUTE_ACCOUNT_HEADER, retryLadderDeadlineExceeded, governorForStatelessTransport } from './chat-stream';
+import { normalizeModelForClaude, splitCliModelSpec, claudeModelSelectionArgs, codexModelSelectionArgs, estimateCodexUsageCost, codexMcpToolFilterInput, codexMcpFailureDebugFields, headersToRecord, buildSystemParam, CLAUDE_CODE_IDENTIFIER, promptCacheEnabled, claudeSpawnEnvOverrides, parseClaudeResultEvent, codexMcpConfigToml, codexGatewayConfigToml, priorityTierHeaders, ownerHeaders, routeAccountHeaders, GATEWAY_PRIORITY_HEADER, GATEWAY_OWNER_HEADER, ROUTE_ACCOUNT_HEADER, retryLadderDeadlineExceeded, governorForStatelessTransport } from './chat-stream';
 
 // EI-20394554339706750: the local inference gateway is already the pooled admission authority.
 // The process-local provider singleton used to sit in front of it with maxConcurrent=3, so three
@@ -272,6 +272,63 @@ test('codexMcpToolFilterInput — reconstructs the shared qualified MCP name', (
     codexMcpToolFilterInput('agentmcp', 'mcp__agentmcp__plans_get'),
     'mcp__agentmcp__plans_get',
   );
+});
+
+test('codexMcpFailureDebugFields — classifies structured MCP errors without exposing raw detail', () => {
+  const fields = codexMcpFailureDebugFields({
+    type: 'mcp_tool_call',
+    status: 'failed',
+    arguments: { Authorization: 'Bearer ARGUMENT_SECRET' },
+    error: {
+      code: -32602,
+      message: 'Invalid params for token CREDENTIAL_SECRET',
+      data: { details: 'schema rejected password=PASSWORD_SECRET' },
+    },
+  });
+  assert.deepEqual(fields, {
+    failureClass: 'invalid_request',
+    detailSources: 'error',
+    errorShape: 'object:code,data,message',
+    resultShape: 'undefined',
+    scannedChars: 83,
+    errorCode: '-32602',
+  });
+  assert.doesNotMatch(JSON.stringify(fields), /ARGUMENT_SECRET|CREDENTIAL_SECRET|PASSWORD_SECRET|Bearer|password/);
+});
+
+test('codexMcpFailureDebugFields — reads CallToolResult-style content but logs only its safe shape', () => {
+  const fields = codexMcpFailureDebugFields({
+    type: 'mcp_tool_call',
+    status: 'failed',
+    result: {
+      isError: true,
+      content: [{ type: 'text', text: 'The tool is unavailable in this session. api_key=RESULT_SECRET' }],
+    },
+  });
+  assert.equal(fields.failureClass, 'unavailable');
+  assert.equal(fields.detailSources, 'result');
+  assert.equal(fields.errorShape, 'undefined');
+  assert.equal(fields.resultShape, 'object:content,isError');
+  assert.equal(fields.resultIsError, true);
+  assert.ok(fields.scannedChars > 0 && fields.scannedChars <= 2_048);
+  assert.doesNotMatch(JSON.stringify(fields), /RESULT_SECRET|api_key/);
+});
+
+test('codexMcpFailureDebugFields — unknown shapes remain bounded and honest', () => {
+  const fields = codexMcpFailureDebugFields({
+    type: 'mcp_tool_call',
+    status: 'failed',
+    error: { privateBlob: 'SECRET'.repeat(10_000) },
+    result: null,
+  });
+  assert.deepEqual(fields, {
+    failureClass: 'unknown',
+    detailSources: 'error,result',
+    errorShape: 'object',
+    resultShape: 'null',
+    scannedChars: 0,
+  });
+  assert.ok(JSON.stringify(fields).length < 180);
 });
 
 // buildSystemParam (RB-008 + claude-code-system-framing 2026-06-30): the FIRST block is ALWAYS the

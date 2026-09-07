@@ -1185,6 +1185,139 @@ export function codexMcpToolFilterInput(server: unknown, tool: string): string {
   return normalizedServer ? `mcp__${normalizedServer}__${tool}` : tool;
 }
 
+export type CodexMcpFailureClass =
+  | 'authorization'
+  | 'cancelled'
+  | 'invalid_request'
+  | 'server_error'
+  | 'timeout'
+  | 'tool_error'
+  | 'transport'
+  | 'unavailable'
+  | 'unknown';
+
+export interface CodexMcpFailureDebugFields {
+  failureClass: CodexMcpFailureClass;
+  detailSources: string;
+  errorShape: string;
+  resultShape: string;
+  scannedChars: number;
+  errorCode?: string;
+  resultIsError?: boolean;
+}
+
+const CODEX_FAILURE_TEXT_KEYS = new Set([
+  'content', 'data', 'detail', 'details', 'error', 'message', 'output', 'result', 'text',
+]);
+const CODEX_FAILURE_SHAPE_KEYS = [
+  'code', 'content', 'data', 'details', 'error', 'is_error', 'isError', 'message', 'output', 'result', 'text',
+] as const;
+const CODEX_FAILURE_SCAN_MAX_CHARS = 2_048;
+
+function codexFailureValueShape(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  if (typeof value !== 'object') return typeof value;
+  const record = value as Record<string, unknown>;
+  const safeKeys = CODEX_FAILURE_SHAPE_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(record, key));
+  return safeKeys.length > 0 ? `object:${safeKeys.join(',')}` : 'object';
+}
+
+function codexFailureText(value: unknown, depth = 0, budget = CODEX_FAILURE_SCAN_MAX_CHARS): string {
+  if (budget <= 0 || value == null) return '';
+  if (typeof value === 'string') return value.slice(0, budget);
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value).slice(0, budget);
+  if (depth >= 4) return '';
+
+  const values = Array.isArray(value)
+    ? value.slice(0, 8)
+    : Object.entries(value as Record<string, unknown>)
+        .filter(([key]) => CODEX_FAILURE_TEXT_KEYS.has(key))
+        .slice(0, 12)
+        .map(([, child]) => child);
+  let out = '';
+  for (const child of values) {
+    const next = codexFailureText(child, depth + 1, budget - out.length);
+    if (!next) continue;
+    out += `${out ? ' ' : ''}${next}`;
+    if (out.length >= budget) break;
+  }
+  return out.slice(0, budget);
+}
+
+function codexFailureClass(text: string, resultIsError: boolean | undefined): CodexMcpFailureClass {
+  if (/cancel(?:led|ed|ation)?|declined|denied by (?:the )?user/i.test(text)) return 'cancelled';
+  if (/\b(?:401|403)\b|unauthenticated|unauthorized|forbidden|permission(?: denied| error)?|not authorized/i.test(text)) {
+    return 'authorization';
+  }
+  if (/timed? out|timeout|deadline exceeded/i.test(text)) return 'timeout';
+  if (/connection|connect(?:ion)? refused|transport|channel closed|socket|econn(?:refused|reset)|fetch failed/i.test(text)) {
+    return 'transport';
+  }
+  if (/not found|unknown tool|tool (?:is )?unavailable|unavailable in this session|does not exist/i.test(text)) {
+    return 'unavailable';
+  }
+  if (/invalid (?:argument|params?|request)|validation|schema|bad request|\b(?:400|422|-32602)\b/i.test(text)) {
+    return 'invalid_request';
+  }
+  if (/server (?:error|overloaded)|internal (?:error|failure)|\b(?:500|502|503|504|-32603|-32001)\b/i.test(text)) {
+    return 'server_error';
+  }
+  if (resultIsError || /\berror\b|\bfailed\b/i.test(text)) return 'tool_error';
+  return 'unknown';
+}
+
+/**
+ * Extract a bounded, non-secret diagnostic from a failed Codex MCP JSONL item.
+ * The raw failure may contain tool output, prompt text, arguments, bearer tokens,
+ * or credentials, so this deliberately returns only a coarse class, safe field
+ * SHAPES, a sanitized machine code, and counts. Raw values never leave memory.
+ */
+export function codexMcpFailureDebugFields(itemValue: unknown): CodexMcpFailureDebugFields {
+  const item = itemValue && typeof itemValue === 'object'
+    ? itemValue as Record<string, unknown>
+    : {};
+  const sources = ['error', 'message', 'result', 'output']
+    .filter((key) => Object.prototype.hasOwnProperty.call(item, key));
+  const result = item.result;
+  const resultRecord = result && typeof result === 'object' && !Array.isArray(result)
+    ? result as Record<string, unknown>
+    : null;
+  const resultIsError = typeof resultRecord?.isError === 'boolean'
+    ? resultRecord.isError
+    : typeof resultRecord?.is_error === 'boolean'
+      ? resultRecord.is_error
+      : undefined;
+  const text = sources
+    .map((key) => codexFailureText(item[key]))
+    .filter(Boolean)
+    .join(' ')
+    .slice(0, CODEX_FAILURE_SCAN_MAX_CHARS);
+
+  const errorRecord = item.error && typeof item.error === 'object' && !Array.isArray(item.error)
+    ? item.error as Record<string, unknown>
+    : null;
+  const nestedError = resultRecord?.error && typeof resultRecord.error === 'object' && !Array.isArray(resultRecord.error)
+    ? resultRecord.error as Record<string, unknown>
+    : null;
+  const rawCode = errorRecord?.code ?? nestedError?.code ?? resultRecord?.code;
+  const safeCode = typeof rawCode === 'number' && Number.isFinite(rawCode)
+    ? String(rawCode)
+    : typeof rawCode === 'string' && /^[A-Za-z0-9_.:-]{1,80}$/.test(rawCode)
+      ? rawCode
+      : undefined;
+
+  return {
+    failureClass: codexFailureClass(text, resultIsError),
+    detailSources: sources.length > 0 ? sources.join(',') : 'none',
+    errorShape: codexFailureValueShape(item.error),
+    resultShape: codexFailureValueShape(result),
+    scannedChars: text.length,
+    ...(safeCode ? { errorCode: safeCode } : {}),
+    ...(resultIsError !== undefined ? { resultIsError } : {}),
+  };
+}
+
 function isTransientLlmError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   // Anthropic SDK APIError surfaces as `<status> <body>` in .message.
@@ -2556,11 +2689,15 @@ export async function* runAgentChat(
         || (typeof ev.type === 'string' && ev.type.startsWith('item.') && debugItem?.type !== 'agent_message')
       )
     ) {
+      const failureFields = debugItem?.type === 'mcp_tool_call' && debugItem?.status === 'failed'
+        ? codexMcpFailureDebugFields(debugItem)
+        : null;
       console.error(
         '[chat-stream][codex-jsonl] ' +
           `event=${String(ev.type ?? '')} itemType=${String(debugItem?.type ?? '')} ` +
           `server=${String(debugItem?.server ?? '')} tool=${String(debugItem?.tool ?? debugItem?.name ?? '')} ` +
-          `status=${String(debugItem?.status ?? '')}`,
+          `status=${String(debugItem?.status ?? '')}` +
+          (failureFields ? ` failure=${JSON.stringify(failureFields)}` : ''),
       );
     }
 
