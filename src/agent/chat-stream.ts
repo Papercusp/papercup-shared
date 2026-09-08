@@ -453,12 +453,22 @@ function gatewayPort(): number {
  * three backends must tier identically or the bug just moves to whichever one is
  * configured.
  */
-export function codexGatewayConfigToml(accountId: string, priority?: string): string {
+export function codexGatewayConfigToml(
+  accountId?: string | null,
+  priority?: string,
+  gatewayOn = false,
+): string {
+  const pinnedAccount = accountId?.trim();
+  // The explicit gateway flag is the unpinned/auto-routing mode. Keep the provider
+  // block when it is enabled even if no account pin was resolved, but never emit an
+  // empty account header (the gateway treats that as a real, invalid account name).
+  if (!pinnedAccount && !gatewayOn) return '';
   const providerId = 'papercusp-codex-gateway';
   const label = priority?.trim();
-  const httpHeaders = [`"${ROUTE_ACCOUNT_HEADER}" = "${tomlStr(accountId)}"`];
+  const httpHeaders: string[] = [];
+  if (pinnedAccount) httpHeaders.push(`"${ROUTE_ACCOUNT_HEADER}" = "${tomlStr(pinnedAccount)}"`);
   if (label) httpHeaders.push(`"${GATEWAY_PRIORITY_HEADER}" = "${tomlStr(label)}"`);
-  return [
+  const lines = [
     '# Per-spawn codex model provider config (managed by chat-stream.ts).',
     `model_provider = "${providerId}"`,
     '',
@@ -467,9 +477,10 @@ export function codexGatewayConfigToml(accountId: string, priority?: string): st
     `base_url = "http://127.0.0.1:${gatewayPort()}/v1"`,
     'wire_api = "responses"',
     'experimental_bearer_token = "papercusp-gateway"',
-    `http_headers = { ${httpHeaders.join(', ')} }`,
-    '',
-  ].join('\n');
+  ];
+  if (httpHeaders.length > 0) lines.push(`http_headers = { ${httpHeaders.join(', ')} }`);
+  lines.push('');
+  return lines.join('\n');
 }
 
 export interface RunAgentChatOptions {
@@ -2148,8 +2159,9 @@ export async function* runAgentChat(
       spawnEnv = { ...process.env, CODEX_HOME: codexHome };
 
       const codexGatewayAccountId = process.env.PAPERCUSP_ACCOUNT_ID?.trim();
+      const codexGatewayOn = process.env.PAPERCUSP_CODEX_GATEWAY === '1';
       const configParts = [
-        codexGatewayAccountId ? codexGatewayConfigToml(codexGatewayAccountId, opts.priority) : '',
+        codexGatewayConfigToml(codexGatewayAccountId, opts.priority, codexGatewayOn),
         opts.mcpConfig ? codexMcpConfigToml(opts.mcpConfig as ClaudeShapeMcpConfig) : '',
       ].filter(Boolean);
       if (configParts.length > 0) {

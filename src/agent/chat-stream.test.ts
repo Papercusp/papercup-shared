@@ -169,6 +169,19 @@ test('codexGatewayConfigToml — routes Codex model traffic through the account-
   assert.match(toml, /http_headers = \{ "x-papercusp-account" = "codex-main" \}/);
 });
 
+test('codexGatewayConfigToml — explicit gateway mode preserves unpinned auto-routing', () => {
+  process.env.PAPERCUSP_GATEWAY_PORT = '9898';
+  const toml = codexGatewayConfigToml(undefined, 'interactive', true);
+  assert.match(toml, /model_provider = "papercusp-codex-gateway"/);
+  assert.match(toml, /base_url = "http:\/\/127\.0\.0\.1:9898\/v1"/);
+  assert.match(toml, /http_headers = \{ "x-papercusp-priority" = "interactive" \}/);
+  assert.doesNotMatch(toml, /x-papercusp-account/);
+});
+
+test('codexGatewayConfigToml — gateway off without an account remains direct', () => {
+  assert.equal(codexGatewayConfigToml(undefined, 'interactive'), '');
+});
+
 // EI-10795 (codex twin): all three backends must tier identically, or the starvation bug
 // simply moves to whichever backend happens to be configured. A codex brain with no tier
 // label admits in the gateway's lowest default band — the same band that left the owner's
