@@ -261,10 +261,10 @@ test('codexModelSelectionArgs — sends luna:low as a bare model plus reasoning 
   assert.deepEqual(codexModelSelectionArgs('gpt-5.6-luna'), ['-m', 'gpt-5.6-luna']);
 });
 
-test('estimateCodexUsageCost — prices luna from the canonical gpt-5.6 family rate', () => {
+test('estimateCodexUsageCost — prices Luna separately from the Sol family alias', () => {
   assert.deepEqual(
     estimateCodexUsageCost('gpt-5.6-luna:low', 1_000_000, 1_000_000, 400_000),
-    { usd: 16.2, priced: true },
+    { usd: 1.328, priced: true },
   );
 });
 
