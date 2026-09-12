@@ -16,6 +16,11 @@
       "import": "./src/agent/index.ts",
       "default": "./src/agent/index.ts"
     },
+    "./resilience": {
+      "types": "./src/resilience/index.ts",
+      "import": "./src/resilience/index.ts",
+      "default": "./src/resilience/index.ts"
+    },
     "./*.css": "./src/*.css"
   },
   "dependencies": {

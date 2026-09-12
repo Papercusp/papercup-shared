@@ -32,6 +32,7 @@ export {
   type TokenEstimate,
   type UnifiedWindowState,
 } from './governor';
+export { ROLLING_WINDOW_REPROBE_MAX_MS } from './governor';
 export {
   runWithRetry,
   type RetryVerdict,
