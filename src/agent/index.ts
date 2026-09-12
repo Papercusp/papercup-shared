@@ -165,6 +165,7 @@ export {
   DEFAULT_TIER,
   AimdConcurrencyController,
 } from '../resilience';
+export { ROLLING_WINDOW_REPROBE_MAX_MS } from '../resilience/governor';
 export type {
   AdmissionSnapshot,
   PriorityAdmissionOptions,
