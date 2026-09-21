@@ -16,6 +16,7 @@ import {
   classifySubprocessResult,
   classifyTurnError,
   isAccountWide,
+  MODEL_CAPACITY_RETRY_AFTER_MS,
 } from './turn-error';
 
 // --- parseRetryAfterMs ---
@@ -119,6 +120,27 @@ test('classifySubprocessResult — rate-limit in STDOUT on a FAILED exit → rat
   });
   assert.equal(e.class, 'rate_limited');
   assert.equal(e.retryable, true);
+});
+test('classifySubprocessResult — Codex selected-model capacity in FAILED STDOUT → one-minute rate_limited retry', () => {
+  const e = classifySubprocessResult({
+    exitCode: 1,
+    stderr: '',
+    stdout: 'Selected model is at capacity. Please try a different model.',
+  }, 'openai');
+  assert.equal(e.class, 'rate_limited');
+  assert.equal(e.retryable, true);
+  assert.equal(e.surfaceToUser, false);
+  assert.equal(e.retryAfterMs, MODEL_CAPACITY_RETRY_AFTER_MS);
+  assert.equal(e.provider, 'openai');
+});
+test('classifySubprocessResult — Codex capacity wording honors a longer inline retry hint', () => {
+  const e = classifySubprocessResult({
+    exitCode: 1,
+    stderr: '',
+    stdout: 'Selected model is at capacity. Please try again in 90 seconds.',
+  }, 'openai');
+  assert.equal(e.class, 'rate_limited');
+  assert.equal(e.retryAfterMs, 90_000);
 });
 test('classifySubprocessResult — prompt overflow in STDOUT on a FAILED exit → context_overflow, not agent_crash', () => {
   const e = classifySubprocessResult({

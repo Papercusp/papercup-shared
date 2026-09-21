@@ -209,6 +209,12 @@ const USAGE_LIMIT_RE =
 // Transient acceleration / requests-per-minute 429 — back off the fleet briefly + retry. The
 // usage-cap phrases were SPLIT OUT into USAGE_LIMIT_RE above (D-001).
 const RATE_RE = /(\b429\b|rate.?limit|too many requests|slow down|temporarily limiting)/i;
+// Codex's CLI can collapse a transient model-capacity response into this user-facing line
+// without preserving the upstream HTTP status or Retry-After header. Keep the match narrow so
+// unrelated crash output does not become retryable, and provide the one-minute fallback the
+// provider's opaque CLI response cannot carry.
+export const MODEL_CAPACITY_RETRY_AFTER_MS = 60_000;
+const MODEL_CAPACITY_RE = /\bselected\s+model\s+is\s+at\s+capacity\b/i;
 // Anthropic's TRANSIENT-overload line — "Server is temporarily limiting requests (not your usage
 // limit) · Rate limited" — contains the substring "usage limit", which would otherwise trip
 // USAGE_LIMIT_RE (a plan CAP: pause-until-far-reset, no retry) — the OPPOSITE disposition to the
@@ -549,6 +555,24 @@ export function classifySubprocessResult(
   if (CONTEXT_OVERFLOW_RE.test(scan)) {
     const message = errText.slice(0, 200) || 'context window exceeded';
     return mk('context_overflow', message, provider, classifiedOnFrom(scan, CONTEXT_OVERFLOW_RE, message));
+  }
+  // Codex's native CLI emits this capacity wording on a failed subprocess without exposing the
+  // structured 429/503 response. Treat it as a transient, model-scoped rate-limit condition so
+  // runAgentTurn waits a minute before retrying instead of misclassifying it as agent_crash.
+  if (MODEL_CAPACITY_RE.test(scan)) {
+    const message = errText.slice(0, 200) || 'selected model is at capacity';
+    const retryHint = /(?:retry after|try again in|wait)\s+(\d+(?:\.\d+)?)\s*(s|sec|seconds|m|min|minutes|ms)?/i.exec(scan);
+    let retryAfterMs = MODEL_CAPACITY_RETRY_AFTER_MS;
+    if (retryHint) {
+      const n = parseFloat(retryHint[1]);
+      const unit = (retryHint[2] ?? 's').toLowerCase();
+      const parsedMs = unit.startsWith('ms') ? n : unit.startsWith('m') ? n * 60_000 : n * 1000;
+      retryAfterMs = Math.max(retryAfterMs, parsedMs);
+    }
+    return mk('rate_limited', message, provider, {
+      retryAfterMs,
+      ...classifiedOnFrom(scan, MODEL_CAPACITY_RE, message),
+    });
   }
   // Plan/usage CAP first (opposite disposition to a transient 429): pause-until-reset + surface,
   // no retry. The CLI prints the reset in the message ("resets 4:20am"), so parse it best-effort.

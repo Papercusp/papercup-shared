@@ -59,6 +59,34 @@ test('runAgentTurn — retries a rate_limited turn (penalizes governor) then suc
   assert.ok(g.state.pausedUntil > 0);
 });
 
+test('runAgentTurn — Codex model-capacity failure waits one minute, then resumes', async () => {
+  let clock = 0;
+  const sleep = async (ms: number) => { clock += ms; };
+  const g = new RateLimitGovernor({ maxConcurrent: 4 }, { now: () => clock, sleep });
+  let calls = 0;
+  const r = await runAgentTurn<string>(
+    { backend: 'codex', maxAttempts: 2, maxWaitMs: 120_000 },
+    {
+      governor: g,
+      now: () => clock,
+      sleep,
+      runOnce: async (): Promise<TurnOutcome<string>> => {
+        calls++;
+        if (calls === 1) {
+          return {
+            ok: false,
+            raw: { exitCode: 1, stderr: '', stdout: 'Selected model is at capacity. Please try a different model.' },
+          };
+        }
+        return { ok: true, value: 'recovered' };
+      },
+    },
+  );
+  assert.equal(r.ok, true);
+  assert.equal(calls, 2);
+  assert.ok(clock >= 60_000, `expected one-minute capacity wait, clock=${clock}`);
+});
+
 test('runAgentTurn — a non-retryable class (auth) returns the error immediately, no retry', async () => {
   const { g } = fakeGovernor();
   let calls = 0;
