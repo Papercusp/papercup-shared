@@ -83,6 +83,10 @@ export {
   clampUsageRearmDelayMs,
   USAGE_REARM_CAP_MS,
   USAGE_REARM_CAP_HIGH_CONFIDENCE_MS,
+  // The Codex model-capacity signature + its fixed retry window. Re-exported so the
+  // operator-side death classifiers consume the ONE literal instead of each growing a copy.
+  MODEL_CAPACITY_RE,
+  MODEL_CAPACITY_RETRY_AFTER_MS,
   type TurnError,
   type TurnBackend,
   type TurnProvider,
