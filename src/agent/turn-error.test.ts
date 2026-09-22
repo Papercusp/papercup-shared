@@ -16,7 +16,6 @@ import {
   classifySubprocessResult,
   classifyTurnError,
   isAccountWide,
-  MODEL_CAPACITY_RETRY_AFTER_MS,
 } from './turn-error';
 
 // --- parseRetryAfterMs ---
@@ -130,7 +129,9 @@ test('classifySubprocessResult — Codex selected-model capacity in FAILED STDOU
   assert.equal(e.class, 'rate_limited');
   assert.equal(e.retryable, true);
   assert.equal(e.surfaceToUser, false);
-  assert.equal(e.retryAfterMs, MODEL_CAPACITY_RETRY_AFTER_MS);
+  // The literal, not MODEL_CAPACITY_RETRY_AFTER_MS: comparing against the constant under test
+  // passes for any value it holds, so a shortened window would go unnoticed.
+  assert.equal(e.retryAfterMs, 60_000);
   assert.equal(e.provider, 'openai');
 });
 test('classifySubprocessResult — Codex capacity wording honors a longer inline retry hint', () => {
