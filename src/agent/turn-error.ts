@@ -214,7 +214,17 @@ const RATE_RE = /(\b429\b|rate.?limit|too many requests|slow down|temporarily li
 // unrelated crash output does not become retryable, and provide the one-minute fallback the
 // provider's opaque CLI response cannot carry.
 export const MODEL_CAPACITY_RETRY_AFTER_MS = 60_000;
-const MODEL_CAPACITY_RE = /\bselected\s+model\s+is\s+at\s+capacity\b/i;
+/**
+ * EXPORTED as the SINGLE SOURCE for this signature. The same death is re-classified from raw
+ * agent output by several OTHER venues — the improvement-worker exit classifier
+ * (`implement-worker-exit.ts`), the session-end taxonomy (`session-end-reason.ts`), and through
+ * the latter the loop lifecycle-death verdict (`reconcile-loop-routines.ts`). Each of those
+ * lists historically grew its own hand-typed literal per incident, which is precisely how a
+ * family of detectors drifts apart (see the EI-6876 / EI-6890 / EI-7591 / EI-10568 accretion
+ * recorded in `ENV_FAILURE_PATTERNS`). Consume THIS constant — or re-anchor its `.source` where
+ * a venue needs tighter precision than a bare substring — but never re-type the wording.
+ */
+export const MODEL_CAPACITY_RE = /\bselected\s+model\s+is\s+at\s+capacity\b/i;
 // Anthropic's TRANSIENT-overload line — "Server is temporarily limiting requests (not your usage
 // limit) · Rate limited" — contains the substring "usage limit", which would otherwise trip
 // USAGE_LIMIT_RE (a plan CAP: pause-until-far-reset, no retry) — the OPPOSITE disposition to the
