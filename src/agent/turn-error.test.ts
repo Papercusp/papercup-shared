@@ -4,6 +4,7 @@
  */
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
+import { makeModelCapacityDetector, modelCapacityLineMatch } from './model-capacity.mjs';
 import {
   parseRetryAfterMs,
   parseResetAt,
@@ -142,6 +143,28 @@ test('classifySubprocessResult — Codex capacity wording honors a longer inline
   }, 'openai');
   assert.equal(e.class, 'rate_limited');
   assert.equal(e.retryAfterMs, 90_000);
+});
+test('interactive PTY capacity matching shares the classifier and requires an error-line prefix', () => {
+  const match = modelCapacityLineMatch(
+    'Selected model is at capacity. Please try again in 90 seconds.',
+  );
+  assert.equal(match?.errorClass, 'rate_limited');
+  assert.equal(match?.retryable, true);
+  assert.equal(match?.retryAfterMs, 90_000);
+  assert.equal(
+    modelCapacityLineMatch('The report discusses selected model is at capacity as an example.'),
+    null,
+  );
+
+  const detector = makeModelCapacityDetector();
+  assert.equal(detector.observe('Selected model is at capa'), null);
+  const splitMatch = detector.observe('city. Please try a different model.\n');
+  assert.equal(splitMatch?.errorClass, 'rate_limited');
+  assert.equal(splitMatch?.retryAfterMs, 60_000);
+  assert.equal(
+    detector.observe('Selected model is at capacity. Please try a different model.\n'),
+    null,
+  );
 });
 test('classifySubprocessResult — prompt overflow in STDOUT on a FAILED exit → context_overflow, not agent_crash', () => {
   const e = classifySubprocessResult({
