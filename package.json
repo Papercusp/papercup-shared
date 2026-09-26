@@ -26,7 +26,8 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.81.0",
     "@papercusp/grid-core": "*",
-    "@papercusp/model-pricing": "*"
+    "@papercusp/model-pricing": "*",
+    "@papercusp/module-singleton": "*"
   },
   "scripts": {
     "test": "vitest run"

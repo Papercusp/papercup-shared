@@ -44,6 +44,7 @@ import { costFromTokens, type CostEstimate } from '@papercusp/model-pricing';
 // Agent-turn robustness (opt-in via PAPERCUSP_AGENT_GOVERNOR=1). These modules are pure +
 // import nothing from this file, so there's no cycle and ~no load cost when the flag is off.
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
+import { planAgentSpawn, type AgentSpawnStagedDir } from './spawn-transform';
 import { governorForBackend, BACKEND_PROFILES } from './governor-registry';
 import { RateLimitGovernor, ROLLING_WINDOW_REPROBE_MS } from '../resilience/governor';
 import { tierOf } from '../resilience/priority-admission';
@@ -2480,14 +2481,33 @@ export async function* runAgentChat(
   const spawnCwd = ompAgentDir ?? claudeConfigDir ?? opts.cwd;
 
   let child: ChildProcess;
+  let spawnPrelude: Buffer | undefined;
   try {
-    child = spawn(command, finalArgs, {
-      stdio: ['pipe', 'pipe', 'pipe'],
+    // D-421 (byoc-cloud-workspaces-gcp-aws-azure-2026-08-22): the identity
+    // the agent runs as is decided by the process-wide spawn transform. With
+    // none configured this is the staged spawn unchanged; a hosted workspace
+    // host runs customer-driven agents as the customer workspace identity.
+    const stagedDirs: AgentSpawnStagedDir[] = [];
+    if (codexHome) stagedDirs.push({ path: codexHome, persistent: false });
+    if (ompAgentDir) stagedDirs.push({ path: ompAgentDir, persistent: false });
+    if (claudeConfigDir) stagedDirs.push({ path: claudeConfigDir, persistent: claudeConfigDirCallerOwned });
+    if (claudeSysDir && claudeSysDir !== claudeConfigDir) stagedDirs.push({ path: claudeSysDir, persistent: false });
+    const plan = planAgentSpawn({
+      backend,
+      command,
+      args: finalArgs,
       cwd: spawnCwd,
       // EI-11519: augment PATH with the well-known per-user bin dirs so the
       // agent binary resolves even when the operator's own env is stripped
       // (Tauri dev shell). See withAgentBinDirs.
       env: withAgentBinDirs(spawnEnv),
+      stagedDirs,
+    });
+    spawnPrelude = plan.stdinPrelude;
+    child = spawn(plan.command, [...plan.args], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: plan.cwd,
+      env: plan.env,
     });
   } catch (e) {
     if (ompAgentDir) {
@@ -2802,6 +2822,7 @@ export async function* runAgentChat(
   // positional); omp reads it from a `@file` positional arg (handled in
   // finalArgs above). For omp we still close stdin so the child doesn't
   // block waiting for input that won't come.
+  if (spawnPrelude) child.stdin!.write(spawnPrelude);
   if (backend === 'omp') {
     child.stdin!.end();
   } else {

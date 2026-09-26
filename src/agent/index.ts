@@ -131,6 +131,24 @@ export {
   type GlobalConcurrencySnapshot,
   type EffectiveConcurrencySnapshot,
 } from './governor-registry';
+export {
+  configureAgentSpawnTransform,
+  agentSpawnTransformConfigured,
+  planAgentSpawn,
+  buildLoopbackIdentitySpawn,
+  AgentSpawnRefusedError,
+  LOOPBACK_IDENTITY_HEADER_VERSION,
+  LOOPBACK_IDENTITY_WRAPPER_SOURCE,
+} from './spawn-transform';
+export type {
+  AgentSpawnRequest,
+  AgentSpawnPlan,
+  AgentSpawnStagedDir,
+  AgentSpawnTransform,
+  LoopbackIdentityHomeLink,
+  LoopbackIdentitySpawnOptions,
+  LoopbackIdentityHeader,
+} from './spawn-transform';
 export type {
   AdmissionDenial,
   AdmissionDenialReason,
