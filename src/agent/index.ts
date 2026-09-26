@@ -140,6 +140,19 @@ export {
   LOOPBACK_IDENTITY_HEADER_VERSION,
   LOOPBACK_IDENTITY_WRAPPER_SOURCE,
 } from './spawn-transform';
+// D-424: the interactive (PTY) sibling of the loopback identity spawn — plain .mjs so psu imports
+// the same implementation (see loopback-identity-tty.mjs).
+export {
+  AGENT_IDENTITY_SPEC_ENV,
+  AGENT_IDENTITY_SPEC_VERSION,
+  AgentIdentityTtyRefusedError,
+  parseAgentIdentitySpec,
+  planAgentIdentityTty,
+  stageAgentIdentityTty,
+  type AgentIdentitySpec,
+  type AgentIdentityTtyExec,
+  type AgentIdentityTtyRequest,
+} from './loopback-identity-tty.mjs';
 export type {
   AgentSpawnRequest,
   AgentSpawnPlan,
