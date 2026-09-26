@@ -115,6 +115,14 @@ export interface LoopbackIdentitySpawnOptions {
   readonly baseEnv: NodeJS.ProcessEnv;
   /** Keys forwarded from the spawn env even when unchanged, e.g. `LANG`. */
   readonly passthroughEnv?: readonly string[];
+  /**
+   * Explicit PATH for the target identity. When set it REPLACES the forwarded
+   * operator PATH entirely: the operator's PATH can name directories the
+   * target identity cannot read (a release tree holding launcher wrappers),
+   * and a bare agent command resolved through one of those fails with a bare
+   * EACCES instead of a named error (plan byoc D-423).
+   */
+  readonly remotePath?: readonly string[];
   readonly homeLinks?: readonly LoopbackIdentityHomeLink[];
   /**
    * Secrets that must never reach the target identity. If any appears in the
@@ -248,11 +256,15 @@ export function buildLoopbackIdentitySpawn(options: LoopbackIdentitySpawnOptions
       env[key] = mapValue(value);
     }
     if (env.HOME === undefined) env.HOME = options.remoteHome;
-    const localHome = options.localHome.replace(/\/+$/, '');
-    const forwardedPath = (request.env.PATH ?? '')
-      .split(':')
-      .filter((entry) => entry && entry !== localHome && !entry.startsWith(`${localHome}/`));
-    env.PATH = [posix.join(options.remoteHome, '.local', 'bin'), ...forwardedPath].join(':');
+    if (options.remotePath) {
+      env.PATH = options.remotePath.join(':');
+    } else {
+      const localHome = options.localHome.replace(/\/+$/, '');
+      const forwardedPath = (request.env.PATH ?? '')
+        .split(':')
+        .filter((entry) => entry && entry !== localHome && !entry.startsWith(`${localHome}/`));
+      env.PATH = [posix.join(options.remoteHome, '.local', 'bin'), ...forwardedPath].join(':');
+    }
 
     const links: HeaderLink[] = [];
     for (const link of options.homeLinks ?? []) {

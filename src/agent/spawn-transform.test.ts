@@ -148,6 +148,15 @@ describe('buildLoopbackIdentitySpawn — the real inline wrapper', () => {
     expect(existsSync(join(remoteHome, '.papercusp', 'agent-spawns', 'spawn-1'))).toBe(false);
   });
 
+  it('an explicit remotePath replaces the forwarded operator PATH entirely (D-423)', async () => {
+    const req = request({ env: { ...request().env, PATH: `/opt/papercusp/current/bin:${operatorHome}/.local/bin:/usr/bin:/bin` } });
+    const remotePath = ['/usr/local/lib/papercusp-agent-toolchain/bin', '/usr/bin', '/bin'];
+    const result = await run(buildLoopbackIdentitySpawn(options({ remotePath }))(req), '');
+    expect(result.stderr).toBe('');
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).path.split(':')).toEqual(remotePath);
+  });
+
   it('propagates the agent exit code so a failed turn stays a failure', async () => {
     const req = request({ env: { ...request().env, PROBE_EXIT: '3' } });
     const result = await run(buildLoopbackIdentitySpawn(options())(req), '');
