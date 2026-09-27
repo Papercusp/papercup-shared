@@ -2,6 +2,8 @@ export const AGENT_IDENTITY_SPEC_ENV: 'PAPERCUSP_AGENT_IDENTITY_SPEC';
 export const AGENT_IDENTITY_SPEC_VERSION: 1;
 export const AGENT_IDENTITY_TTY_STAGE_SOURCE: string;
 export const AGENT_IDENTITY_TTY_EXEC_SOURCE: string;
+/** P-326: per-cwd `~/.claude.json` flags the stage hop pre-accepts on the target account. */
+export const CLAUDE_PROJECT_LAUNCH_FLAGS: readonly string[];
 
 export interface AgentIdentityTransport {
   readonly command: string;

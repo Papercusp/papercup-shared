@@ -11,7 +11,9 @@
  * into it would be echoed and line-disciplined. So the TTY path runs in two hops:
  *
  *   stage  non-TTY transport, header on stdin: create the spawn dirs, write the shipped files and
- *          home links, and write the exec header (argv/env/cwd) to a 0600 file. Prints its path.
+ *          home links, assert claude's pre-turn launch flags on the target account (P-326, see
+ *          claudeLaunchReadiness), and write the exec header (argv/env/cwd) to a 0600 file. Prints
+ *          its path.
  *   exec   TTY transport: `node -e <exec wrapper> <header path>` reads + unlinks the header and
  *          runs the agent with the remote TTY inherited, cleaning the spawn dir on exit.
  *
@@ -38,6 +40,17 @@ const SUPPORTED_BACKENDS = new Set(['claude', 'codex', 'omp']);
 /** Env names that look like a credential never cross, whatever the allowlist says. */
 const SECRET_NAME_RE = /(TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|AUTH|CREDENTIAL|COOKIE|PRIVATE)/i;
 const BASE_ENV_ALLOW = ['TERM', 'COLORTERM', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'NO_COLOR', 'FORCE_COLOR'];
+/**
+ * P-326: the per-cwd `~/.claude.json` flags that gate an interactive prompt in the claude TUI.
+ * Same set psu's local launch pre-accepts (operator-core `ensureProjectTrust`); a prompt nobody
+ * can answer parks the agent before its first turn.
+ */
+export const CLAUDE_PROJECT_LAUNCH_FLAGS = Object.freeze([
+  'hasTrustDialogAccepted',
+  'hasClaudeMdExternalIncludesApproved',
+  'hasClaudeMdExternalIncludesWarningShown',
+  'hasCompletedProjectOnboarding',
+]);
 
 export class AgentIdentityTtyRefusedError extends Error {
   constructor(code, message) {
@@ -61,6 +74,35 @@ if (h.v !== 1) throw new Error('agent stage header version ' + h.v + ' unsupport
 for (const d of h.dirs) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
 for (const f of h.files) { fs.mkdirSync(path.dirname(f.path), { recursive: true, mode: 0o700 }); fs.writeFileSync(f.path, Buffer.from(f.data, 'base64'), { mode: f.mode }); fs.chmodSync(f.path, f.mode); }
 for (const l of h.links) { let present = false; try { fs.lstatSync(l.path); present = true; } catch {} if (!present && fs.existsSync(l.target)) fs.symlinkSync(l.target, l.path); }
+const assertJson = (file, mutate) => {
+  let cur = {};
+  if (fs.existsSync(file)) {
+    try { cur = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { process.stderr.write('agent stage: left unparseable ' + file + ' untouched: ' + e.message + '\n'); return; }
+    if (!cur || typeof cur !== 'object' || Array.isArray(cur)) { process.stderr.write('agent stage: left non-object ' + file + ' untouched\n'); return; }
+  }
+  if (!mutate(cur)) return;
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = file + '.agent-stage.' + process.pid + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(cur, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+};
+const r = h.claudeLaunchReady;
+if (r) {
+  assertJson(r.globalConfigPath, (c) => {
+    let changed = false;
+    if (c.hasCompletedOnboarding !== true) { c.hasCompletedOnboarding = true; changed = true; }
+    if (!c.projects || typeof c.projects !== 'object' || Array.isArray(c.projects)) { c.projects = {}; changed = true; }
+    const p = c.projects[r.cwd] && typeof c.projects[r.cwd] === 'object' ? c.projects[r.cwd] : {};
+    for (const k of r.projectFlags) if (p[k] !== true) { p[k] = true; changed = true; }
+    c.projects[r.cwd] = p;
+    return changed;
+  });
+  assertJson(r.settingsPath, (s) => {
+    if (s.skipDangerousModePermissionPrompt === true) return false;
+    s.skipDangerousModePermissionPrompt = true;
+    return true;
+  });
+}
 fs.writeFileSync(h.execHeaderPath, JSON.stringify({ v: 1, argv: h.argv, env: h.env, cwd: h.cwd, cleanup: h.cleanup }), { mode: 0o600, flag: 'wx' });
 process.stdout.write(h.execHeaderPath + '\n');
 `;
@@ -158,6 +200,26 @@ function readSecrets(files, readFile) {
 }
 
 /**
+ * P-326: where the TARGET account's claude keeps the state its TUI consults before the first
+ * turn. psu launches claude interactively (`--dangerously-skip-permissions`, a kickoff turn), and
+ * psu's own launch-readiness self-heal only ever touched the SPAWNING account's home — so on a
+ * hosted host every New Session parked on the first-run wizard / folder-trust / bypass-accept
+ * prompts that nobody can answer (measured on avi-test r55: no transcript after 3m20s; the same
+ * launch took its turn once these flags were set). The stage hop, which already runs as the
+ * target, asserts exactly these flags: idempotent, every other key preserved, never a credential
+ * or MCP server (D-422 — the account's own agent config stays what the agent uses).
+ */
+function claudeLaunchReadiness(env, remoteHome, cwd) {
+  const configDir = env.CLAUDE_CONFIG_DIR;
+  return {
+    globalConfigPath: configDir ? posix.join(configDir, '.claude.json') : posix.join(remoteHome, '.claude.json'),
+    settingsPath: posix.join(configDir ?? posix.join(remoteHome, '.claude'), 'settings.json'),
+    cwd,
+    projectFlags: [...CLAUDE_PROJECT_LAUNCH_FLAGS],
+  };
+}
+
+/**
  * Pure planning: the stage hop (command, args, stdin) and the exec hop (the PTY command).
  * `request` is exactly what psu would have spawned: { command, args, env, cwd }.
  */
@@ -251,6 +313,7 @@ export function planAgentIdentityTty(rawSpec, request, deps = {}) {
   }
 
   const execHeaderPath = posix.join(ephemeralRoot, 'exec.json');
+  const cwd = spec.remoteCwd ?? spec.remoteHome;
   const header = {
     v: HEADER_VERSION,
     dirs: [spec.spawnRoot, ephemeralRoot, filesRoot],
@@ -258,9 +321,10 @@ export function planAgentIdentityTty(rawSpec, request, deps = {}) {
     links,
     argv,
     env,
-    cwd: spec.remoteCwd ?? spec.remoteHome,
+    cwd,
     cleanup: [ephemeralRoot],
     execHeaderPath,
+    ...(backend === 'claude' ? { claudeLaunchReady: claudeLaunchReadiness(env, spec.remoteHome, cwd) } : {}),
   };
   const json = Buffer.from(JSON.stringify(header), 'utf8');
   const node = shellQuote(spec.nodePath);

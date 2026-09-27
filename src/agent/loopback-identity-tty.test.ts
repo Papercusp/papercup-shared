@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   AGENT_IDENTITY_SPEC_ENV,
   AgentIdentityTtyRefusedError,
+  CLAUDE_PROJECT_LAUNCH_FLAGS,
   planAgentIdentityTty,
   stageAgentIdentityTty,
   type AgentIdentitySpec,
@@ -190,5 +191,101 @@ describe('loopback identity TTY stage + exec (D-424)', () => {
     expect(caught?.message).toContain('exited 7');
     expect(caught?.message).toContain('denied');
     expect(readFileSync(promptFile, 'utf8')).toBe('# rendered su playbook\n');
+  });
+});
+
+// P-326: psu launches claude INTERACTIVELY; on a hosted host the TUI reads the TARGET account's
+// config, so the stage hop must pre-accept the prompts nobody is there to answer.
+describe('claude pre-turn launch readiness on the target account (P-326)', () => {
+  const customerJson = () => join(spec.remoteHome, '.claude.json');
+  const customerSettings = () => join(spec.remoteHome, '.claude', 'settings.json');
+  const readJson = (file: string) => JSON.parse(readFileSync(file, 'utf8'));
+
+  it('asserts onboarding, cwd trust and the bypass-accept skip while preserving every other key', () => {
+    mkdirSync(join(spec.remoteHome, '.claude'), { recursive: true });
+    writeFileSync(
+      customerJson(),
+      JSON.stringify({
+        userID: 'customer-user',
+        projects: {
+          '/elsewhere': { allowedTools: ['Read'] },
+          [spec.remoteHome]: { mcpServers: { own: { command: 'x' } }, hasTrustDialogAccepted: false },
+        },
+      }),
+    );
+    writeFileSync(customerSettings(), JSON.stringify({ theme: 'dark', permissions: { allow: ['Bash'] } }));
+    writeFileSync(join(spec.remoteHome, '.claude', '.credentials.json'), 'customer-credential');
+
+    stageAgentIdentityTty(spec, request());
+
+    const cfg = readJson(customerJson());
+    expect(cfg.hasCompletedOnboarding).toBe(true);
+    expect(cfg.userID).toBe('customer-user');
+    expect(cfg.projects['/elsewhere']).toEqual({ allowedTools: ['Read'] });
+    expect(cfg.projects[spec.remoteHome]).toEqual({
+      mcpServers: { own: { command: 'x' } },
+      ...Object.fromEntries(CLAUDE_PROJECT_LAUNCH_FLAGS.map((flag) => [flag, true])),
+    });
+    expect(readJson(customerSettings())).toEqual({
+      theme: 'dark',
+      permissions: { allow: ['Bash'] },
+      skipDangerousModePermissionPrompt: true,
+    });
+    // The account's own credential is never read, moved or rewritten.
+    expect(readFileSync(join(spec.remoteHome, '.claude', '.credentials.json'), 'utf8')).toBe('customer-credential');
+    expect(statSync(customerJson()).mode & 0o777).toBe(0o600);
+  });
+
+  it('creates the state for an account that has never run claude', () => {
+    stageAgentIdentityTty(spec, request());
+    const cfg = readJson(customerJson());
+    expect(cfg.hasCompletedOnboarding).toBe(true);
+    for (const flag of CLAUDE_PROJECT_LAUNCH_FLAGS) expect(cfg.projects[spec.remoteHome][flag]).toBe(true);
+    expect(readJson(customerSettings())).toEqual({ skipDangerousModePermissionPrompt: true });
+    expect(statSync(customerSettings()).mode & 0o777).toBe(0o600);
+  });
+
+  it('pre-trusts the launch cwd, not the home, when the spec pins remoteCwd', () => {
+    const work = join(spec.remoteHome, 'work');
+    mkdirSync(work, { recursive: true });
+    stageAgentIdentityTty({ ...spec, remoteCwd: work }, request());
+    const projects = readJson(customerJson()).projects;
+    expect(Object.keys(projects)).toEqual([work]);
+  });
+
+  it('does not rewrite a target that is already launch-ready', () => {
+    stageAgentIdentityTty(spec, request());
+    const before = { json: statSync(customerJson()).ino, settings: statSync(customerSettings()).ino };
+    stageAgentIdentityTty(spec, request());
+    // A rewrite is temp + rename, which always lands a new inode.
+    expect(statSync(customerJson()).ino).toBe(before.json);
+    expect(statSync(customerSettings()).ino).toBe(before.settings);
+  });
+
+  it('leaves an unparseable config untouched and still stages the agent', () => {
+    writeFileSync(customerJson(), '{not json');
+    const exec = stageAgentIdentityTty(spec, request());
+    expect(readFileSync(customerJson(), 'utf8')).toBe('{not json');
+    expect(existsSync(exec.execHeaderPath)).toBe(true);
+  });
+
+  it('follows CLAUDE_CONFIG_DIR when the spec lets it cross', () => {
+    const configDir = join(spec.remoteHome, 'cfg');
+    stageAgentIdentityTty(
+      { ...spec, envAllow: ['CLAUDE_CONFIG_DIR'] },
+      request({ env: { ...request().env, CLAUDE_CONFIG_DIR: configDir } }),
+    );
+    expect(readJson(join(configDir, '.claude.json')).hasCompletedOnboarding).toBe(true);
+    expect(readJson(join(configDir, 'settings.json')).skipDangerousModePermissionPrompt).toBe(true);
+    expect(existsSync(customerJson())).toBe(false);
+  });
+
+  it('touches no claude state when the agent is not claude', () => {
+    const omp = join(spec.toolchainBin, 'omp');
+    writeFileSync(omp, `#!/bin/sh\nexec '${process.execPath}' '${join(root, 'probe.js')}' "$@"\n`);
+    chmodSync(omp, 0o755);
+    stageAgentIdentityTty(spec, request({ command: 'omp', args: [] }));
+    expect(existsSync(customerJson())).toBe(false);
+    expect(existsSync(customerSettings())).toBe(false);
   });
 });
