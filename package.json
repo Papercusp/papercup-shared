@@ -16,6 +16,11 @@
       "import": "./src/agent/index.ts",
       "default": "./src/agent/index.ts"
     },
+    "./agent/turn-error": {
+      "types": "./src/agent/turn-error.ts",
+      "import": "./src/agent/turn-error.ts",
+      "default": "./src/agent/turn-error.ts"
+    },
     "./resilience": {
       "types": "./src/resilience/index.ts",
       "import": "./src/resilience/index.ts",

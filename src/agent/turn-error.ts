@@ -359,8 +359,11 @@ export function parseUsageReset(text: string, now: number = Date.now()): UsageRe
   // Date-qualified absolute: "resets Aug 20, 7am", "resets Jun 18 7:30pm", "resets Sep 3, 16:00".
   // MUST precede the bare-clock branch below, which would otherwise never see these anyway (it
   // needs a digit right after "resets") but would misread a reordered variant as "today/tomorrow".
+  // Codex prints the same wall as "try again at Oct 3rd, 2026 5:30 PM" — a "try again" lead and
+  // an explicit YEAR (WI-10003494: without this branch a capped Codex account had no reset time,
+  // so neither the fleet governor nor a chat viewer learned when it lifts).
   const absDate =
-    /resets?\s+(?:at\s+)?([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?\s*,?\s*(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i.exec(
+    /(?:resets?|try again)\s+(?:at\s+|on\s+)?([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?\s*,?\s*(?:(\d{4})\s*,?\s*)?(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i.exec(
       text,
     );
   if (absDate) {
@@ -369,18 +372,21 @@ export function parseUsageReset(text: string, now: number = Date.now()): UsageRe
     // resolving to a wrong instant.
     if (mon !== undefined) {
       const day = parseInt(absDate[2], 10);
-      let h = parseInt(absDate[3], 10);
-      const min = absDate[4] ? parseInt(absDate[4], 10) : 0;
-      const ap = absDate[5]?.toLowerCase();
+      const year = absDate[3] ? parseInt(absDate[3], 10) : null;
+      let h = parseInt(absDate[4], 10);
+      const min = absDate[5] ? parseInt(absDate[5], 10) : 0;
+      const ap = absDate[6]?.toLowerCase();
       if (ap === 'pm' && h < 12) h += 12;
       if (ap === 'am' && h === 12) h = 0;
       if (day >= 1 && day <= 31 && h <= 23 && min <= 59) {
         const d = new Date(now);
-        d.setMonth(mon, day);
+        if (year !== null) d.setFullYear(year, mon, day);
+        else d.setMonth(mon, day);
         d.setHours(h, min, 0, 0);
-        // The message names no year and a reset is always ahead of us, so a constructed instant
-        // in the past means a year rollover (a late-December wall resetting in January).
-        if (d.getTime() <= now) d.setFullYear(d.getFullYear() + 1);
+        // With no year named, a reset is always ahead of us, so a constructed instant in the past
+        // means a year rollover (a late-December wall resetting in January). A NAMED year is taken
+        // as written: a past instant then fails the `> now` check below instead of being moved.
+        if (year === null && d.getTime() <= now) d.setFullYear(d.getFullYear() + 1);
         const t = d.getTime();
         // Sanity horizon. A subscription reset is inherently near-future (weekly ⇒ ≤7d), so a
         // parse landing months out is a MISREAD, not a long wall — and returning it would be
@@ -389,7 +395,9 @@ export function parseUsageReset(text: string, now: number = Date.now()): UsageRe
         // as-is, so a stale/garbled "resets Jun 18" read in August would roll to the NEXT June and
         // pause inference for a year. Fall through to undefined instead: the caller still pauses
         // and surfaces, just without a precise time — the documented degraded mode.
-        if (Number.isFinite(t) && t - now <= USAGE_RESET_MAX_HORIZON_MS) return { atMs: t, precision: 'dated' };
+        if (Number.isFinite(t) && t > now && t - now <= USAGE_RESET_MAX_HORIZON_MS) {
+          return { atMs: t, precision: 'dated' };
+        }
       }
     }
   }

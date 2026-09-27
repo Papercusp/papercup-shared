@@ -352,6 +352,29 @@ test('parseUsageReset — date-qualified variants', () => {
   assert.equal(new Date(nc!.atMs).getMinutes(), 30);
   for (const r of [sep, ord, nc]) assert.equal(r?.precision, 'dated');
 });
+// WI-10003494: Codex words the same wall "try again at Oct 3rd, 2026 5:30 PM" — a "try again"
+// lead and an explicit YEAR. It used to parse to nothing, so a capped Codex account carried no
+// reset time to the governor or to a chat viewer.
+test('parseUsageReset — Codex "try again at <Mon> <day>, <year> <time>" is a dated reset', () => {
+  const now = Date.parse('2026-09-27T16:01:00Z');
+  const msg =
+    'codex exited 1: You’ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to ' +
+    'purchase more credits or try again at Oct 3rd, 2026 5:30 PM.';
+  const r = parseUsageReset(msg, now);
+  assert.ok(r !== undefined, 'Codex usage-cap wording must parse');
+  const d = new Date(r.atMs);
+  assert.deepEqual([d.getFullYear(), d.getMonth(), d.getDate(), d.getHours(), d.getMinutes()], [2026, 9, 3, 17, 30]);
+  assert.equal(r.precision, 'dated');
+  // The classifier carries it through: a usage_limit with a dated reset, not an undated one.
+  const e = classifySubprocessResult({ exitCode: 1, stderr: msg }, 'openai', now);
+  assert.equal(e.class, 'usage_limit');
+  assert.equal(e.resetAt, r.atMs);
+  assert.equal(e.resetPrecision, 'dated');
+  // A NAMED year in the past is a stale message, not next year's wall — never rolled forward.
+  assert.equal(parseUsageReset('try again at Oct 3rd, 2025 5:30 PM', now), undefined);
+  // The Claude weekly form (no year) is unchanged.
+  assert.equal(new Date(parseUsageReset('resets Oct 1, 7am', now)!.atMs).getDate(), 1);
+});
 test('parseUsageReset — a month-name read is bounded, and non-months fall through', () => {
   const now = Date.parse('2026-08-15T17:47:00Z');
   // A PAST month names no year, so it would roll to the next one — ~10 months out. That is a
