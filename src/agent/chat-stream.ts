@@ -1330,6 +1330,91 @@ export function codexMcpFailureDebugFields(itemValue: unknown): CodexMcpFailureD
   };
 }
 
+/** Upper bound on the backend failure line carried in a terminal error message. */
+const BACKEND_FAILURE_LINE_MAX_CHARS = 400;
+
+/**
+ * WI-10003188 — reduce a CLI backend's own failure text to ONE human-readable line.
+ *
+ * Providers often hand the CLI a JSON error envelope that the CLI then forwards as a
+ * STRING (measured codex-cli 0.157.1: `{"type":"error","status":400,"error":{"type":
+ * "invalid_request_error","message":"The '…' model is not supported …"}}`). When the whole
+ * text parses as such an envelope, the innermost `error.message` / `message` is the line a
+ * person can act on. Otherwise the first non-empty line is taken as-is, capped.
+ */
+export function backendFailureLine(raw: string | null | undefined): string | null {
+  if (typeof raw !== 'string') return null;
+  let text = raw.trim();
+  if (!text) return null;
+  if (text.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      const nested = parsed?.error && typeof parsed.error === 'object'
+        ? (parsed.error as Record<string, unknown>).message
+        : undefined;
+      const inner = typeof nested === 'string' && nested.trim()
+        ? nested
+        : typeof parsed?.message === 'string' ? parsed.message : undefined;
+      if (typeof inner === 'string' && inner.trim()) text = inner.trim();
+    } catch { /* not an envelope — keep the text */ }
+  }
+  const line = text.split(/\r?\n/).map((l) => l.trim()).find(Boolean);
+  if (!line) return null;
+  return line.length > BACKEND_FAILURE_LINE_MAX_CHARS
+    ? `${line.slice(0, BACKEND_FAILURE_LINE_MAX_CHARS - 1)}…`
+    : line;
+}
+
+/**
+ * WI-10003188 — the failure text a `codex exec --json` frame carries, or null.
+ *
+ * codex reports a failed turn ON STDOUT, with an empty stderr (measured codex-cli 0.157.1):
+ *   {"type":"error","message":"<text>"}
+ *   {"type":"turn.failed","error":{"message":"<text>"}}
+ * An `item.completed` whose `item.type` is `error` is a NON-fatal warning (e.g. "Model
+ * metadata for `x` not found. Defaulting to fallback metadata") — never the cause.
+ */
+export function codexFailureFrameMessage(ev: unknown): string | null {
+  if (!ev || typeof ev !== 'object') return null;
+  const frame = ev as Record<string, unknown>;
+  if (frame.type === 'turn.failed') {
+    const err = frame.error && typeof frame.error === 'object' ? frame.error as Record<string, unknown> : null;
+    return typeof err?.message === 'string' && err.message.trim() ? err.message : null;
+  }
+  if (frame.type === 'error') {
+    return typeof frame.message === 'string' && frame.message.trim() ? frame.message : null;
+  }
+  return null;
+}
+
+/**
+ * WI-10003188 — the failure text of a claude `stream-json` terminal `result` frame, or null.
+ * An `is_error:true` result carries the account/API wall ("Invalid API key · Please run
+ * /login", "API Error: 401 … OAuth token has been revoked …") in `result`.
+ */
+export function claudeFailureResultMessage(ev: unknown): string | null {
+  if (!ev || typeof ev !== 'object') return null;
+  const frame = ev as Record<string, unknown>;
+  if (frame.type !== 'result' || frame.is_error !== true) return null;
+  return typeof frame.result === 'string' && frame.result.trim() ? frame.result : null;
+}
+
+/**
+ * The terminal error message for a CLI backend that exited non-zero. Keeps the
+ * `<backend> exited <code>` prefix every consumer already matches, and appends the
+ * backend's own failure line when it reported one — so a hosted surface that renders
+ * only this message tells the customer WHY (plan cap, revoked login) instead of a bare
+ * exit code.
+ */
+export function agentExitErrorMessage(
+  backend: string,
+  exitCode: number | null,
+  failureLine: string | null,
+): string {
+  const base = `${backend} exited ${exitCode ?? '?'}`;
+  return failureLine ? `${base}: ${failureLine}` : base;
+}
+
 function isTransientLlmError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   // Anthropic SDK APIError surfaces as `<status> <body>` in .message.
@@ -2559,6 +2644,11 @@ export async function* runAgentChat(
   let ompUsageComplete = false;
   let codexUsageSeen = false;
   let codexUsageComplete = false;
+  // WI-10003188 — the backend's OWN statement of why a turn failed, read from its
+  // structured stdout (codex `turn.failed`/`error` frames, a claude `is_error` result).
+  // `backendFailureIsTerminal` lets a codex `turn.failed` outrank an earlier `error` frame.
+  let backendFailureRaw: string | null = null;
+  let backendFailureIsTerminal = false;
   // Buffer events from the line-parser; the generator drains this queue.
   const queue: ChatEvent[] = [];
   let resolveTick: (() => void) | null = null;
@@ -2602,6 +2692,11 @@ export async function* runAgentChat(
       }
     } else if (ev.type === 'result') {
       claudeTerminalUsageSeen = true;
+      const failure = claudeFailureResultMessage(ev);
+      if (failure) {
+        backendFailureRaw = failure;
+        backendFailureIsTerminal = true;
+      }
       const u = parseClaudeResultEvent(ev);
       if (u.tokensIn !== undefined) tokensIn = u.tokensIn;
       if (u.tokensOut !== undefined) tokensOut = u.tokensOut;
@@ -2707,6 +2802,14 @@ export async function* runAgentChat(
    */
   const handleCodexEvent = (ev: any) => {
     if (!ev || typeof ev !== 'object') return;
+
+    // WI-10003188 — keep codex's own failure text (usage limit, rejected model, auth) so
+    // the terminal error and the turn classifier can see it; stderr is empty in --json mode.
+    const failure = codexFailureFrameMessage(ev);
+    if (failure && (ev.type === 'turn.failed' || !backendFailureIsTerminal)) {
+      backendFailureRaw = failure;
+      backendFailureIsTerminal = ev.type === 'turn.failed';
+    }
 
     // `codex exec --json` grows new item/event variants independently of this
     // adapter. In debug runs, retain only the bounded routing fields for every
@@ -2933,11 +3036,22 @@ export async function* runAgentChat(
   // penalize the SHARED governor so concurrent callers back off (no re-spawn here). Only on
   // the governed path; cheap + side-effect-free otherwise. The classified turn is also
   // attached to the terminal error event so a consumer can pause/resume (RB-006).
+  // WI-10003188 — the backend's own failure line (plan cap, rejected model, revoked login),
+  // read from its structured stdout. Only meaningful on a failed exit.
+  const failureLine = exitCode !== 0 ? backendFailureLine(backendFailureRaw) : null;
+
   let cliTurn: TurnError | undefined;
   if (governed) {
+    // codex --json puts its wall text in stdout JSONL frames, not in stderr or the assistant
+    // text, so fold the captured line into the stdout the classifier scans on a failed exit —
+    // otherwise a codex plan cap is never classified `usage_limit` and never pauses the governor.
+    const classifyStdout =
+      backendFailureRaw && exitCode !== 0 && !finalText.includes(backendFailureRaw)
+        ? `${finalText}\n${backendFailureRaw}`
+        : finalText;
     cliTurn = classifyTurnError(
       backend as TurnBackend,
-      { exitCode, signal: exitSignal, stderr: stderrBuf, stdout: finalText, timedOut },
+      { exitCode, signal: exitSignal, stderr: stderrBuf, stdout: classifyStdout, timedOut },
       Date.now(),
     );
     if (isAccountWide(cliTurn.class)) {
@@ -2962,8 +3076,9 @@ export async function* runAgentChat(
       type: 'error',
       // A spawn failure never produced an exit code — name the real cause
       // (e.g. "failed to spawn claude: spawn claude ENOENT") instead of the
-      // opaque "exited ?" (EI-11519).
-      message: spawnErrMsg ?? `${backend} exited ${exitCode ?? '?'}`,
+      // opaque "exited ?" (EI-11519). Otherwise append the backend's own failure line
+      // (WI-10003188) so a surface that renders only `message` can say WHY.
+      message: spawnErrMsg ?? agentExitErrorMessage(backend, exitCode, failureLine),
       stderr: stderrBuf.slice(-800),
       ...(cliTurn ? { turn: cliTurn } : {}),
     };
