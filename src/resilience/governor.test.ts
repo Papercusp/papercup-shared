@@ -100,17 +100,20 @@ test('recordPenalty — maxPauseMs caps a far-future rolling-window reset to a b
   assert.equal(s2.pausedUntil, 30_000);
 });
 
-test('SOFT (predictive) pause is serviceable — acquire({allowSoftPaused}) admits it; a HARD rejected pause never is (2026-06-21)', async () => {
+test('SOFT pause (window still allowed) is serviceable — acquire({allowSoftPaused}) admits it; a HARD rejected pause never is (2026-06-21)', async () => {
   const clock = 2_000_000;
   const resetSec = Math.round((clock + 5 * 60 * 60_000) / 1000);
-  // SOFT: util 0.97 but the window is still ALLOWED → predictive pause, yet Anthropic would serve it.
+  // SOFT: util 0.97 and the window is still ALLOWED. Since WI-10004492 that alone does NOT pause (no
+  // predictive pause); a real non-window penalty does, and that pause is soft because Anthropic would serve.
   const g = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock });
   g.recordResponse({
     'anthropic-ratelimit-unified-5h-status': 'allowed',
     'anthropic-ratelimit-unified-5h-utilization': '0.97',
     'anthropic-ratelimit-unified-5h-reset': String(resetSec),
   });
-  assert.ok(g.state.pausedUntil > clock, 'predictively paused (routes around it when a healthier account exists)');
+  assert.equal(g.state.pausedUntil, 0, 'an allowed window at 0.97 is NOT paused (no early 95% pause)');
+  g.penalize({ retryAfterMs: 60_000 });
+  assert.ok(g.state.pausedUntil > clock, 'a real penalty pauses it');
   assert.equal(g.softPaused(clock), true, 'allowed-but-paused = SOFT / serviceable');
   assert.equal(await g.acquire({}, { maxWaitMs: 0 }), null, 'a normal acquire is blocked by the pause');
   const rel = await g.acquire({}, { maxWaitMs: 0, allowSoftPaused: true });
@@ -136,8 +139,10 @@ test('SOFT (predictive) pause is serviceable — acquire({allowSoftPaused}) admi
     'anthropic-ratelimit-unified-7d-utilization': '1',
     'anthropic-ratelimit-unified-7d-reset': String(resetSec),
   });
-  assert.ok(g3.state.pausedUntil > clock, 'predictively paused at the cap');
-  assert.equal(g3.softPaused(clock), true, 'util 1.0 but allowed = SERVICEABLE (rejected is authoritative, not the fraction)');
+  assert.equal(g3.state.pausedUntil, 0, 'util 1.0 but still allowed is NOT paused — serve until an actual rejection');
+  assert.ok(await g3.acquire({}, { maxWaitMs: 0 }), 'a NORMAL acquire serves the at-cap-but-allowed account');
+  g3.penalize({ retryAfterMs: 60_000 });
+  assert.equal(g3.softPaused(clock), true, 'penalized but window allowed = SERVICEABLE (rejected is authoritative, not the fraction)');
   assert.ok(await g3.acquire({}, { maxWaitMs: 0, allowSoftPaused: true }), 'allowSoftPaused serves the at-cap-but-allowed account instead of shedding');
 });
 
@@ -1070,7 +1075,7 @@ test('recordHeaders — unified.observedAt only advances on a FRESH response, so
   assert.equal(s.unified!.observedAt, t0, 'observedAt stays put — it is not a live clock, it is the last-write timestamp');
 });
 
-test('recordHeaders — a 7d-exhausted window parks FAR longer than the flat 2-min re-probe (owner 2026-06-21: agents pinned to a 97%-7d account 429ing while its 5h read empty)', () => {
+test('recordHeaders — a REJECTED 7d window parks FAR longer than the flat 2-min re-probe (owner 2026-06-21: agents pinned to a 7d-spent account 429ing while its 5h read empty)', () => {
   const s = initGovernorState({ maxConcurrent: 10 });
   const now = 1_700_000_000_000;
   const reset7dSec = Math.round((now + 27 * 60 * 60_000) / 1000); // ~27h out — like the reported aviynw8/aviynw
@@ -1081,19 +1086,19 @@ test('recordHeaders — a 7d-exhausted window parks FAR longer than the flat 2-m
       'anthropic-ratelimit-unified-5h-status': 'allowed',
       'anthropic-ratelimit-unified-5h-utilization': '0.0', // the 5h window reads EMPTY — the misleading "current usage"
       'anthropic-ratelimit-unified-5h-reset': String(reset5hSec),
-      'anthropic-ratelimit-unified-7d-status': 'allowed',
-      'anthropic-ratelimit-unified-7d-utilization': '0.97', // …but the 7-DAY budget is spent → predictive-pause
+      'anthropic-ratelimit-unified-7d-status': 'rejected',
+      'anthropic-ratelimit-unified-7d-utilization': '1.0', // …but the 7-DAY budget is spent and Anthropic REJECTS
       'anthropic-ratelimit-unified-7d-reset': String(reset7dSec),
     },
     now,
   );
   const pausedFor = s.pausedUntil - now;
-  // The fix: a 7d-exhausted account is parked ~its real recovery (tens of minutes), NOT re-probed every 2 min
+  // A 7d-rejected account is parked ~its real recovery (tens of minutes), NOT re-probed every 2 min
   // (which re-lured pinned agents back onto it into a 429 every 2 min). Bounded by the max so it re-checks.
   assert.ok(pausedFor > ROLLING_WINDOW_REPROBE_MS, `parked far longer than the flat 2-min re-probe (got ${Math.round(pausedFor / 1000)}s)`);
   assert.ok(pausedFor <= ROLLING_WINDOW_REPROBE_MAX_MS, 'still bounded by the max re-probe (never the full multi-day reset)');
   assert.equal(s.unified!.window, '7d', 'the 7-day window binds (the 5h reads empty)');
-  assert.equal(s.unified!.utilization, 0.97);
+  assert.equal(s.unified!.rejected, true);
 });
 
 test('recordHeaders — unified high utilization (allowed) sets pre-emptive pace, not a pause', () => {
@@ -1132,32 +1137,60 @@ test('recordHeaders — unified utilization below the watermark paces 0 (healthy
   assert.equal(s.unified!.utilization, 0.2);
 });
 
-// --- PREDICTIVE pre-emptive pause (owner-requested 2026-06-18, UNIFIED_PREDICT_PAUSE_WATERMARK 0.95) ---
-// A rolling window at/over 0.95 utilization will almost certainly 429 the NEXT request even though THIS
-// response was `allowed` — so the governor proactively pauses the account for the bounded re-probe so
-// routing/failover SKIPS it before it 429s, then re-probes once the window ages back below the cap.
-test('recordHeaders — unified util ≥ 0.95 (allowed, future reset) PROACTIVELY pauses the re-probe window before it 429s', () => {
+// --- NO early pause on an ALLOWED window (owner Avi 2026-10-01, WI-10004492) ---
+// The former ≥0.95 predictive pause (2026-06-18) parked an account Anthropic still served for up to
+// 30 min after EVERY response — aviynw4 at 7d 0.96 (reset ~132h out) got ~1 request per 30 min while the
+// fleet starved. Owner ruling: let the account keep going until an ACTUAL penalty (a rejection / 429).
+test('recordHeaders — an ALLOWED window at 0.95–1.0 is NEVER paused; the first real rejection is (WI-10004492)', () => {
+  const now = 1_790_820_169_407; // the 2026-10-01T02:02:49Z re-pause of aviynw4
+  const reset7dSec = Math.round((now + 132 * 60 * 60_000) / 1000); // 7d reset ~132h out (aviynw4's)
+  for (const util of ['0.95', '0.96', '0.99', '1']) {
+    const s = initGovernorState({ maxConcurrent: 10 });
+    recordHeaders(
+      s,
+      {
+        'anthropic-ratelimit-unified-7d-status': 'allowed',
+        'anthropic-ratelimit-unified-7d-utilization': util,
+        'anthropic-ratelimit-unified-7d-reset': String(reset7dSec),
+      },
+      now,
+    );
+    assert.equal(s.pausedUntil, 0, `7d ${util} still ALLOWED → no pause`);
+    assert.equal(s.unified!.rejected, false);
+    assert.equal(decideAcquire(s, now, {}).allowed, true, `7d ${util} still ALLOWED → admitted (keeps serving)`);
+
+    // The ACTUAL penalty: Anthropic rejects the window → now (and only now) the account is parked.
+    recordHeaders(
+      s,
+      {
+        'anthropic-ratelimit-unified-7d-status': 'rejected',
+        'anthropic-ratelimit-unified-7d-utilization': '1.0',
+        'anthropic-ratelimit-unified-7d-reset': String(reset7dSec),
+      },
+      now,
+    );
+    assert.ok(s.pausedUntil > now, `after a real rejection (from ${util}) the account is paused`);
+    assert.ok(s.pausedUntil <= now + ROLLING_WINDOW_REPROBE_MAX_MS, 'bounded re-probe, not the multi-day reset');
+    assert.equal(decideAcquire(s, now, {}).allowed, false, 'blocked after the real rejection');
+  }
+});
+
+test('recordHeaders — an ALLOWED 5h window at 0.97 is not paused either (no early pause on any window)', () => {
   const s = initGovernorState({ maxConcurrent: 10 });
-  const now = 1_000;
-  const resetSec = Math.round(now / 1000) + 3_600; // a FUTURE reset (window still live)
+  const now = 1_700_000_000_000; // a realistic clock: the pace gap is measured from lastAcquireAt (0)
+  const resetSec = Math.round(now / 1000) + 3_600;
   recordHeaders(
     s,
     {
-      // 7-day Claude Max budget effectively spent (0.97 ≥ 0.95) but NOT yet rejected — the next request
-      // would tip it over. The governor predicts the 429 and backs off NOW rather than routing into it.
-      'anthropic-ratelimit-unified-7d-status': 'allowed',
-      'anthropic-ratelimit-unified-7d-utilization': '0.97',
-      'anthropic-ratelimit-unified-7d-reset': String(resetSec),
+      'anthropic-ratelimit-unified-5h-status': 'allowed',
+      'anthropic-ratelimit-unified-5h-utilization': '0.97',
+      'anthropic-ratelimit-unified-5h-reset': String(resetSec),
     },
     now,
   );
-  assert.equal(s.pausedUntil, now + ROLLING_WINDOW_REPROBE_MS, 'predictive pause = bounded re-probe interval, not the multi-hour reset');
-  assert.ok(s.pausedUntil < resetSec * 1000, 'far below the full window reset (re-probe, not hard-pause to reset)');
-  assert.equal(s.unified!.rejected, false, 'the window was ALLOWED — the pause is predictive, not a rejection');
-  assert.equal(s.unified!.utilization, 0.97);
-  // The account is skipped during the predictive pause, then re-probes once it elapses.
-  assert.equal(decideAcquire(s, now, {}).allowed, false, 'blocked during the predictive pause');
-  assert.equal(decideAcquire(s, now + ROLLING_WINDOW_REPROBE_MS + 1, {}).allowed, true, 'then re-probes the freed window');
+  assert.equal(s.pausedUntil, 0, 'allowed 5h at 0.97 → no pause');
+  assert.ok(s.paceDelayMs > 0, 'the soft pace still spreads load as the window fills');
+  assert.equal(decideAcquire(s, now, {}).allowed, true);
 });
 
 test('recordHeaders — unified util 0.85 (below the 0.95 predict watermark, allowed) PACES but does NOT pause', () => {
