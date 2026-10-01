@@ -64,7 +64,11 @@ describe('@anthropic-ai/sdk retry-after patch (WI-10004615)', () => {
   });
 
   it('also refuses a long wait requested via retry-after-ms and via an HTTP date', async () => {
-    for (const headers of [{ 'retry-after-ms': '61000' }, { 'retry-after': new Date(Date.now() + 3_600_000).toUTCString() }]) {
+    const longWaits: Record<string, string>[] = [
+      { 'retry-after-ms': '61000' },
+      { 'retry-after': new Date(Date.now() + 3_600_000).toUTCString() },
+    ];
+    for (const headers of longWaits) {
       const { calls, fetchImpl } = stubFetch([rateLimited(headers)]);
       await expect(client(fetchImpl).messages.create(params)).rejects.toMatchObject({ status: 429 });
       expect(calls).toHaveLength(1);
@@ -82,7 +86,8 @@ describe('@anthropic-ai/sdk retry-after patch (WI-10004615)', () => {
     const msg = await client(fetchImpl).messages.create(params);
     expect(msg.content[0]).toMatchObject({ type: 'text', text: 'ok' });
     expect(calls).toHaveLength(2);
-    expect(calls[1].at - calls[0].at).toBeGreaterThanOrEqual(40);
+    const [first, second] = calls;
+    expect((second?.at ?? 0) - (first?.at ?? 0)).toBeGreaterThanOrEqual(40);
   });
 
   it('a retry wait observes the request AbortSignal', async () => {
