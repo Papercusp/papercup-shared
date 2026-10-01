@@ -1001,6 +1001,53 @@ test('recordHeaders — unified 5h rejected pauses a BOUNDED re-probe interval, 
   assert.equal(decideAcquire(s, now + ROLLING_WINDOW_REPROBE_MAX_MS + 1, {}).allowed, true); // then re-probes
 });
 
+test('recordHeaders — a rejected allowance that USAGE CREDITS are serving does NOT pause the account (P-008)', () => {
+  // Past the allowance, Anthropic bills the request from usage credits: the response itself was a 200,
+  // so pausing on `unified-status: rejected` would wall off an account that is still serving.
+  for (const overage of [
+    { 'anthropic-ratelimit-unified-overage-in-use': 'true' },
+    { 'anthropic-ratelimit-unified-overage-status': 'allowed' },
+    { 'anthropic-ratelimit-unified-overage-status': 'allowed_warning' },
+  ]) {
+    const s = initGovernorState({ maxConcurrent: 10 });
+    const now = 1_000;
+    const resetSec = 1_781_076_000;
+    recordHeaders(
+      s,
+      {
+        'anthropic-ratelimit-unified-5h-status': 'rejected',
+        'anthropic-ratelimit-unified-5h-utilization': '1.01',
+        'anthropic-ratelimit-unified-5h-reset': String(resetSec),
+        'anthropic-ratelimit-unified-status': 'rejected',
+        'anthropic-ratelimit-unified-reset': String(resetSec),
+        'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+        ...overage,
+      },
+      now,
+    );
+    assert.equal(s.pausedUntil <= now, true, `no pause while usage credits serve (${JSON.stringify(overage)})`);
+    assert.equal(decideAcquire(s, now, {}).allowed, true);
+    assert.equal(s.unified?.rejected, true, 'the allowance state itself is still recorded as rejected');
+    assert.equal(s.unified?.overage, true, 'and marked as served by usage credits');
+  }
+  // Control: overage REJECTED (credits exhausted / disabled) is a real wall and still pauses.
+  const s = initGovernorState({ maxConcurrent: 10 });
+  recordHeaders(
+    s,
+    {
+      'anthropic-ratelimit-unified-5h-status': 'rejected',
+      'anthropic-ratelimit-unified-5h-utilization': '1.01',
+      'anthropic-ratelimit-unified-5h-reset': '1781076000',
+      'anthropic-ratelimit-unified-status': 'rejected',
+      'anthropic-ratelimit-unified-reset': '1781076000',
+      'anthropic-ratelimit-unified-overage-status': 'rejected',
+    },
+    1_000,
+  );
+  assert.equal(s.pausedUntil > 1_000, true, 'overage rejected => paused');
+  assert.equal(s.unified?.overage, undefined);
+});
+
 test('recordHeaders — unified.observedAt only advances on a FRESH response, so it stays a true staleness clock across an idle stretch (EI-535)', () => {
   const s = initGovernorState({ maxConcurrent: 10 });
   const t0 = 1_000;
