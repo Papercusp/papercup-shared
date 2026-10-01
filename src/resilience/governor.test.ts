@@ -1101,7 +1101,7 @@ test('recordHeaders — a REJECTED 7d window parks FAR longer than the flat 2-mi
   assert.equal(s.unified!.rejected, true);
 });
 
-test('recordHeaders — unified high utilization (allowed) sets pre-emptive pace, not a pause', () => {
+test('recordHeaders — unified high utilization (allowed) neither paces nor pauses (WI-10004505)', () => {
   const s = initGovernorState({ maxConcurrent: 10 });
   const now = 1_000;
   const resetMs = now + 3_600_000;
@@ -1109,14 +1109,14 @@ test('recordHeaders — unified high utilization (allowed) sets pre-emptive pace
     s,
     {
       'anthropic-ratelimit-unified-5h-status': 'allowed',
-      'anthropic-ratelimit-unified-5h-utilization': '0.9', // halfway from watermark 0.8 → 1.0
+      'anthropic-ratelimit-unified-5h-utilization': '0.9', // formerly → a 2.5s pace gap
       'anthropic-ratelimit-unified-5h-reset': String(Math.round(resetMs / 1000)),
     },
     now,
   );
   assert.equal(s.pausedUntil, 0, 'allowed window does not pause');
-  // gap = 5000 * (0.9 - 0.8)/(1 - 0.8) = 5000 * 0.5 = 2500
-  assert.equal(s.paceDelayMs, 2500);
+  // Owner Avi 2026-10-01: utilization pacing removed — an allowed window serves at full rate.
+  assert.equal(s.paceDelayMs, 0, 'no utilization pace on an allowed window');
   assert.equal(s.unified!.rejected, false);
   assert.equal(s.unified!.utilization, 0.9);
 });
@@ -1177,7 +1177,7 @@ test('recordHeaders — an ALLOWED window at 0.95–1.0 is NEVER paused; the fir
 
 test('recordHeaders — an ALLOWED 5h window at 0.97 is not paused either (no early pause on any window)', () => {
   const s = initGovernorState({ maxConcurrent: 10 });
-  const now = 1_700_000_000_000; // a realistic clock: the pace gap is measured from lastAcquireAt (0)
+  const now = 1_700_000_000_000; // a realistic clock: any pace gap is measured from lastAcquireAt (0)
   const resetSec = Math.round(now / 1000) + 3_600;
   recordHeaders(
     s,
@@ -1189,30 +1189,45 @@ test('recordHeaders — an ALLOWED 5h window at 0.97 is not paused either (no ea
     now,
   );
   assert.equal(s.pausedUntil, 0, 'allowed 5h at 0.97 → no pause');
-  assert.ok(s.paceDelayMs > 0, 'the soft pace still spreads load as the window fills');
+  assert.equal(s.paceDelayMs, 0, 'allowed 5h at 0.97 → no pace either (WI-10004505)');
   assert.equal(decideAcquire(s, now, {}).allowed, true);
 });
 
-test('recordHeaders — unified util 0.85 (below the 0.95 predict watermark, allowed) PACES but does NOT pause', () => {
+test('recordHeaders — unified 7d util 0.85 (allowed) neither paces nor pauses (WI-10004505)', () => {
   const s = initGovernorState({ maxConcurrent: 10 });
-  const now = 1_000;
+  const now = 1_700_000_000_000; // a realistic clock so decideAcquire's gap checks are meaningful
   const resetSec = Math.round(now / 1000) + 3_600;
   recordHeaders(
     s,
     {
-      // Above the 0.8 pace watermark but below the 0.95 predict watermark → still serve, just slow.
+      // Formerly above the 0.8 pace watermark → slowed. Now an allowed weekly window serves at full rate.
       'anthropic-ratelimit-unified-7d-status': 'allowed',
       'anthropic-ratelimit-unified-7d-utilization': '0.85',
       'anthropic-ratelimit-unified-7d-reset': String(resetSec),
     },
     now,
   );
-  assert.equal(s.pausedUntil, 0, 'below the predict watermark → no proactive pause (it only paces)');
-  assert.ok(s.paceDelayMs > 0, 'still over the pace watermark → a soft pace gap is set (not a pause)');
-  // The decideAcquire denial here would be reason:'pace' (the soft gap), never reason:'paused' — the
-  // distinction the test guards: a 0.85 window slows the account, it does not skip it out of rotation.
-  assert.notEqual(decideAcquire(s, now, {}).reason, 'paused', 'not paused (at most paced)');
+  assert.equal(s.pausedUntil, 0, 'allowed 7d window → no pause');
+  assert.equal(s.paceDelayMs, 0, 'allowed 7d window → no utilization pace');
+  assert.equal(decideAcquire(s, now, {}).allowed, true, 'serves immediately — neither paused nor paced');
   assert.equal(s.unified!.utilization, 0.85);
+});
+
+test('recordHeaders — NO allowed unified window in 0.80..0.999 sets any pace or pause (regression guard, WI-10004505)', () => {
+  // Owner Avi 2026-10-01: "remove that. keep the burn-rate shed" — utilization-based slowdown pacing is gone.
+  // Sweep every window × the former pace band so a re-added watermark on ANY window fails here.
+  const now = 1_700_000_000_000;
+  const resetSec = Math.round(now / 1000) + 3_600;
+  for (const win of ['5h', '7d', null] as const) {
+    const k = (suffix: string) => (win ? `anthropic-ratelimit-unified-${win}-${suffix}` : `anthropic-ratelimit-unified-${suffix}`);
+    for (const util of [0.8, 0.81, 0.85, 0.9, 0.95, 0.97, 0.99, 0.999]) {
+      const s = initGovernorState({ maxConcurrent: 10 });
+      recordHeaders(s, { [k('status')]: 'allowed', [k('utilization')]: String(util), [k('reset')]: String(resetSec) }, now);
+      assert.equal(s.paceDelayMs, 0, `${win ?? 'unified'} @ ${util} allowed → no pace`);
+      assert.equal(s.pausedUntil, 0, `${win ?? 'unified'} @ ${util} allowed → no pause`);
+      assert.equal(decideAcquire(s, now, {}).allowed, true, `${win ?? 'unified'} @ ${util} allowed → serves now`);
+    }
+  }
 });
 
 test('recordHeaders — classic and unified dialects are independent; absent unified leaves s.unified undefined', () => {

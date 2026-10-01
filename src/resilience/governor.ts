@@ -210,11 +210,6 @@ const MAX_PACE_DELAY_MS = 5_000;
 const RPM_AIMD_DECREASE = Number(process.env.PAPERCUSP_GATEWAY_RPM_AIMD_DECREASE) || 0.5;
 const RPM_AIMD_MIN_FACTOR = Number(process.env.PAPERCUSP_GATEWAY_RPM_AIMD_MIN) || 0.1;
 const RPM_AIMD_RECOVER_MS = Number(process.env.PAPERCUSP_GATEWAY_RPM_AIMD_RECOVER_MS) || 5 * 60_000;
-// Unified (subscription) dialect: above this utilization fraction of the binding window we start
-// pre-emptively pacing — the per-request gap grows linearly from 0 at the watermark to
-// MAX_PACE_DELAY_MS as utilization → 1, so a 5-hour budget glides toward its reset instead of
-// being burned early then hard-stopping for hours. `status: rejected` still hard-pauses to reset.
-const UNIFIED_PACE_WATERMARK = 0.8;
 // After a REAL rejection, the utilization a rolling window must age back below before the account is
 // worth re-probing — it only scales the post-rejection re-probe interval (scaledReprobeAt). It is NOT a
 // pause trigger: the former predictive pause at ≥ this value on a still-ALLOWED window was removed
@@ -481,9 +476,9 @@ export function recordHeaders(s: GovernorState, headers: Record<string, string |
 
   // Unified (subscription) dialect: rolling-UTILIZATION windows (5h + 7d), not per-minute
   // buckets — a Claude Max/Pro account never returns the classic `*-limit` headers. A window
-  // `status: rejected` → hard-pause to its reset; high utilization (< 1, still allowed) →
-  // pre-emptive pace that grows linearly past the watermark. The most-constraining window is
-  // recorded on `s.unified` for observability (P-014). Resets are unix seconds here.
+  // `status: rejected` → bounded re-probe pause; high utilization (< 1, still allowed) → no pause
+  // and no pace (it serves at full rate). The most-constraining window is recorded on `s.unified`
+  // for observability (P-014). Resets are unix seconds here.
   const unifiedWindows: Array<{ window: string; statusK: string; utilK: string; resetK: string }> = [
     { window: '5h', statusK: 'anthropic-ratelimit-unified-5h-status', utilK: 'anthropic-ratelimit-unified-5h-utilization', resetK: 'anthropic-ratelimit-unified-5h-reset' },
     { window: '7d', statusK: 'anthropic-ratelimit-unified-7d-status', utilK: 'anthropic-ratelimit-unified-7d-utilization', resetK: 'anthropic-ratelimit-unified-7d-reset' },
@@ -521,14 +516,11 @@ export function recordHeaders(s: GovernorState, headers: Record<string, string |
     // pausing at 95%"). The former ≥0.95 predictive pause re-armed a 30-min park after EVERY served
     // request on an account with weekly headroom left (aviynw4 at 0.96 got ~1 request per 30 min while
     // the fleet starved), idling the last few % of each allowance. Only a real rejection (above) or a
-    // 429 via `penalize()` pauses now; the soft pace below still spreads load as a window fills.
-    if (util !== undefined && util > UNIFIED_PACE_WATERMARK && util < 1 && resetAt > now) {
-      const gap = Math.min(
-        MAX_PACE_DELAY_MS,
-        Math.round((MAX_PACE_DELAY_MS * (util - UNIFIED_PACE_WATERMARK)) / (1 - UNIFIED_PACE_WATERMARK)),
-      );
-      if (gap > pace) pace = gap;
-    }
+    // 429 via `penalize()` pauses now.
+    // NO utilization pacing either (owner Avi, 2026-10-01, WI-10004505: "remove that. keep the burn-rate
+    // shed"). The former ≥0.8 soft pace spaced requests up to 5s apart as a window filled, throttling an
+    // account that still had allowance. A high-but-allowed window now serves at full rate; the burn
+    // governor's projected-exhaustion shed (WI-41147, outside this function) is the only pre-penalty brake.
     // Most-constraining window wins for observability: a rejected window beats an allowed one;
     // among same-verdict windows, the higher utilization binds.
     const u = util ?? (rejected ? 1 : 0);
