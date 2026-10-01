@@ -99,6 +99,12 @@ export interface UnifiedWindowState {
    *  a `UnifiedWindowState` by hand (tests, older persisted snapshots) stay valid — absence just means
    *  staleness can't be computed for that reading, not that it's fresh. */
   observedAt?: number;
+  /** True when the same response said usage credits (overage) are serving this account
+   *  (`anthropic-ratelimit-unified-overage-in-use: true`, or overage status allowed /
+   *  allowed_warning). A `rejected` allowance window then does NOT stop the account — requests are
+   *  billed from usage credits instead — so `recordHeaders` takes no pause for it, and a consumer
+   *  must not read `rejected` as "cannot serve" (anthropic-credits-gateway-2026-09-30 P-008). */
+  overage?: boolean;
 }
 
 export interface TokenEstimate {
@@ -482,6 +488,16 @@ export function recordHeaders(s: GovernorState, headers: Record<string, string |
     { window: '7d', statusK: 'anthropic-ratelimit-unified-7d-status', utilK: 'anthropic-ratelimit-unified-7d-utilization', resetK: 'anthropic-ratelimit-unified-7d-reset' },
     { window: 'unified', statusK: 'anthropic-ratelimit-unified-status', utilK: 'anthropic-ratelimit-unified-utilization', resetK: 'anthropic-ratelimit-unified-reset' },
   ];
+  // Usage credits (overage) serving: past the allowance, Anthropic bills the request from usage
+  // credits instead of refusing it, so a `rejected` allowance window — or one predicted to reject —
+  // no longer means "this account cannot serve". Pausing it would strand credits the owner enabled
+  // (anthropic-credits-gateway-2026-09-30 P-008, D-003). Overage that cannot serve (status rejected,
+  // a disabled reason) is NOT this case: the allowance verdict stands and pauses as before.
+  const overageStatus = String(h['anthropic-ratelimit-unified-overage-status'] ?? '').toLowerCase();
+  const overageServes =
+    String(h['anthropic-ratelimit-unified-overage-in-use'] ?? '').toLowerCase() === 'true' ||
+    overageStatus === 'allowed' ||
+    overageStatus === 'allowed_warning';
   let binding: UnifiedWindowState | undefined;
   for (const w of unifiedWindows) {
     const status = h[w.statusK];
@@ -493,7 +509,9 @@ export function recordHeaders(s: GovernorState, headers: Record<string, string |
     // continuously, so sitting on the multi-hour reset goes stale (false exhaustion). See
     // ROLLING_WINDOW_REPROBE_MS. The real `resetAt` is still recorded on `s.unified` (observability)
     // + used by the gateway failover's rejoin time.
-    if (rejected) {
+    if (overageServes) {
+      // Usage credits carry the request past the allowance: no pause (see overageServes above).
+    } else if (rejected) {
       const reprobeAt = scaledReprobeAt(now, util ?? 1, resetAt);
       if (reprobeAt > s.pausedUntil) s.pausedUntil = reprobeAt;
     }
@@ -518,7 +536,7 @@ export function recordHeaders(s: GovernorState, headers: Record<string, string |
     // among same-verdict windows, the higher utilization binds.
     const u = util ?? (rejected ? 1 : 0);
     if (!binding || (rejected && !binding.rejected) || (rejected === binding.rejected && u > binding.utilization)) {
-      binding = { window: w.window, utilization: u, resetAt, rejected, observedAt: now };
+      binding = { window: w.window, utilization: u, resetAt, rejected, observedAt: now, ...(overageServes ? { overage: true } : {}) };
     }
   }
   if (binding) s.unified = binding;
