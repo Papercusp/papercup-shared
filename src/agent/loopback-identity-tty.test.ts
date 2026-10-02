@@ -7,6 +7,7 @@ import {
   AGENT_IDENTITY_SPEC_ENV,
   AgentIdentityTtyRefusedError,
   CLAUDE_PROJECT_LAUNCH_FLAGS,
+  parseAgentIdentitySpec,
   planAgentIdentityTty,
   stageAgentIdentityTty,
   type AgentIdentitySpec,
