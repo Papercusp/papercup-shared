@@ -112,8 +112,10 @@ describe('loopback identity TTY stage + exec (D-424)', () => {
   // WI-10005296 (D-031): fixedEnv is operator-set env every agent gets (heavy-job admission).
   it('validates fixedEnv: strings under env names, never HOME/PATH or a credential-shaped name', () => {
     expect(parseAgentIdentitySpec({ ...spec, fixedEnv: { NODE_OPTIONS: '--require=/t/h.cjs' } }).fixedEnv).toEqual({ NODE_OPTIONS: '--require=/t/h.cjs' });
-    for (const bad of [{ PATH: '/x' }, { HOME: '/x' }, { GITHUB_TOKEN: 'x' }, { 'BAD-NAME': 'x' }, { N: 1 }, ['x']]) {
-      expect(() => parseAgentIdentitySpec({ ...spec, fixedEnv: bad })).toThrow(/fixedEnv/);
+    // Deliberately ill-typed inputs: the parser must refuse what the type system would also refuse.
+    const bads: unknown[] = [{ PATH: '/x' }, { HOME: '/x' }, { GITHUB_TOKEN: 'x' }, { 'BAD-NAME': 'x' }, { N: 1 }, ['x']];
+    for (const bad of bads) {
+      expect(() => parseAgentIdentitySpec({ ...spec, fixedEnv: bad as Readonly<Record<string, string>> })).toThrow(/fixedEnv/);
     }
   });
 
