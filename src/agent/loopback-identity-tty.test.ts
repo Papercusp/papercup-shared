@@ -108,6 +108,14 @@ describe('loopback identity TTY stage + exec (D-424)', () => {
     expect(AGENT_IDENTITY_SPEC_ENV).toBe('PAPERCUSP_AGENT_IDENTITY_SPEC');
   });
 
+  // WI-10005296 (D-031): fixedEnv is operator-set env every agent gets (heavy-job admission).
+  it('validates fixedEnv: strings under env names, never HOME/PATH or a credential-shaped name', () => {
+    expect(parseAgentIdentitySpec({ ...spec, fixedEnv: { NODE_OPTIONS: '--require=/t/h.cjs' } }).fixedEnv).toEqual({ NODE_OPTIONS: '--require=/t/h.cjs' });
+    for (const bad of [{ PATH: '/x' }, { HOME: '/x' }, { GITHUB_TOKEN: 'x' }, { 'BAD-NAME': 'x' }, { N: 1 }, ['x']]) {
+      expect(() => parseAgentIdentitySpec({ ...spec, fixedEnv: bad })).toThrow(/fixedEnv/);
+    }
+  });
+
   it('stages then runs the toolchain agent as the target: shipped prompt, own HOME/PATH/cwd, allowlisted env only', () => {
     const exec = stageAgentIdentityTty(JSON.stringify(spec), request({ args: [...request().args, '--exit=3'] }));
     // The exec header was written 0600 by the stage hop, beneath the target's spawn root.

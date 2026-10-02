@@ -157,6 +157,13 @@ describe('buildLoopbackIdentitySpawn — the real inline wrapper', () => {
     expect(JSON.parse(result.stdout).path.split(':')).toEqual(remotePath);
   });
 
+  // WI-10005296 (D-031): fixedEnv is operator-set env; HOME/PATH stay owned by remoteHome/remotePath.
+  it('refuses a fixedEnv that tries to set HOME or PATH', () => {
+    for (const key of ['HOME', 'PATH']) {
+      expect(() => buildLoopbackIdentitySpawn(options({ fixedEnv: { [key]: '/x' } }))(request())).toThrow(`fixedEnv may not set ${key}`);
+    }
+  });
+
   it('propagates the agent exit code so a failed turn stays a failure', async () => {
     const req = request({ env: { ...request().env, PROBE_EXIT: '3' } });
     const result = await run(buildLoopbackIdentitySpawn(options())(req), '');
