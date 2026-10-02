@@ -262,6 +262,16 @@ test('classifySubprocessResult — ordinary auth diagnostics retain their existi
   assert.equal(e.message, stderr.slice(0, 200));
   assert.equal(e.message.includes('malformed Authorization header'), false);
 });
+test('classifySubprocessResult — authentication inside a missing-tool identifier is not an auth wall', () => {
+  const e = classifySubprocessResult({
+    exitCode: 1,
+    stderr: 'Permission deny rule "ToolSearch" matches no known tool — check for typos.',
+    stdout: "API Error: 400 Tool reference 'mcp__tsenta__complete_authentication' not found in available tools",
+  });
+
+  assert.equal(e.class, 'agent_crash');
+  assert.equal(e.classifiedOn, undefined);
+});
 test('classifySubprocessResult — nonzero exit, no known pattern → agent_crash', () => {
   const e = classifySubprocessResult({ exitCode: 2, stderr: 'TypeError: boom' });
   assert.equal(e.class, 'agent_crash');
