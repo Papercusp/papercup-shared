@@ -3,10 +3,14 @@ import { createStatelessDiagnosticFetch, runAgentChat, type StatelessTransportDi
 
 const sdk = vi.hoisted(() => ({ fetch: undefined as typeof fetch | undefined,
   bodyEvents: [] as unknown[], bodyFailure: undefined as Error | undefined,
-  beforeFailure: undefined as (() => void) | undefined }));
+  beforeFailure: undefined as (() => void) | undefined,
+  real: undefined as typeof import('@anthropic-ai/sdk').default | undefined }));
 vi.mock('@anthropic-ai/sdk', () => ({
   default: class {
-    constructor(options: { fetch?: typeof fetch }) { sdk.fetch = options.fetch; }
+    constructor(options: { fetch?: typeof fetch }) {
+      sdk.fetch = options.fetch;
+      if (sdk.real) this.messages = new sdk.real(options).messages as unknown as typeof this.messages;
+    }
     messages = {
       stream: () => {
         const listeners = new Map<string, (event: unknown) => void>();
@@ -34,7 +38,7 @@ vi.mock('@anthropic-ai/sdk', () => ({
 
 afterEach(() => {
   vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.restoreAllMocks();
-  sdk.bodyEvents = []; sdk.bodyFailure = undefined; sdk.beforeFailure = undefined;
+  sdk.bodyEvents = []; sdk.bodyFailure = undefined; sdk.beforeFailure = undefined; sdk.real = undefined;
 });
 
 const transport = {
@@ -179,5 +183,41 @@ describe('stateless HTTP attempt diagnostics (WI-10005738)', () => {
       callerAborted: null, callerAbortReason: null });
     expect(events.at(-1)).toMatchObject({ type: 'result', finalText: 'ok' });
     expect(JSON.stringify(records)).not.toContain('secret');
+  });
+
+  it('observes actual SDK SSE progress before an interrupted body, without a provider request', async () => {
+    vi.stubEnv('PAPERCUSP_DEFAULT_ACCOUNT_ACTIVE', '1');
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', '0');
+    sdk.real = (await vi.importActual<typeof import('@anthropic-ai/sdk')>('@anthropic-ai/sdk')).default;
+    const controller = new AbortController();
+    const records: StatelessTransportDiagnostic[] = [], events = [];
+    vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: RequestInit) => {
+      const prefix = [
+        { type: 'message_start', message: { id: 'msg_fixture', type: 'message', role: 'assistant',
+          model: 'claude-sonnet-4-6', content: [], stop_reason: null, stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 0 } } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'secret' } },
+      ].map(event => 'event: ' + event.type + '\ndata: ' + JSON.stringify(event) + '\n\n').join('');
+      const body = new ReadableStream<Uint8Array>({ start(streamController) {
+        streamController.enqueue(new TextEncoder().encode(prefix));
+        init?.signal?.addEventListener('abort', () => streamController.error(new Error('fixture body interrupted')), { once: true });
+      } });
+      return new Response(body, { headers: { 'content-type': 'text/event-stream', 'request-id': 'req_sse_fixture' } });
+    }));
+    for await (const event of runAgentChat({ backend: 'anthropic-direct', model: 'claude-sonnet-4-6',
+      promptText: 'secret prompt', signal: controller.signal, retryDeadlineMs: 0,
+      onTransportDiagnostic: r => {
+        records.push(r);
+        if (r.phase === 'stream-progress') queueMicrotask(() => controller.abort(new DOMException('secret reason', 'TimeoutError')));
+      } })) events.push(event);
+    expect(records.at(-1)).toMatchObject({ phase: 'stream-error', status: 200,
+      providerRequestId: 'req_sse_fixture', callerAborted: true, callerAbortReason: 'TimeoutError' });
+    expect(records.at(-1)?.streamEventCount).toBeGreaterThan(0);
+    expect(records.at(-1)?.lastStreamEventAt).toBeTruthy();
+    expect(JSON.stringify(records)).not.toContain('secret');
+    expect(events.at(-1)?.type).toBe('error');
+    expect(events.some(event => event.type === 'result')).toBe(false);
+    expect(fetch).toHaveBeenCalledOnce();
   });
 });
