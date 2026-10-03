@@ -78,7 +78,8 @@ describe('stateless HTTP attempt diagnostics (WI-10005738)', () => {
     const records: StatelessTransportDiagnostic[] = [];
     const events = [];
     for await (const event of runAgentChat({ backend: 'anthropic-direct', model: 'claude-sonnet-4-6',
-      promptText: 'unchanged prompt', retryDeadlineMs: 0, onTransportDiagnostic: r => records.push(r) })) events.push(event);
+      promptText: 'unchanged prompt', signal: AbortSignal.timeout(1000), retryDeadlineMs: 0,
+      onTransportDiagnostic: r => records.push(r) })) events.push(event);
     expect(records.map(r => r.phase)).toEqual(['request', 'response']);
     expect(records[1]).toMatchObject({ providerRequestId: 'req_failure', servedAccount: 'actual-account' });
     expect(events.at(-1)?.type).toBe('error');
