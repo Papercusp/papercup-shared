@@ -11,20 +11,20 @@ vi.mock('@anthropic-ai/sdk', () => ({
       stream: () => {
         const listeners = new Map<string, (event: unknown) => void>();
         const stream = {
-        response: undefined as Response | undefined,
-        once: () => {},
-        on: (event: string, listener: (event: unknown) => void) => { listeners.set(event, listener); },
-        off: (event: string) => { listeners.delete(event); },
-        finalMessage: async () => {
-          const response = await sdk.fetch!('http://127.0.0.1:8788/v1/messages');
-          stream.response = response;
-          if (!response.ok) throw Object.assign(new Error('upstream refusal'), {
-            status: response.status, headers: response.headers,
-          });
-          for (const event of sdk.bodyEvents) listeners.get('streamEvent')?.(event);
-          if (sdk.bodyFailure) { sdk.beforeFailure?.(); throw sdk.bodyFailure; }
-          return { content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 1, output_tokens: 1 } };
-        },
+          response: undefined as Response | undefined,
+          once: () => {},
+          on: (event: string, listener: (event: unknown) => void) => { listeners.set(event, listener); },
+          off: (event: string) => { listeners.delete(event); },
+          finalMessage: async () => {
+            const response = await sdk.fetch!('http://127.0.0.1:8788/v1/messages');
+            stream.response = response;
+            if (!response.ok) throw Object.assign(new Error('upstream refusal'), {
+              status: response.status, headers: response.headers,
+            });
+            for (const event of sdk.bodyEvents) listeners.get('streamEvent')?.(event);
+            if (sdk.bodyFailure) { sdk.beforeFailure?.(); throw sdk.bodyFailure; }
+            return { content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 1, output_tokens: 1 } };
+          },
         };
         return stream;
       },
@@ -142,7 +142,11 @@ describe('stateless HTTP attempt diagnostics (WI-10005738)', () => {
     expect(new Set(records.map(r => r.callId)).size).toBe(1);
     expect(new Set(records.map(r => r.attempt))).toEqual(new Set([1]));
     expect(JSON.stringify(records)).not.toContain('secret');
-    expect(events.at(-1)).toMatchObject({ type: 'error', message: expect.stringContaining('Request was aborted.') });
+    // Diagnostics preserve the actual caller-abort evidence before either
+    // existing retry path applies its own terminal error classification.
+    expect(events.at(-1)).toMatchObject({ type: 'error', message: governed === '1'
+      ? 'anthropic-direct error: aborted while rate-limited'
+      : expect.stringContaining('Request was aborted.') });
     expect(fetch).toHaveBeenCalledOnce();
   });
 
