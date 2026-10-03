@@ -81,8 +81,22 @@ describe('stateless HTTP attempt diagnostics (WI-10005738)', () => {
       promptText: 'unchanged prompt', signal: AbortSignal.timeout(1000), retryDeadlineMs: 0,
       onTransportDiagnostic: r => records.push(r) })) events.push(event);
     expect(records.map(r => r.phase)).toEqual(['request', 'response']);
-    expect(records[1]).toMatchObject({ providerRequestId: 'req_failure', servedAccount: 'actual-account' });
+    expect(records[1]).toMatchObject({ providerRequestId: 'req_failure', servedAccount: 'actual-account',
+      governorMode: governed === '1' ? 'request-local' : 'disabled' });
     expect(events.at(-1)?.type).toBe('error');
     expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it('the real successful path observes headers without altering its model result', async () => {
+    vi.stubEnv('PAPERCUSP_DEFAULT_ACCOUNT_ACTIVE', '1');
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', '0');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('ok', { headers: { 'request-id': 'req_success' } })));
+    const records: StatelessTransportDiagnostic[] = [];
+    const events = [];
+    for await (const event of runAgentChat({ backend: 'anthropic-direct', model: 'claude-sonnet-4-6',
+      promptText: 'unchanged prompt', signal: AbortSignal.timeout(1000),
+      onTransportDiagnostic: r => records.push(r) })) events.push(event);
+    expect(records[1]).toMatchObject({ providerRequestId: 'req_success', servedAccount: null, status: 200 });
+    expect(events.at(-1)).toMatchObject({ type: 'result', finalText: 'ok', tokensIn: 1, tokensOut: 1 });
   });
 });
