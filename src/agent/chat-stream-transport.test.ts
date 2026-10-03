@@ -1,26 +1,41 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createStatelessDiagnosticFetch, runAgentChat, type StatelessTransportDiagnostic } from './chat-stream';
 
-const sdk = vi.hoisted(() => ({ fetch: undefined as typeof fetch | undefined }));
+const sdk = vi.hoisted(() => ({ fetch: undefined as typeof fetch | undefined,
+  bodyEvents: [] as unknown[], bodyFailure: undefined as Error | undefined,
+  beforeFailure: undefined as (() => void) | undefined }));
 vi.mock('@anthropic-ai/sdk', () => ({
   default: class {
     constructor(options: { fetch?: typeof fetch }) { sdk.fetch = options.fetch; }
     messages = {
-      stream: () => ({
+      stream: () => {
+        const listeners = new Map<string, (event: unknown) => void>();
+        const stream = {
+        response: undefined as Response | undefined,
         once: () => {},
+        on: (event: string, listener: (event: unknown) => void) => { listeners.set(event, listener); },
+        off: (event: string) => { listeners.delete(event); },
         finalMessage: async () => {
           const response = await sdk.fetch!('http://127.0.0.1:8788/v1/messages');
+          stream.response = response;
           if (!response.ok) throw Object.assign(new Error('upstream refusal'), {
             status: response.status, headers: response.headers,
           });
+          for (const event of sdk.bodyEvents) listeners.get('streamEvent')?.(event);
+          if (sdk.bodyFailure) { sdk.beforeFailure?.(); throw sdk.bodyFailure; }
           return { content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 1, output_tokens: 1 } };
         },
-      }),
+        };
+        return stream;
+      },
     };
   },
 }));
 
-afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
+afterEach(() => {
+  vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.restoreAllMocks();
+  sdk.bodyEvents = []; sdk.bodyFailure = undefined; sdk.beforeFailure = undefined;
+});
 
 const transport = {
   baseURL: 'http://127.0.0.1:8788', token: 'secret-bearer',
@@ -80,7 +95,7 @@ describe('stateless HTTP attempt diagnostics (WI-10005738)', () => {
     for await (const event of runAgentChat({ backend: 'anthropic-direct', model: 'claude-sonnet-4-6',
       promptText: 'unchanged prompt', signal: AbortSignal.timeout(1000), retryDeadlineMs: 0,
       onTransportDiagnostic: r => records.push(r) })) events.push(event);
-    expect(records.map(r => r.phase)).toEqual(['request', 'response']);
+    expect(records.map(r => r.phase)).toEqual(['request', 'response', 'stream-error']);
     expect(records[1]).toMatchObject({ providerRequestId: 'req_failure', servedAccount: 'actual-account',
       governorMode: governed === '1' ? 'request-local' : 'disabled' });
     expect(events.at(-1)?.type).toBe('error');
@@ -98,5 +113,67 @@ describe('stateless HTTP attempt diagnostics (WI-10005738)', () => {
       onTransportDiagnostic: r => records.push(r) })) events.push(event);
     expect(records[1]).toMatchObject({ providerRequestId: 'req_success', servedAccount: null, status: 200 });
     expect(events.at(-1)).toMatchObject({ type: 'result', finalText: 'ok', tokensIn: 1, tokensOut: 1 });
+    expect(records.at(-1)).toMatchObject({ phase: 'stream-complete', streamEventCount: 0,
+      textChars: 0, firstStreamEventAt: null, lastStreamEventAt: null, callerAborted: false });
+  });
+
+  it.each(['0', '1'])('distinguishes caller timeout after header200 from body failure with governor=%s', async governed => {
+    vi.stubEnv('PAPERCUSP_DEFAULT_ACCOUNT_ACTIVE', '1');
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', governed);
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('secret body', {
+      headers: { 'request-id': 'req_partial', 'x-papercusp-routed-account': 'served-account' },
+    })));
+    sdk.bodyEvents = [{ type: 'message_start' }, { type: 'content_block_delta',
+      delta: { type: 'text_delta', text: 'secret partial response' } }];
+    sdk.bodyFailure = new Error('Request was aborted.');
+    const controller = new AbortController();
+    sdk.beforeFailure = () => controller.abort(new DOMException('secret reason', 'TimeoutError'));
+    const records: StatelessTransportDiagnostic[] = [], events = [];
+    for await (const event of runAgentChat({ backend: 'anthropic-direct', model: 'claude-sonnet-4-6',
+      promptText: 'secret prompt', signal: controller.signal, retryDeadlineMs: 0,
+      onTransportDiagnostic: r => records.push(r) })) events.push(event);
+    expect(records.map(r => r.phase)).toEqual(['request', 'response', 'stream-progress', 'stream-error']);
+    expect(records.at(-1)).toMatchObject({ status: 200, providerRequestId: 'req_partial',
+      servedAccount: 'served-account', streamEventCount: 2, textChars: 23,
+      callerAborted: true, callerAbortReason: 'TimeoutError',
+      governorMode: governed === '1' ? 'request-local' : 'disabled' });
+    expect(records.at(-1)?.firstStreamEventAt).toBeTruthy();
+    expect(records.at(-1)?.lastStreamEventAt).toBeTruthy();
+    expect(new Set(records.map(r => r.callId)).size).toBe(1);
+    expect(new Set(records.map(r => r.attempt))).toEqual(new Set([1]));
+    expect(JSON.stringify(records)).not.toContain('secret');
+    expect(events.at(-1)).toMatchObject({ type: 'error', message: expect.stringContaining('Request was aborted.') });
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it('records a zero-event body failure without falsely claiming caller cancellation', async () => {
+    vi.stubEnv('PAPERCUSP_DEFAULT_ACCOUNT_ACTIVE', '1');
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', '0');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('unread')));
+    sdk.bodyFailure = new Error('malformed provider stream');
+    const records: StatelessTransportDiagnostic[] = [];
+    const events = [];
+    for await (const event of runAgentChat({ backend: 'anthropic-direct', model: 'claude-sonnet-4-6',
+      promptText: 'prompt', signal: new AbortController().signal,
+      onTransportDiagnostic: r => records.push(r) })) events.push(event);
+    expect(records.at(-1)).toMatchObject({ phase: 'stream-error', status: 200, streamEventCount: 0,
+      firstStreamEventAt: null, lastStreamEventAt: null, callerAborted: false, callerAbortReason: null });
+    expect(events.at(-1)).toMatchObject({ type: 'error', message: expect.stringContaining('malformed provider stream') });
+  });
+
+  it('bounds progress output and preserves success when a diagnostic sink throws', async () => {
+    vi.stubEnv('PAPERCUSP_DEFAULT_ACCOUNT_ACTIVE', '1');
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', '0');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('unread')));
+    sdk.bodyEvents = Array.from({ length: 1000 }, () => ({ type: 'content_block_delta',
+      delta: { type: 'text_delta', text: 'secret' } }));
+    const records: StatelessTransportDiagnostic[] = [], events = [];
+    for await (const event of runAgentChat({ backend: 'anthropic-direct', model: 'claude-sonnet-4-6',
+      promptText: 'prompt', onTransportDiagnostic: r => { records.push(r); throw new Error('sink failure'); } })) events.push(event);
+    expect(records.map(r => r.phase)).toEqual(['request', 'response', 'stream-progress', 'stream-complete']);
+    expect(records.at(-1)).toMatchObject({ streamEventCount: 1000, textChars: 6000,
+      callerAborted: null, callerAbortReason: null });
+    expect(events.at(-1)).toMatchObject({ type: 'result', finalText: 'ok' });
+    expect(JSON.stringify(records)).not.toContain('secret');
   });
 });
