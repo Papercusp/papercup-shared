@@ -915,6 +915,7 @@ export interface StatelessTransportDiagnostic {
   label: StatelessTransport['label'];
   endpointOrigin: string | null;
   loopback: boolean | null;
+  governorMode: 'unobserved' | 'disabled' | 'request-local' | 'shared-provider';
   requestedAccount: string | null;
   servedAccount: string | null;
   providerRequestId: string | null;
@@ -929,6 +930,7 @@ export function createStatelessDiagnosticFetch(
   observe: (diagnostic: StatelessTransportDiagnostic) => void,
   send: typeof fetch = globalThis.fetch,
   state = { callId: randomUUID() as string, attempt: 0 },
+  governorMode: StatelessTransportDiagnostic['governorMode'] = 'unobserved',
 ): typeof fetch {
   return async (input, init) => {
     const attempt = ++state.attempt;
@@ -939,7 +941,7 @@ export function createStatelessDiagnosticFetch(
       endpointOrigin = url.origin === 'null' ? null : url.origin;
     } catch { /* An invalid URL remains unknown; fetch owns the actual refusal. */ }
     const base = {
-      callId: state.callId, attempt, label: transport.label, endpointOrigin,
+      callId: state.callId, attempt, label: transport.label, endpointOrigin, governorMode,
       loopback: endpointOrigin === null ? null : isLocalhostUrl(endpointOrigin),
       requestedAccount: transport.headers[ROUTE_ACCOUNT_HEADER]?.trim() || null,
     };
@@ -1601,6 +1603,7 @@ async function* statelessAgentChat(
   // the gateway via gatewayLlmEnv but never identified itself as `scout`).
   const tierHeaders = priorityTierHeaders(opts.priority);
   const callerHeaders = ownerHeaders(opts.ownerId);
+  const governed = process.env.PAPERCUSP_AGENT_GOVERNOR === '1';
   // One local identity across SDK retries and credential-refresh client replacements.
   const diagnosticState = { callId: randomUUID() as string, attempt: 0 };
   const mkClient = (t: StatelessTransport) =>
@@ -1611,6 +1614,7 @@ async function* statelessAgentChat(
       maxRetries: 2,
       ...(opts.onTransportDiagnostic ? { fetch: createStatelessDiagnosticFetch(
         t, opts.onTransportDiagnostic, globalThis.fetch, diagnosticState,
+        governed ? (isLocalhostUrl(t.baseURL) ? 'request-local' : 'shared-provider') : 'disabled',
       ) } : {}),
     });
   let client = mkClient(transport);
@@ -1641,7 +1645,7 @@ async function* statelessAgentChat(
   // limit and a 429 honors the server's retry-after instead of a blind backoff. OFF by
   // default → the proven retry loop below runs unchanged (zero behavior change for the
   // live fleet until validated).
-  if (process.env.PAPERCUSP_AGENT_GOVERNOR === '1') {
+  if (governed) {
     yield* governedStatelessChat(client, params, opts, { transport, mkClient });
     return;
   }
