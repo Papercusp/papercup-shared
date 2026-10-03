@@ -910,7 +910,7 @@ export interface StatelessTransportDiagnostic {
   /** Local correlation only; not an admission/idempotency key. */
   callId: string;
   attempt: number;
-  phase: 'request' | 'response' | 'transport-error';
+  phase: 'request' | 'response' | 'transport-error' | 'stream-progress' | 'stream-complete' | 'stream-error';
   observedAt: string;
   label: StatelessTransport['label'];
   endpointOrigin: string | null;
@@ -920,6 +920,13 @@ export interface StatelessTransportDiagnostic {
   servedAccount: string | null;
   providerRequestId: string | null;
   status: number | null;
+  /** Parsed SDK message events, not raw bytes or evidence of a completed response. */
+  streamEventCount?: number;
+  textChars?: number;
+  firstStreamEventAt?: string | null;
+  lastStreamEventAt?: string | null;
+  callerAborted?: boolean | null;
+  callerAbortReason?: 'TimeoutError' | 'AbortError' | 'other' | null;
 }
 
 /** Observe the SDK's fetch boundary so its own retry ladder cannot hide HTTP
@@ -964,6 +971,78 @@ export function createStatelessDiagnosticFetch(
       throw err;
     }
   };
+}
+
+/** Observe parsed message progress without reading/teeing the HTTP body or retaining
+ * text. Header arrival alone cannot distinguish a stalled body from generation
+ * exceeding a caller deadline (WI-10005973). Both retry paths use this observer. */
+async function finalStatelessMessage(
+  // The SDK is loaded lazily; keep this structural seam independent of its runtime import.
+  stream: {
+    on(event: 'streamEvent', listener: (event: unknown) => void): unknown;
+    off(event: 'streamEvent', listener: (event: unknown) => void): unknown;
+    response?: Response | null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    finalMessage(): Promise<any>;
+  },
+  opts: RunAgentChatOptions,
+  transport: StatelessTransport,
+  state: { callId: string; attempt: number },
+  governorMode: StatelessTransportDiagnostic['governorMode'],
+) {
+  if (!opts.onTransportDiagnostic) return stream.finalMessage();
+  let streamEventCount = 0, textChars = 0;
+  let firstStreamEventAt: string | null = null, lastStreamEventAt: string | null = null;
+  let lastEmittedAt = 0;
+  let endpointOrigin: string | null = null;
+  try { endpointOrigin = new URL(transport.baseURL).origin; } catch { /* unknown */ }
+  const emit = (phase: 'stream-progress' | 'stream-complete' | 'stream-error') => {
+    try {
+      const headers = headersToRecord(stream.response?.headers);
+      const reason = opts.signal?.aborted ? opts.signal.reason : undefined;
+      // Never serialize the reason: callers may put credentials or prompt text in it.
+      const reasonName = reason && typeof reason === 'object' ? reason.name : undefined;
+      opts.onTransportDiagnostic!({ callId: state.callId, attempt: state.attempt,
+        phase, observedAt: new Date().toISOString(), label: transport.label, endpointOrigin,
+        loopback: endpointOrigin === null ? null : isLocalhostUrl(endpointOrigin), governorMode,
+        requestedAccount: transport.headers[ROUTE_ACCOUNT_HEADER]?.trim() || null,
+        servedAccount: servedAccountFromHeaders(headers) ?? null,
+        providerRequestId: (headers?.['request-id'] ?? headers?.['x-request-id'])?.trim() || null,
+        status: stream.response?.status ?? null,
+        streamEventCount, textChars, firstStreamEventAt, lastStreamEventAt,
+        callerAborted: opts.signal?.aborted ?? null,
+        callerAbortReason: reason === undefined ? null
+          : reasonName === 'TimeoutError' || reasonName === 'AbortError' ? reasonName : 'other',
+      });
+    } catch { /* Diagnostics must not change the original result or exception. */ }
+  };
+  const onEvent = (event: unknown) => {
+    const now = Date.now();
+    lastStreamEventAt = new Date(now).toISOString();
+    firstStreamEventAt ??= lastStreamEventAt;
+    streamEventCount++;
+    if (event && typeof event === 'object') {
+      const value = event as { type?: unknown; delta?: { type?: unknown; text?: unknown } };
+      if (value.type === 'content_block_delta' && value.delta?.type === 'text_delta'
+        && typeof value.delta.text === 'string') textChars += value.delta.text.length;
+    }
+    // First parsed event, then at most one progress record per five seconds.
+    // Always emit a terminal snapshot, including a stream with no parsed events.
+    if (streamEventCount === 1 || now - lastEmittedAt >= 5000) {
+      lastEmittedAt = now; emit('stream-progress');
+    }
+  };
+  stream.on('streamEvent', onEvent);
+  try {
+    const result = await stream.finalMessage();
+    emit('stream-complete');
+    return result;
+  } catch (error) {
+    emit('stream-error');
+    throw error;
+  } finally {
+    stream.off('streamEvent', onEvent);
+  }
 }
 
 /**
@@ -1646,7 +1725,7 @@ async function* statelessAgentChat(
   // default → the proven retry loop below runs unchanged (zero behavior change for the
   // live fleet until validated).
   if (governed) {
-    yield* governedStatelessChat(client, params, opts, { transport, mkClient });
+    yield* governedStatelessChat(client, params, opts, { transport, mkClient, diagnosticState });
     return;
   }
 
@@ -1682,7 +1761,7 @@ async function* statelessAgentChat(
           /* a caller's bookkeeping must never break the turn */
         }
       });
-      const resp = await stream.finalMessage();
+      const resp = await finalStatelessMessage(stream, opts, transport, diagnosticState, 'disabled');
       let finalText = '';
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       for (const block of (resp.content ?? []) as Array<any>) {
@@ -1890,6 +1969,7 @@ async function* governedStatelessChat(
   // becomes the default.
   auth?: {
     transport: StatelessTransport;
+    diagnosticState: { callId: string; attempt: number };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     mkClient: (t: StatelessTransport) => any;
   },
@@ -2024,7 +2104,10 @@ async function* governedStatelessChat(
               /* a caller's bookkeeping must never break the turn */
             }
           });
-          const resp = await stream.finalMessage();
+          const resp = auth
+            ? await finalStatelessMessage(stream, opts, auth.transport, auth.diagnosticState,
+              isLocalhostUrl(auth.transport.baseURL) ? 'request-local' : 'shared-provider')
+            : await stream.finalMessage();
           let finalText = '';
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           for (const block of (resp.content ?? []) as Array<any>) {
