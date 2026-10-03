@@ -37,6 +37,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, delimiter, join } from 'node:path';
@@ -691,6 +692,10 @@ export interface RunAgentChatOptions {
    * is the safe boundary for a caller's generation timer. Fires per successful retry attempt.
    */
   onResponseStart?: () => void;
+  /** Observe each actual SDK HTTP send, including SDK-internal retries, before
+   * it can fail. Only sanitized origins and allowlisted response metadata are
+   * supplied; this callback never receives credentials, prompts or bodies. */
+  onTransportDiagnostic?: (diagnostic: StatelessTransportDiagnostic) => void;
   /**
    * Priority/role LABEL for the inference-gateway admission tier
    * (gateway-priority-tiers-2026-06-22). For the in-process `anthropic-direct`
@@ -899,6 +904,64 @@ export interface StatelessTransport {
   token: string;
   headers: Record<string, string>;
   label: 'anthropic-direct' | 'gateway-pool';
+}
+
+export interface StatelessTransportDiagnostic {
+  /** Local correlation only; not an admission/idempotency key. */
+  callId: string;
+  attempt: number;
+  phase: 'request' | 'response' | 'transport-error';
+  observedAt: string;
+  label: StatelessTransport['label'];
+  endpointOrigin: string | null;
+  loopback: boolean | null;
+  requestedAccount: string | null;
+  servedAccount: string | null;
+  providerRequestId: string | null;
+  status: number | null;
+}
+
+/** Observe the SDK's fetch boundary so its own retry ladder cannot hide HTTP
+ * attempts. Preserve the exact request, response and exception; do not stamp
+ * gateway admission headers or read the response body. */
+export function createStatelessDiagnosticFetch(
+  transport: StatelessTransport,
+  observe: (diagnostic: StatelessTransportDiagnostic) => void,
+  send: typeof fetch = globalThis.fetch,
+  state = { callId: randomUUID() as string, attempt: 0 },
+): typeof fetch {
+  return async (input, init) => {
+    const attempt = ++state.attempt;
+    let endpointOrigin: string | null = null;
+    try {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      // origin omits userinfo, path, query and fragment, any of which can carry secrets.
+      endpointOrigin = url.origin === 'null' ? null : url.origin;
+    } catch { /* An invalid URL remains unknown; fetch owns the actual refusal. */ }
+    const base = {
+      callId: state.callId, attempt, label: transport.label, endpointOrigin,
+      loopback: endpointOrigin === null ? null : isLocalhostUrl(endpointOrigin),
+      requestedAccount: transport.headers[ROUTE_ACCOUNT_HEADER]?.trim() || null,
+    };
+    const emit = (phase: StatelessTransportDiagnostic['phase'], response?: Response) => {
+      try {
+        const headers = headersToRecord(response?.headers);
+        observe({ ...base, phase, observedAt: new Date().toISOString(),
+          servedAccount: servedAccountFromHeaders(headers) ?? null,
+          providerRequestId: (headers?.['request-id'] ?? headers?.['x-request-id'])?.trim() || null,
+          status: response?.status ?? null });
+      } catch { /* Diagnostic bookkeeping must never change a turn's outcome. */ }
+    };
+    emit('request');
+    try {
+      const response = await send(input, init);
+      emit('response', response);
+      return response;
+    } catch (err) {
+      emit('transport-error');
+      throw err;
+    }
+  };
 }
 
 /**
@@ -1538,12 +1601,17 @@ async function* statelessAgentChat(
   // the gateway via gatewayLlmEnv but never identified itself as `scout`).
   const tierHeaders = priorityTierHeaders(opts.priority);
   const callerHeaders = ownerHeaders(opts.ownerId);
+  // One local identity across SDK retries and credential-refresh client replacements.
+  const diagnosticState = { callId: randomUUID() as string, attempt: 0 };
   const mkClient = (t: StatelessTransport) =>
     new Anthropic({
       baseURL: t.baseURL,
       authToken: t.token,
       defaultHeaders: { ...t.headers, ...tierHeaders, ...callerHeaders },
       maxRetries: 2,
+      ...(opts.onTransportDiagnostic ? { fetch: createStatelessDiagnosticFetch(
+        t, opts.onTransportDiagnostic, globalThis.fetch, diagnosticState,
+      ) } : {}),
     });
   let client = mkClient(transport);
 
