@@ -132,6 +132,58 @@ describe('agentExitErrorMessage', () => {
 });
 
 describe('runAgentChat — backend failure reaches the terminal error (end to end)', () => {
+  it.each([0, 0.42])('retains reported Claude failure spend of $%s', async costUsd => {
+    const cmd = fakeCli([{ type: 'result', is_error: true, result: 'tool failed after inference',
+      total_cost_usd: costUsd, usage: { input_tokens: 12, output_tokens: 4 } }], 1);
+    const err = terminalError(await collect({ backend: 'claude-code', agentCmd: cmd, promptText: 'Reply OK' }));
+    expect(err).toMatchObject({ costUsd });
+    expect(err).not.toHaveProperty('unreportedFrames');
+    expect(err.message).toContain('tool failed after inference');
+  });
+
+  it('retains reported spend while marking incomplete Claude usage', async () => {
+    const cmd = fakeCli([{ type: 'result', is_error: true, result: 'tool failed',
+      total_cost_usd: 0.42, usage: { input_tokens: 12 } }], 1);
+    const err = terminalError(await collect({ backend: 'claude-code', agentCmd: cmd, promptText: 'Reply OK' }));
+    expect(err).toMatchObject({ costUsd: 0.42, unreportedFrames: 1 });
+  });
+
+  it.each([undefined, -0.42])('does not turn absent/invalid Claude failure spend %s into a measured zero', async costUsd => {
+    const cmd = fakeCli([{ type: 'result', is_error: true, result: 'tool failed',
+      ...(costUsd === undefined ? {} : { total_cost_usd: costUsd }),
+      usage: { input_tokens: 12, output_tokens: 4 } }], 1);
+    const err = terminalError(await collect({ backend: 'claude-code', agentCmd: cmd, promptText: 'Reply OK' }));
+    expect(err).not.toHaveProperty('costUsd');
+    expect(err).toMatchObject({ unreportedFrames: 1 });
+  });
+
+  it('retains OMP spend on a failed subprocess', async () => {
+    const cmd = fakeCli([{ type: 'message_end', message: { role: 'assistant', content: [],
+      usage: { input: 12, output: 4, cost: 0.27 } } }], 1);
+    const err = terminalError(await collect({ backend: 'omp', agentCmd: cmd, promptText: 'Reply OK' }));
+    expect(err).toMatchObject({ costUsd: 0.27 });
+    expect(err).not.toHaveProperty('unreportedFrames');
+  });
+
+  it('retains priced Codex usage before a later subprocess failure', async () => {
+    const cmd = fakeCli([{ type: 'turn.completed', usage: { input_tokens: 120, output_tokens: 40 } },
+      { type: 'turn.failed', error: { message: 'tool failed after inference' } }], 1);
+    const err = terminalError(await collect({ backend: 'codex', model: 'gpt-5.5', agentCmd: cmd, promptText: 'Reply OK' }));
+    expect(err).toMatchObject({ costUsd: expect.any(Number) });
+    expect((err as unknown as { costUsd: number }).costUsd).toBeGreaterThan(0);
+    expect(err).not.toHaveProperty('unreportedFrames');
+  });
+
+  it.each([
+    { model: 'gpt-unknown-failure-price', usage: { input_tokens: 120, output_tokens: 40 } },
+    { model: 'gpt-5.5', usage: { input_tokens: 120 } },
+  ])('keeps unpriced/incomplete Codex failure spend unknown ($model)', async ({ model, usage }) => {
+    const cmd = fakeCli([{ type: 'turn.completed', usage }], 1);
+    const err = terminalError(await collect({ backend: 'codex', model, agentCmd: cmd, promptText: 'Reply OK' }));
+    expect(err).not.toHaveProperty('costUsd');
+    expect(err).toMatchObject({ unreportedFrames: 1 });
+  });
+
   it('codex usage limit: the plan-cap line is in the error message (stderr empty, as measured)', async () => {
     const cmd = fakeCli(
       [
