@@ -16,7 +16,7 @@
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   agentExitErrorMessage,
   backendFailureLine,
@@ -36,9 +36,13 @@ const NESTED_400 =
 let dir: string;
 
 beforeEach(() => {
+  // These assertions exercise the error receipt, while Codex debug runs emit
+  // intentional console.error diagnostics. Isolate that inherited host setting.
+  vi.stubEnv('PAPERCUSP_AGENT_DEBUG', '');
   dir = mkdtempSync(join(tmpdir(), 'wi10003188-'));
 });
 afterEach(() => {
+  vi.unstubAllEnvs();
   rmSync(dir, { recursive: true, force: true });
 });
 

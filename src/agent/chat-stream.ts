@@ -753,6 +753,11 @@ export type ChatEvent =
       type: 'error';
       message: string;
       stderr?: string;
+      /** Reported/priced usage retained before failure. Absent means unknown,
+          including an unpriced backend; an explicit zero remains measured zero. */
+      costUsd?: number;
+      /** Incomplete usage evidence, preserved even when some spend was reported. */
+      unreportedFrames?: number;
       /**
        * RB-006: the classified turn error, when known. Lets a consumer (e.g. the gym's
        * `llmCall` → `runAbEvaluation`) distinguish a `rate_limited` failure (pause + resume)
@@ -2785,6 +2790,7 @@ export async function* runAgentChat(
   let stdoutLineBuf = '';
   let finalText = '';
   let costUsd = 0;
+  let costReported = false;
   let tokensIn = 0;
   let tokensOut = 0;
   let unreportedFrames = 0;
@@ -2857,7 +2863,10 @@ export async function* runAgentChat(
       if (u.tokensOut !== undefined) tokensOut = u.tokensOut;
       if (u.cacheReadTokens !== undefined) cacheReadTokens = u.cacheReadTokens;
       if (u.cacheCreationTokens !== undefined) cacheCreationTokens = u.cacheCreationTokens;
-      if (u.costUsd !== undefined) costUsd = u.costUsd;
+      if (u.costUsd !== undefined) {
+        costUsd = u.costUsd;
+        costReported = u.costUsd >= 0;
+      }
       if (u.unreportedFrames !== undefined) unreportedFrames = Math.max(unreportedFrames, u.unreportedFrames);
       if (u.numTurns !== undefined) numTurns = u.numTurns;
       // Sometimes the terminal `result.result` is the most complete
@@ -2923,7 +2932,10 @@ export async function* runAgentChat(
     tokensIn = (hasFiniteNumber(input) ? input : 0) + cacheRead + cacheWrite;
     tokensOut = hasFiniteNumber(output) ? output : tokensOut;
     const reportedCost = u?.costUsd ?? u?.cost ?? u?.totalCost;
-    if (hasFiniteNumber(reportedCost)) costUsd = reportedCost;
+    if (hasFiniteNumber(reportedCost)) {
+      costUsd = reportedCost;
+      costReported = reportedCost >= 0;
+    }
     ompUsageComplete = hasFiniteNumber(input) && hasFiniteNumber(output) && hasFiniteNumber(reportedCost);
   };
 
@@ -3044,6 +3056,7 @@ export async function* runAgentChat(
       const cachedInput = hasFiniteNumber(u.cached_input_tokens) ? u.cached_input_tokens : 0;
       const estimate = estimateCodexUsageCost(opts.model, tokensIn, tokensOut, cachedInput);
       costUsd = estimate.usd;
+      costReported = codexUsageComplete && estimate.priced && Number.isFinite(costUsd) && costUsd >= 0;
       if (!estimate.priced) unreportedFrames = Math.max(unreportedFrames, 1);
       return;
     }
@@ -3226,6 +3239,13 @@ export async function* runAgentChat(
     }
   }
 
+  if (
+    (backend === 'claude-code' && !claudeTerminalUsageSeen) ||
+    (backend === 'omp' && (!ompUsageSeen || !ompUsageComplete)) ||
+    (backend === 'codex' && (!codexUsageSeen || !codexUsageComplete))
+  ) {
+    unreportedFrames = Math.max(unreportedFrames, 1);
+  }
   if (exitCode !== 0) {
     yield {
       type: 'error',
@@ -3235,16 +3255,11 @@ export async function* runAgentChat(
       // (WI-10003188) so a surface that renders only `message` can say WHY.
       message: spawnErrMsg ?? agentExitErrorMessage(backend, exitCode, failureLine),
       stderr: stderrBuf.slice(-800),
+      ...(costReported ? { costUsd } : {}),
+      ...(!costReported || unreportedFrames > 0 ? { unreportedFrames: Math.max(unreportedFrames, 1) } : {}),
       ...(cliTurn ? { turn: cliTurn } : {}),
     };
   } else {
-    if (
-      (backend === 'claude-code' && !claudeTerminalUsageSeen) ||
-      (backend === 'omp' && (!ompUsageSeen || !ompUsageComplete)) ||
-      (backend === 'codex' && (!codexUsageSeen || !codexUsageComplete))
-    ) {
-      unreportedFrames = Math.max(unreportedFrames, 1);
-    }
     yield {
       type: 'result',
       costUsd,
