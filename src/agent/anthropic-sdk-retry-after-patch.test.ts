@@ -16,7 +16,7 @@ import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { satisfies } from 'semver';
+import { satisfies } from '../../../../scripts/check-peer-dep-conflicts.mjs';
 import { describe, expect, it } from 'vitest';
 
 const require = createRequire(import.meta.url);
