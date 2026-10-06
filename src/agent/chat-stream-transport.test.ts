@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import { createStatelessDiagnosticFetch, runAgentChat, type RunAgentChatOptions, type StatelessTransportDiagnostic } from './chat-stream';
 
 // Negative pre-implementation cases must never launch a credentialed CLI.
@@ -52,6 +53,102 @@ const transport = {
   headers: { 'x-papercusp-account': 'requested-account', authorization: 'secret-header' },
   label: 'anthropic-direct' as const,
 };
+
+describe('trusted-host authorization at the stateless HTTP boundary (WI-10006164)', () => {
+  const digest = (value: string) => createHash('sha256').update(value).digest('hex');
+  const requestInit = () => ({ method: 'POST', headers: { authorization: 'Bearer private-fixture' },
+    body: JSON.stringify({ model: 'claude-opus-4-8', max_tokens: 8, messages: [{ role: 'user', content: 'original' }] }) });
+
+  it.each(['missing', 'malformed', 'throws'] as const)('refuses a %s authorization before sending', async kind => {
+    const send = vi.fn(async () => new Response('unexpected'));
+    const observe = vi.fn();
+    const guarded = createStatelessDiagnosticFetch(transport, observe, send,
+      { callId: 'authorized', attempt: 0 }, 'disabled', 8, async () => {
+        if (kind === 'throws') throw new Error('private-controller-error');
+        return kind === 'missing' ? null : 'invalid' as never;
+      });
+    await expect(guarded('http://127.0.0.1:8788/v1/messages', requestInit()))
+      .rejects.toMatchObject({ message: 'Stateless request authorization refused', costUsd: 0 });
+    expect(send).not.toHaveBeenCalled();
+    expect(observe).not.toHaveBeenCalled();
+  });
+
+  it('authorizes the immutable request and passes credential digests rather than credentials', async () => {
+    let release!: () => void;
+    const ready = new Promise<void>(resolve => { release = resolve; });
+    const sent: Request[] = [];
+    const authorize = vi.fn(async attempt => {
+      await ready;
+      expect(Object.isFrozen(attempt)).toBe(true);
+      return () => {};
+    });
+    const guarded = createStatelessDiagnosticFetch(transport, () => {}, async input => {
+      sent.push(input as Request); return new Response('ok');
+    }, { callId: 'authorized', attempt: 0 }, 'disabled', 8, authorize);
+    const init = requestInit();
+    const originalBody = init.body;
+    const pending = guarded('http://127.0.0.1:8788/v1/messages', init);
+    init.headers.authorization = 'Bearer changed'; init.body = JSON.stringify({ max_tokens: 999 });
+    release(); await pending;
+    const attempt = authorize.mock.calls[0]![0];
+    expect(attempt).toMatchObject({ callId: 'authorized', attempt: 1, method: 'POST',
+      url: 'http://127.0.0.1:8788/v1/messages', body: originalBody, bodySha256: digest(originalBody),
+      credentialSha256: digest(JSON.stringify({ authorization: 'Bearer private-fixture', apiKey: null })) });
+    expect(JSON.stringify(attempt)).not.toContain('private-fixture');
+    expect(await sent[0]!.text()).toBe(originalBody);
+    expect(sent[0]!.headers.get('authorization')).toBe('Bearer private-fixture');
+  });
+
+  it.each(['aborted', 'revoked'] as const)('rechecks %s authorization after an asynchronous policy read', async kind => {
+    const controller = new AbortController();
+    const send = vi.fn(async () => new Response('unexpected'));
+    const guarded = createStatelessDiagnosticFetch(transport, () => {}, send,
+      { callId: 'authorized', attempt: 0 }, 'disabled', 8, async () => {
+        if (kind === 'aborted') controller.abort();
+        return () => { if (kind === 'revoked') throw new Error('expired private grant'); };
+      });
+    await expect(guarded('http://127.0.0.1:8788/v1/messages', { ...requestInit(), signal: controller.signal }))
+      .rejects.toMatchObject({ message: 'Stateless request authorization refused', costUsd: 0 });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the grant after diagnostic callbacks and before send', async () => {
+    let revoked = false;
+    const send = vi.fn(async () => new Response('unexpected'));
+    const guarded = createStatelessDiagnosticFetch(transport, () => { revoked = true; }, send,
+      { callId: 'authorized', attempt: 0 }, 'disabled', 8,
+      async () => () => { if (revoked) throw new Error('revoked'); });
+    await expect(guarded('http://127.0.0.1:8788/v1/messages', requestInit())).rejects.toMatchObject({ costUsd: 0 });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('authorizes every retry separately and never labels a later refusal as zero total spend', async () => {
+    const send = vi.fn(async () => new Response('unknown usage', { status: 503 }));
+    const attempts: Array<{ attemptId: string; attempt: number }> = [];
+    const state = { callId: 'authorized', attempt: 0 };
+    const authorize = vi.fn(async attempt => {
+      attempts.push(attempt);
+      return attempts.length === 1 ? () => {} : null;
+    });
+    const first = createStatelessDiagnosticFetch(transport, () => {}, send, state, 'disabled', 8, authorize);
+    await first('http://127.0.0.1:8788/v1/messages', requestInit());
+    // Credential refresh replaces the SDK wrapper, but not this call's send history.
+    const retry = createStatelessDiagnosticFetch({ ...transport, token: 'refreshed' }, () => {}, send, state, 'disabled', 8, authorize);
+    const refusal = await retry('http://127.0.0.1:8788/v1/messages', requestInit()).catch(error => error);
+    expect(refusal).toMatchObject({ costUsdMeasurementMissing: true });
+    expect(refusal).not.toHaveProperty('costUsd');
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(attempts.map(a => a.attempt)).toEqual([1, 2]);
+    expect(new Set(attempts.map(a => a.attemptId)).size).toBe(2);
+  });
+
+  it.each(['claude-code', 'omp', 'codex'] as const)('refuses authorization on unsupported backend %s before spawn', async backend => {
+    const authorizeStatelessRequest = vi.fn(async () => () => {});
+    await expect(runAgentChat({ backend, promptText: 'fixture', authorizeStatelessRequest }).next())
+      .rejects.toMatchObject({ costUsd: 0 });
+    expect(authorizeStatelessRequest).not.toHaveBeenCalled();
+  });
+});
 
 describe('required Anthropic output bounds (WI-10006340)', () => {
   it.each([undefined, 0, -1, 1.5, Infinity, NaN])('refuses invalid maxTokens=%s before any send', async maxTokens => {

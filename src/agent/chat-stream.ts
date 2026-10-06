@@ -37,7 +37,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, delimiter, join } from 'node:path';
@@ -633,6 +633,11 @@ export interface RunAgentChatOptions {
   /** Refuse unsupported backends and validate the final Anthropic HTTP body
    * against this exact output bound before each send. Not a dollar cap. */
   requireOutputTokenLimit?: boolean;
+  /** Trusted host policy at EACH final Anthropic HTTP send, including retries.
+   * The host owns authenticated grant issuance, durable reservation and pricing;
+   * this hook alone is not a monetary or provider-invoice cap. Unsupported
+   * backends refuse rather than ignore it. */
+  authorizeStatelessRequest?: StatelessRequestAuthorizer;
   /**
    * Sampling temperature (0–1). `anthropic-direct` honors when the model
    * accepts it (skipped for `opus*` per the Anthropic API constraint).
@@ -937,6 +942,31 @@ export interface StatelessTransportDiagnostic {
   callerAbortReason?: 'TimeoutError' | 'AbortError' | 'other' | null;
 }
 
+/** Private policy input, never telemetry. The body and credential digest bind
+ * authorization to the actual SDK request; raw credentials are not exposed.
+ * A gateway may select a different provider account after this local boundary. */
+export interface StatelessRequestAttempt {
+  readonly attemptId: string;
+  readonly callId: string;
+  readonly attempt: number;
+  readonly method: string;
+  readonly url: string;
+  readonly body: string;
+  readonly bodySha256: string;
+  /** SHA256 of JSON { authorization: string|null, apiKey: string|null }. */
+  readonly credentialSha256: string;
+  readonly signal: AbortSignal;
+}
+
+/** Return a synchronous final grant check, or null to refuse. The final check
+ * must not await or mutate a reservation: it verifies the host's copied receipt
+ * (identity, expiry, revocation and admitted bounds) immediately before send.
+ * As with the gateway's controller hook, the policy is trusted host code, not a
+ * caller-selected reservation id or an authorization header. */
+export type StatelessRequestAuthorizer = (
+  attempt: StatelessRequestAttempt,
+) => Promise<(() => void) | null>;
+
 /** Observe the SDK's fetch boundary so its own retry ladder cannot hide HTTP
  * attempts. Preserve the exact request, response and exception; do not stamp
  * gateway admission headers or read the response body. */
@@ -944,31 +974,59 @@ export function createStatelessDiagnosticFetch(
   transport: StatelessTransport,
   observe: (diagnostic: StatelessTransportDiagnostic) => void,
   send: typeof fetch = globalThis.fetch,
-  state = { callId: randomUUID() as string, attempt: 0 },
+  state: { callId: string; attempt: number; sent?: number } = { callId: randomUUID(), attempt: 0, sent: 0 },
   governorMode: StatelessTransportDiagnostic['governorMode'] = 'unobserved',
   outputTokenLimit?: number,
+  authorizeRequest?: StatelessRequestAuthorizer,
 ): typeof fetch {
   if (outputTokenLimit !== undefined && (!Number.isSafeInteger(outputTokenLimit) || outputTokenLimit <= 0)) {
     throw Object.assign(new RangeError('Required output token limit needs a positive integer maxTokens'), { costUsd: 0 });
   }
+  if (authorizeRequest !== undefined && typeof authorizeRequest !== 'function') {
+    throw Object.assign(new TypeError('Stateless request authorizer must be a function'), { costUsd: 0 });
+  }
+  const refusal = (message: string) => Object.assign(new Error(message),
+    (state.sent ?? 0) === 0 ? { costUsd: 0 } : { costUsdMeasurementMissing: true });
   return async (input, init) => {
     // Snapshot before reading asynchronously, then send THIS request. Checking
     // init.body and sending the caller's mutable init later would reopen the bound.
-    if (outputTokenLimit !== undefined) {
+    let request: Request | undefined;
+    let requestBody: string | undefined;
+    if (outputTokenLimit !== undefined || authorizeRequest !== undefined) {
       try {
-        const request = new Request(input, init);
-        const body: unknown = JSON.parse(await request.clone().text());
-        if (!body || typeof body !== 'object' || Array.isArray(body) ||
-          (body as { max_tokens?: unknown }).max_tokens !== outputTokenLimit) {
-          throw new Error('Required output token limit differs from the final Anthropic request');
+        request = new Request(input, init);
+        requestBody = await request.clone().text();
+        if (outputTokenLimit !== undefined) {
+          const body: unknown = JSON.parse(requestBody);
+          if (!body || typeof body !== 'object' || Array.isArray(body) ||
+            (body as { max_tokens?: unknown }).max_tokens !== outputTokenLimit) {
+            throw new Error('Required output token limit differs from the final Anthropic request');
+          }
         }
         input = request;
         init = undefined;
       } catch {
-        throw Object.assign(new Error('Required output token limit could not be verified on the final Anthropic request'), { costUsd: 0 });
+        throw refusal(outputTokenLimit !== undefined
+          ? 'Required output token limit could not be verified on the final Anthropic request'
+          : 'Stateless request authorization refused');
       }
     }
     const attempt = ++state.attempt;
+    let validateAuthorization: (() => void) | null = null;
+    if (authorizeRequest) {
+      try {
+        if (request!.signal.aborted) throw new Error('aborted');
+        validateAuthorization = await authorizeRequest(Object.freeze({
+          attemptId: randomUUID(), callId: state.callId, attempt, method: request!.method,
+          url: request!.url, body: requestBody!,
+          bodySha256: createHash('sha256').update(requestBody!).digest('hex'),
+          credentialSha256: createHash('sha256').update(JSON.stringify({
+            authorization: request!.headers.get('authorization'), apiKey: request!.headers.get('x-api-key'),
+          })).digest('hex'), signal: request!.signal,
+        }));
+        if (typeof validateAuthorization !== 'function') throw new Error('missing authorization');
+      } catch { throw refusal('Stateless request authorization refused'); }
+    }
     let endpointOrigin: string | null = null;
     try {
       const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
@@ -991,6 +1049,15 @@ export function createStatelessDiagnosticFetch(
     };
     emit('request');
     try {
+      if (authorizeRequest) {
+        try {
+          // No await or diagnostic callback between the final receipt check and
+          // fetch. The exact Request above is the only object sent downstream.
+          if (request!.signal.aborted) throw new Error('aborted');
+          validateAuthorization!();
+        } catch { throw refusal('Stateless request authorization refused'); }
+      }
+      state.sent = (state.sent ?? 0) + 1;
       const response = await send(input, init);
       emit('response', response);
       return response;
@@ -1712,17 +1779,18 @@ async function* statelessAgentChat(
   const callerHeaders = ownerHeaders(opts.ownerId);
   const governed = process.env.PAPERCUSP_AGENT_GOVERNOR === '1';
   // One local identity across SDK retries and credential-refresh client replacements.
-  const diagnosticState = { callId: randomUUID() as string, attempt: 0 };
+  const diagnosticState = { callId: randomUUID() as string, attempt: 0, sent: 0 };
   const mkClient = (t: StatelessTransport) =>
     new Anthropic({
       baseURL: t.baseURL,
       authToken: t.token,
       defaultHeaders: { ...t.headers, ...tierHeaders, ...callerHeaders },
       maxRetries: 2,
-      ...(opts.onTransportDiagnostic || opts.requireOutputTokenLimit ? { fetch: createStatelessDiagnosticFetch(
+      ...(opts.onTransportDiagnostic || opts.requireOutputTokenLimit || opts.authorizeStatelessRequest ? { fetch: createStatelessDiagnosticFetch(
         t, opts.onTransportDiagnostic ?? (() => {}), globalThis.fetch, diagnosticState,
         governed ? (isLocalhostUrl(t.baseURL) ? 'request-local' : 'shared-provider') : 'disabled',
         opts.requireOutputTokenLimit ? opts.maxTokens : undefined,
+        opts.authorizeStatelessRequest,
       ) } : {}),
     });
   let client = mkClient(transport);
@@ -2205,13 +2273,16 @@ async function* governedStatelessChat(
 export async function* runAgentChat(
   opts: RunAgentChatOptions,
 ): AsyncGenerator<ChatEvent, void, void> {
-  if (opts.requireOutputTokenLimit) {
+  if (opts.requireOutputTokenLimit || opts.authorizeStatelessRequest !== undefined) {
     opts = { ...opts, ...(opts.messages ? { messages: opts.messages.map(message => ({ ...message })) } : {}) };
-    if (!Number.isSafeInteger(opts.maxTokens) || opts.maxTokens! <= 0) {
+    if (opts.requireOutputTokenLimit && (!Number.isSafeInteger(opts.maxTokens) || opts.maxTokens! <= 0)) {
       throw Object.assign(new RangeError('Required output token limit needs a positive integer maxTokens'), { costUsd: 0 });
     }
     if (resolveBackend(opts) !== 'anthropic-direct') {
-      throw Object.assign(new Error('Required output token limit is not implemented for this backend'), { costUsd: 0 });
+      throw Object.assign(new Error('Required stateless request policy is not implemented for this backend'), { costUsd: 0 });
+    }
+    if (opts.authorizeStatelessRequest !== undefined && typeof opts.authorizeStatelessRequest !== 'function') {
+      throw Object.assign(new TypeError('Stateless request authorizer must be a function'), { costUsd: 0 });
     }
   }
   maybeBootstrap();
