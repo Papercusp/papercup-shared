@@ -995,6 +995,9 @@ export function createStatelessDiagnosticFetch(
     if (outputTokenLimit !== undefined || authorizeRequest !== undefined) {
       try {
         request = new Request(input, init);
+        // Native fetch follows redirects internally, beyond this authorizer.
+        // A governed send must not acquire an unapproved second destination.
+        if (authorizeRequest) request = new Request(request, { redirect: 'error' });
         requestBody = await request.clone().text();
         if (outputTokenLimit !== undefined) {
           const body: unknown = JSON.parse(requestBody);
@@ -1054,7 +1057,14 @@ export function createStatelessDiagnosticFetch(
           // No await or diagnostic callback between the final receipt check and
           // fetch. The exact Request above is the only object sent downstream.
           if (request!.signal.aborted) throw new Error('aborted');
-          validateAuthorization!();
+          const validation: unknown = validateAuthorization!();
+          if (validation !== undefined) {
+            // Accidentally async host checks must neither authorize a send nor
+            // leave a rejected validation promise unhandled.
+            void Promise.resolve(validation).catch(() => {});
+            throw new Error('final authorization must be synchronous');
+          }
+          if (request!.signal.aborted) throw new Error('aborted');
         } catch { throw refusal('Stateless request authorization refused'); }
       }
       state.sent = (state.sent ?? 0) + 1;

@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { createStatelessDiagnosticFetch, runAgentChat, type RunAgentChatOptions, type StatelessTransportDiagnostic } from './chat-stream';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { createStatelessDiagnosticFetch, runAgentChat, type RunAgentChatOptions, type StatelessRequestAttempt, type StatelessTransportDiagnostic } from './chat-stream';
 
 // Negative pre-implementation cases must never launch a credentialed CLI.
 vi.mock('node:child_process', async importOriginal => ({
@@ -77,7 +79,7 @@ describe('trusted-host authorization at the stateless HTTP boundary (WI-10006164
     let release!: () => void;
     const ready = new Promise<void>(resolve => { release = resolve; });
     const sent: Request[] = [];
-    const authorize = vi.fn(async attempt => {
+    const authorize = vi.fn(async (attempt: StatelessRequestAttempt) => {
       await ready;
       expect(Object.isFrozen(attempt)).toBe(true);
       return () => {};
@@ -97,15 +99,20 @@ describe('trusted-host authorization at the stateless HTTP boundary (WI-10006164
     expect(JSON.stringify(attempt)).not.toContain('private-fixture');
     expect(await sent[0]!.text()).toBe(originalBody);
     expect(sent[0]!.headers.get('authorization')).toBe('Bearer private-fixture');
+    expect(sent[0]!.redirect).toBe('error');
   });
 
-  it.each(['aborted', 'revoked'] as const)('rechecks %s authorization after an asynchronous policy read', async kind => {
+  it.each(['aborted', 'revoked', 'validator-aborted', 'async-validator'] as const)('rechecks %s authorization after an asynchronous policy read', async kind => {
     const controller = new AbortController();
     const send = vi.fn(async () => new Response('unexpected'));
     const guarded = createStatelessDiagnosticFetch(transport, () => {}, send,
       { callId: 'authorized', attempt: 0 }, 'disabled', 8, async () => {
         if (kind === 'aborted') controller.abort();
-        return () => { if (kind === 'revoked') throw new Error('expired private grant'); };
+        if (kind === 'async-validator') return (async () => { throw new Error('async private grant'); }) as never;
+        return () => {
+          if (kind === 'revoked') throw new Error('expired private grant');
+          if (kind === 'validator-aborted') controller.abort();
+        };
       });
     await expect(guarded('http://127.0.0.1:8788/v1/messages', { ...requestInit(), signal: controller.signal }))
       .rejects.toMatchObject({ message: 'Stateless request authorization refused', costUsd: 0 });
@@ -126,7 +133,7 @@ describe('trusted-host authorization at the stateless HTTP boundary (WI-10006164
     const send = vi.fn(async () => new Response('unknown usage', { status: 503 }));
     const attempts: Array<{ attemptId: string; attempt: number }> = [];
     const state = { callId: 'authorized', attempt: 0 };
-    const authorize = vi.fn(async attempt => {
+    const authorize = vi.fn(async (attempt: StatelessRequestAttempt) => {
       attempts.push(attempt);
       return attempts.length === 1 ? () => {} : null;
     });
@@ -147,6 +154,33 @@ describe('trusted-host authorization at the stateless HTTP boundary (WI-10006164
     await expect(runAgentChat({ backend, promptText: 'fixture', authorizeStatelessRequest }).next())
       .rejects.toMatchObject({ costUsd: 0 });
     expect(authorizeStatelessRequest).not.toHaveBeenCalled();
+  });
+
+  it('refuses HTTP redirects before an unapproved destination receives the request', async () => {
+    let originRequests = 0, redirectedRequests = 0;
+    const target = createServer((_request, response) => { redirectedRequests++; response.end('unexpected'); });
+    const origin = createServer((_request, response) => {
+      originRequests++;
+      response.writeHead(307, { location: `http://127.0.0.1:${(target.address() as AddressInfo).port}/other` });
+      response.end();
+    });
+    try {
+      await new Promise<void>(resolve => { target.listen(0, '127.0.0.1', resolve); });
+      await new Promise<void>(resolve => { origin.listen(0, '127.0.0.1', resolve); });
+      const authorize = vi.fn(async () => () => {});
+      const guarded = createStatelessDiagnosticFetch(transport, () => {}, globalThis.fetch,
+        { callId: 'redirect', attempt: 0 }, 'disabled', 8, authorize);
+      await expect(guarded(`http://127.0.0.1:${(origin.address() as AddressInfo).port}/v1/messages`,
+        { ...requestInit(), signal: AbortSignal.timeout(2000) })).rejects.toThrow();
+      expect(originRequests).toBe(1);
+      expect(redirectedRequests).toBe(0);
+      expect(authorize).toHaveBeenCalledTimes(1);
+    } finally {
+      origin.closeAllConnections(); target.closeAllConnections();
+      await Promise.all([origin, target].map(server => new Promise<void>((resolve, reject) => {
+        server.close(error => { if (error) reject(error); else resolve(); });
+      })));
+    }
   });
 });
 
@@ -216,6 +250,8 @@ describe('required Anthropic output bounds (WI-10006340)', () => {
     const requests: unknown[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       requests.push(await new Request(input, init).json());
+      if (requests.length === 1) return new Response(JSON.stringify({ error: { type: 'overloaded_error', message: 'fixture retry' } }),
+        { status: 503, headers: { 'retry-after': '0', 'content-type': 'application/json' } });
       const frames = [
         { type: 'message_start', message: { id: 'msg_bounded', type: 'message', role: 'assistant',
           model: 'claude-opus-4-8', content: [], stop_reason: null, stop_sequence: null,
@@ -228,17 +264,25 @@ describe('required Anthropic output bounds (WI-10006340)', () => {
       ].map(event => 'event: ' + event.type + '\ndata: ' + JSON.stringify(event) + '\n\n').join('');
       return new Response(frames, { headers: { 'content-type': 'text/event-stream' } });
     }));
+    const authorized: StatelessRequestAttempt[] = [];
+    const authorizeStatelessRequest = vi.fn(async (attempt: StatelessRequestAttempt) => { authorized.push(attempt); return () => {}; });
     const opts: RunAgentChatOptions = { backend: 'anthropic-direct', model: 'claude-opus-4-8',
       promptText: 'original', messages: [{ role: 'user', content: 'original' }],
       maxTokens: 2048, thinkingBudgetTokens: 1024, temperature: 0,
-      requireOutputTokenLimit: true, signal: AbortSignal.timeout(2000) };
+      requireOutputTokenLimit: true, authorizeStatelessRequest, signal: AbortSignal.timeout(5000) };
     const run = runAgentChat(opts);
     const first = run.next();
     opts.maxTokens = 9999; opts.model = 'claude-sonnet-4-6';
     opts.messages![0].content = 'changed'; opts.requireOutputTokenLimit = false;
+    opts.authorizeStatelessRequest = undefined;
     const events = [(await first).value];
     for await (const event of run) events.push(event);
-    expect(requests).toHaveLength(1);
+    expect(requests).toHaveLength(2);
+    expect(authorizeStatelessRequest).toHaveBeenCalledTimes(2);
+    expect(authorized.map(a => a.attempt)).toEqual([1, 2]);
+    expect(new Set(authorized.map(a => a.attemptId)).size).toBe(2);
+    expect(authorized.map(a => JSON.parse(a.body))).toEqual(requests);
+    expect(requests[1]).toEqual(requests[0]);
     expect(requests[0]).toMatchObject({ model: 'claude-opus-4-8', max_tokens: 2048,
       messages: [{ role: 'user', content: 'original' }], thinking: { type: 'enabled', budget_tokens: 1024 } });
     expect(requests[0]).not.toHaveProperty('temperature');
