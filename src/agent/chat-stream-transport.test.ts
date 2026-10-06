@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createStatelessDiagnosticFetch, runAgentChat, type StatelessTransportDiagnostic } from './chat-stream';
+import { createStatelessDiagnosticFetch, runAgentChat, type RunAgentChatOptions, type StatelessTransportDiagnostic } from './chat-stream';
+
+// Negative pre-implementation cases must never launch a credentialed CLI.
+vi.mock('node:child_process', async importOriginal => ({
+  ...await importOriginal<typeof import('node:child_process')>(),
+  spawn: vi.fn(() => { throw new Error('Fixture forbids subprocess inference'); }),
+}));
 
 const sdk = vi.hoisted(() => ({ fetch: undefined as typeof fetch | undefined,
   bodyEvents: [] as unknown[], bodyFailure: undefined as Error | undefined,
@@ -46,6 +52,102 @@ const transport = {
   headers: { 'x-papercusp-account': 'requested-account', authorization: 'secret-header' },
   label: 'anthropic-direct' as const,
 };
+
+describe('required Anthropic output bounds (WI-10006340)', () => {
+  it.each([undefined, 0, -1, 1.5, Infinity, NaN])('refuses invalid maxTokens=%s before any send', async maxTokens => {
+    const send = vi.fn();
+    vi.stubGlobal('fetch', send);
+    const run = runAgentChat({ backend: 'anthropic-direct', model: 'claude-opus-4-8',
+      promptText: 'fixture', maxTokens, requireOutputTokenLimit: true });
+    await expect(run.next()).rejects.toMatchObject({ costUsd: 0 });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each(['claude-code', 'omp', 'codex'] as const)('refuses unsupported backend %s before auth or spawn', async backend => {
+    const send = vi.fn();
+    vi.stubGlobal('fetch', send);
+    await expect(runAgentChat({ backend, model: 'fixture', promptText: 'fixture',
+      maxTokens: 8, requireOutputTokenLimit: true }).next()).rejects.toMatchObject({ costUsd: 0 });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 0, -1, 1.5, 9, Infinity])('rejects a final HTTP max_tokens=%s that differs from the admitted bound', async maxTokens => {
+    const send = vi.fn(async () => new Response('unexpected'));
+    const records: StatelessTransportDiagnostic[] = [];
+    const guarded = createStatelessDiagnosticFetch(transport, r => records.push(r), send,
+      { callId: 'bounded', attempt: 0 }, 'disabled', 8);
+    await expect(guarded('http://127.0.0.1:8788/v1/messages', { method: 'POST',
+      body: JSON.stringify({ model: 'claude-opus-4-8', max_tokens: maxTokens }) })).rejects.toMatchObject({ costUsd: 0 });
+    expect(send).not.toHaveBeenCalled();
+    expect(records).toEqual([]);
+  });
+
+  it('refuses malformed final request bodies without emitting a send diagnostic', async () => {
+    const send = vi.fn(async () => new Response('unexpected'));
+    const guarded = createStatelessDiagnosticFetch(transport, () => {}, send,
+      { callId: 'bounded', attempt: 0 }, 'disabled', 8);
+    for (const body of ['not json', 'null', '[]']) {
+      await expect(guarded('http://127.0.0.1:8788/v1/messages', { method: 'POST', body })).rejects.toMatchObject({ costUsd: 0 });
+    }
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('sends the validated immutable request including Request inputs', async () => {
+    const sent: Request[] = [];
+    const guarded = createStatelessDiagnosticFetch(transport, () => {}, async input => {
+      sent.push(input as Request);
+      return new Response('ok');
+    }, { callId: 'bounded', attempt: 0 }, 'disabled', 8);
+    const init = { method: 'POST', headers: { authorization: 'private' },
+      body: JSON.stringify({ model: 'claude-opus-4-8', max_tokens: 8 }) };
+    const pending = guarded('http://127.0.0.1:8788/v1/messages', init);
+    init.body = JSON.stringify({ max_tokens: 999 });
+    await pending;
+    await guarded(new Request('http://127.0.0.1:8788/v1/messages', { ...init,
+      body: JSON.stringify({ model: 'claude-opus-4-8', max_tokens: 8 }) }));
+    expect(sent).toHaveLength(2);
+    for (const request of sent) {
+      expect(await request.json()).toEqual({ model: 'claude-opus-4-8', max_tokens: 8 });
+      expect(request.headers.get('authorization')).toBe('private');
+    }
+  });
+
+  it.each(['0', '1'])('the actual SDK sends the frozen judge policy and caller snapshot with governor=%s', async governed => {
+    vi.stubEnv('PAPERCUSP_DEFAULT_ACCOUNT_ACTIVE', '1');
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', governed);
+    sdk.real = (await vi.importActual<typeof import('@anthropic-ai/sdk')>('@anthropic-ai/sdk')).default;
+    const requests: unknown[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(await new Request(input, init).json());
+      const frames = [
+        { type: 'message_start', message: { id: 'msg_bounded', type: 'message', role: 'assistant',
+          model: 'claude-opus-4-8', content: [], stop_reason: null, stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 0 } } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'bounded' } },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 1 } },
+        { type: 'message_stop' },
+      ].map(event => 'event: ' + event.type + '\ndata: ' + JSON.stringify(event) + '\n\n').join('');
+      return new Response(frames, { headers: { 'content-type': 'text/event-stream' } });
+    }));
+    const opts: RunAgentChatOptions = { backend: 'anthropic-direct', model: 'claude-opus-4-8',
+      promptText: 'original', messages: [{ role: 'user', content: 'original' }],
+      maxTokens: 2048, thinkingBudgetTokens: 1024, temperature: 0,
+      requireOutputTokenLimit: true, signal: AbortSignal.timeout(2000) };
+    const run = runAgentChat(opts);
+    const first = run.next();
+    opts.maxTokens = 9999; opts.model = 'claude-sonnet-4-6';
+    opts.messages![0].content = 'changed'; opts.requireOutputTokenLimit = false;
+    const events = [(await first).value];
+    for await (const event of run) events.push(event);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ model: 'claude-opus-4-8', max_tokens: 2048,
+      messages: [{ role: 'user', content: 'original' }], thinking: { type: 'enabled', budget_tokens: 1024 } });
+    expect(requests[0]).not.toHaveProperty('temperature');
+    expect(events.at(-1)).toMatchObject({ type: 'result', finalText: 'bounded', tokensIn: 1, tokensOut: 1 });
+  });
+});
 
 describe('stateless HTTP attempt diagnostics (WI-10005738)', () => {
   it('records actual sends including SDK retries, without changing requests or consuming responses', async () => {

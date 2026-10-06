@@ -630,6 +630,9 @@ export interface RunAgentChatOptions {
    * `claude-code` have their own internal limits.
    */
   maxTokens?: number;
+  /** Refuse unsupported backends and validate the final Anthropic HTTP body
+   * against this exact output bound before each send. Not a dollar cap. */
+  requireOutputTokenLimit?: boolean;
   /**
    * Sampling temperature (0–1). `anthropic-direct` honors when the model
    * accepts it (skipped for `opus*` per the Anthropic API constraint).
@@ -943,8 +946,28 @@ export function createStatelessDiagnosticFetch(
   send: typeof fetch = globalThis.fetch,
   state = { callId: randomUUID() as string, attempt: 0 },
   governorMode: StatelessTransportDiagnostic['governorMode'] = 'unobserved',
+  outputTokenLimit?: number,
 ): typeof fetch {
+  if (outputTokenLimit !== undefined && (!Number.isSafeInteger(outputTokenLimit) || outputTokenLimit <= 0)) {
+    throw Object.assign(new RangeError('Required output token limit needs a positive integer maxTokens'), { costUsd: 0 });
+  }
   return async (input, init) => {
+    // Snapshot before reading asynchronously, then send THIS request. Checking
+    // init.body and sending the caller's mutable init later would reopen the bound.
+    if (outputTokenLimit !== undefined) {
+      try {
+        const request = new Request(input, init);
+        const body: unknown = JSON.parse(await request.clone().text());
+        if (!body || typeof body !== 'object' || Array.isArray(body) ||
+          (body as { max_tokens?: unknown }).max_tokens !== outputTokenLimit) {
+          throw new Error('Required output token limit differs from the final Anthropic request');
+        }
+        input = request;
+        init = undefined;
+      } catch {
+        throw Object.assign(new Error('Required output token limit could not be verified on the final Anthropic request'), { costUsd: 0 });
+      }
+    }
     const attempt = ++state.attempt;
     let endpointOrigin: string | null = null;
     try {
@@ -1696,9 +1719,10 @@ async function* statelessAgentChat(
       authToken: t.token,
       defaultHeaders: { ...t.headers, ...tierHeaders, ...callerHeaders },
       maxRetries: 2,
-      ...(opts.onTransportDiagnostic ? { fetch: createStatelessDiagnosticFetch(
-        t, opts.onTransportDiagnostic, globalThis.fetch, diagnosticState,
+      ...(opts.onTransportDiagnostic || opts.requireOutputTokenLimit ? { fetch: createStatelessDiagnosticFetch(
+        t, opts.onTransportDiagnostic ?? (() => {}), globalThis.fetch, diagnosticState,
         governed ? (isLocalhostUrl(t.baseURL) ? 'request-local' : 'shared-provider') : 'disabled',
+        opts.requireOutputTokenLimit ? opts.maxTokens : undefined,
       ) } : {}),
     });
   let client = mkClient(transport);
@@ -2181,6 +2205,15 @@ async function* governedStatelessChat(
 export async function* runAgentChat(
   opts: RunAgentChatOptions,
 ): AsyncGenerator<ChatEvent, void, void> {
+  if (opts.requireOutputTokenLimit) {
+    opts = { ...opts, ...(opts.messages ? { messages: opts.messages.map(message => ({ ...message })) } : {}) };
+    if (!Number.isSafeInteger(opts.maxTokens) || opts.maxTokens! <= 0) {
+      throw Object.assign(new RangeError('Required output token limit needs a positive integer maxTokens'), { costUsd: 0 });
+    }
+    if (resolveBackend(opts) !== 'anthropic-direct') {
+      throw Object.assign(new Error('Required output token limit is not implemented for this backend'), { costUsd: 0 });
+    }
+  }
   maybeBootstrap();
   const backend: AgentBackend = resolveBackend(opts);
   if (backend === 'anthropic-direct') {
