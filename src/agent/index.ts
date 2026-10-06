@@ -18,6 +18,9 @@ export {
   resolveAnthropicBaseUrl,
   probeStatelessTransport,
   type StatelessTransportProbe,
+  createStatelessDiagnosticFetch,
+  type StatelessRequestAttempt,
+  type StatelessRequestAuthorizer,
   // P-007 (own-tui-full-divorce-2026-08-24): the agent-loop ModelPort adapter
   // reuses the stateless family's transport resolution, admission-tier headers
   // and OAuth-framed system param instead of duplicating them.
