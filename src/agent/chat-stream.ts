@@ -638,6 +638,10 @@ export interface RunAgentChatOptions {
    * this hook alone is not a monetary or provider-invoice cap. Unsupported
    * backends refuse rather than ignore it. */
   authorizeStatelessRequest?: StatelessRequestAuthorizer;
+  /** Trusted host's scoped loopback gateway, copied before async work. Uses
+   * this exact route/token for retries; never falls back to local credentials.
+   * Provider authorization remains the gateway controller's responsibility. */
+  statelessGateway?: Pick<StatelessTransport, 'baseURL' | 'token'>;
   /**
    * Sampling temperature (0–1). `anthropic-direct` honors when the model
    * accepts it (skipped for `opus*` per the Anthropic API constraint).
@@ -1339,7 +1343,23 @@ export function chooseStatelessTransport(args: {
  *  stateless family uses — same OAuth/delegation choice, same route-account
  *  pin, same base-URL precedence — so the owned loop can never disagree with
  *  the proven call path. */
-export function resolveStatelessTransport(accountId?: string): StatelessTransport {
+export function resolveStatelessTransport(
+  accountId?: string,
+  gateway?: Pick<StatelessTransport, 'baseURL' | 'token'>,
+): StatelessTransport {
+  if (gateway !== undefined) {
+    try {
+      const { baseURL, token } = gateway;
+      if (typeof baseURL !== 'string' || typeof token !== 'string' || !token.trim() || /[\r\n]/.test(token)) throw new Error();
+      const url = new URL(baseURL);
+      if (!isLocalhostUrl(url.href) || !['http:', 'https:'].includes(url.protocol) ||
+          url.username || url.password || url.search || url.hash) throw new Error();
+      // No ambient account pin: this scoped service owns account selection.
+      return { baseURL: url.href, token, headers: { 'anthropic-beta': 'oauth-2025-04-20' }, label: 'gateway-pool' };
+    } catch {
+      throw Object.assign(new Error('Invalid stateless gateway binding'), { costUsd: 0 });
+    }
+  }
   // A concrete per-request account selection necessarily rides the local
   // gateway: a direct Anthropic endpoint cannot interpret the routing header.
   if (accountId?.trim()) return gatewayPoolTransport(accountId);
@@ -1767,7 +1787,7 @@ async function* statelessAgentChat(
   // Resolve transport: direct-to-Anthropic with the Claude OAuth session, or
   // gateway-pool delegation when no usable local session exists (EI-12940 —
   // see resolveStatelessTransport / gatewayPoolTransport).
-  let transport: StatelessTransport = resolveStatelessTransport();
+  let transport: StatelessTransport = resolveStatelessTransport(undefined, opts.statelessGateway);
 
   // Lazy-load the SDK so consumers that never use this path don't pay the import
   // cost. Dynamic `import()` (not a static top-level import) keeps it lazy, stays
@@ -1914,7 +1934,7 @@ async function* statelessAgentChat(
       // cached Claude token rotated on disk after we read it. Invalidate,
       // re-read, and retry once with the fresh token; if the re-read yields
       // the SAME token, the session is genuinely dead — fail normally.
-      if (isAuthFailure(err)) {
+      if (!opts.statelessGateway && isAuthFailure(err)) {
         const staleTok = transport.token;
         authExpiresAt = readClaudeOauthExpiry();
         invalidateClaudeTokenCache();
@@ -2096,7 +2116,7 @@ async function* governedStatelessChat(
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const recoverAuth = async (): Promise<any | null> => {
-    if (refreshAttempted || !auth || auth.transport.label !== 'anthropic-direct') return null;
+    if (opts.statelessGateway || refreshAttempted || !auth || auth.transport.label !== 'anthropic-direct') return null;
     refreshAttempted = true;
     const staleTok = auth.transport.token;
     authExpiresAt = readClaudeOauthExpiry();
@@ -2283,8 +2303,10 @@ async function* governedStatelessChat(
 export async function* runAgentChat(
   opts: RunAgentChatOptions,
 ): AsyncGenerator<ChatEvent, void, void> {
-  if (opts.requireOutputTokenLimit || opts.authorizeStatelessRequest !== undefined) {
-    opts = { ...opts, ...(opts.messages ? { messages: opts.messages.map(message => ({ ...message })) } : {}) };
+  if (opts.requireOutputTokenLimit || opts.authorizeStatelessRequest !== undefined || opts.statelessGateway !== undefined) {
+    opts = { ...opts, ...(opts.messages ? { messages: opts.messages.map(message => ({ ...message })) } : {}),
+      ...(opts.statelessGateway === undefined ? {} : { statelessGateway: Object.freeze({ ...opts.statelessGateway }) }) };
+    if (opts.statelessGateway !== undefined) resolveStatelessTransport(undefined, opts.statelessGateway);
     if (opts.requireOutputTokenLimit && (!Number.isSafeInteger(opts.maxTokens) || opts.maxTokens! <= 0)) {
       throw Object.assign(new RangeError('Required output token limit needs a positive integer maxTokens'), { costUsd: 0 });
     }

@@ -243,6 +243,68 @@ describe('required Anthropic output bounds (WI-10006340)', () => {
     }
   });
 
+  it.each(['0', '1'])('the actual SDK retains a per-call gateway across mutation and retries with governor=%s', async governed => {
+    vi.stubEnv('PAPERCUSP_DEFAULT_ACCOUNT_ACTIVE', '1');
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', governed);
+    sdk.real = (await vi.importActual<typeof import('@anthropic-ai/sdk')>('@anthropic-ai/sdk')).default;
+    const statelessGateway = { baseURL: 'http://127.0.0.1:32123/cycle', token: 'cycle-private' };
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(new Request(input, init));
+      if (requests.length === 1) return new Response(JSON.stringify({ error: { type: 'overloaded_error', message: 'fixture retry' } }),
+        { status: 503, headers: { 'retry-after': '0', 'content-type': 'application/json' } });
+      const frames = [
+        { type: 'message_start', message: { id: 'msg_scoped', type: 'message', role: 'assistant', model: 'claude-opus-4-8',
+          content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'scoped' } },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 1 } },
+        { type: 'message_stop' },
+      ].map(event => 'event: ' + event.type + '\ndata: ' + JSON.stringify(event) + '\n\n').join('');
+      return new Response(frames, { headers: { 'content-type': 'text/event-stream' } });
+    }));
+    const attempts: StatelessRequestAttempt[] = [];
+    const opts: RunAgentChatOptions = { backend: 'anthropic-direct', model: 'claude-opus-4-8', promptText: 'scoped',
+      maxTokens: 8, requireOutputTokenLimit: true, statelessGateway, signal: AbortSignal.timeout(5000),
+      authorizeStatelessRequest: async attempt => {
+        attempts.push(attempt); statelessGateway.baseURL = 'http://127.0.0.1:1'; statelessGateway.token = 'changed'; return () => {};
+      } };
+    const run = runAgentChat(opts); const first = run.next();
+    opts.statelessGateway = { baseURL: 'http://127.0.0.1:2', token: 'replacement' };
+    const events = [(await first).value]; for await (const event of run) events.push(event);
+    expect(requests.map(request => [request.url, request.headers.get('authorization')]))
+      .toEqual([['http://127.0.0.1:32123/cycle/v1/messages', 'Bearer cycle-private'],
+        ['http://127.0.0.1:32123/cycle/v1/messages', 'Bearer cycle-private']]);
+    expect(attempts.map(attempt => attempt.url)).toEqual(['http://127.0.0.1:32123/cycle/v1/messages',
+      'http://127.0.0.1:32123/cycle/v1/messages']);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'result', finalText: 'scoped' }));
+  });
+
+  it.each(['claude-code', 'omp', 'codex'] as const)('refuses a per-call gateway on unsupported backend %s', async backend => {
+    await expect(runAgentChat({ backend, promptText: 'fixture',
+      statelessGateway: { baseURL: 'http://127.0.0.1:32123', token: 'private' } }).next()).rejects.toMatchObject({ costUsd: 0 });
+  });
+
+  it.each(['0', '1'])('does not replace an explicit gateway credential on authentication failure with governor=%s', async governed => {
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', governed);
+    sdk.real = (await vi.importActual<typeof import('@anthropic-ai/sdk')>('@anthropic-ai/sdk')).default;
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(new Request(input, init));
+      return new Response(JSON.stringify({ error: { type: 'authentication_error', message: 'private fixture refused' } }),
+        { status: 401, headers: { 'content-type': 'application/json' } });
+    }));
+    const events = [];
+    for await (const event of runAgentChat({ backend: 'anthropic-direct', model: 'claude-opus-4-8', promptText: 'fixture',
+      statelessGateway: { baseURL: 'http://127.0.0.1:32123/cycle', token: 'cycle-private' },
+      signal: AbortSignal.timeout(5000), authorizeStatelessRequest: async () => () => {} })) events.push(event);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toBe('http://127.0.0.1:32123/cycle/v1/messages');
+    expect(requests[0]?.headers.get('authorization')).toBe('Bearer cycle-private');
+    expect(events).toContainEqual(expect.objectContaining({ type: 'error' }));
+  });
+
   it.each(['0', '1'])('the actual SDK sends the frozen judge policy and caller snapshot with governor=%s', async governed => {
     vi.stubEnv('PAPERCUSP_DEFAULT_ACCOUNT_ACTIVE', '1');
     vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', governed);
