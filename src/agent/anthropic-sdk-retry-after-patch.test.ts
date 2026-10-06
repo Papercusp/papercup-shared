@@ -1,5 +1,5 @@
 /**
- * Guard for the @anthropic-ai/sdk patch (patches/@anthropic-ai+sdk+0.81.0.patch, WI-10004615).
+ * Guard for the @anthropic-ai/sdk patch (patches/@anthropic-ai+sdk+0.93.0.patch, WI-10004615).
  *
  * SDK 0.81 honours a 429 `retry-after` with no upper bound and waits it out with a sleep
  * that ignores the request's AbortSignal. Measured 2026-10-01: a usage-window 429 carrying
@@ -12,7 +12,15 @@
  * is ever lost (an SDK upgrade, a dropped patch file, a reinstall without patch-package).
  */
 import Anthropic from '@anthropic-ai/sdk';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { satisfies } from 'semver';
 import { describe, expect, it } from 'vitest';
+
+const require = createRequire(import.meta.url);
+const CommonJSAnthropic = require('@anthropic-ai/sdk').default as typeof Anthropic;
 
 type FetchCall = { at: number };
 
@@ -48,13 +56,28 @@ const ok = () =>
     { status: 200, headers: { 'content-type': 'application/json' } },
   );
 
-function client(fetchImpl: typeof fetch, maxRetries = 2) {
-  return new Anthropic({ apiKey: 'test-key', baseURL: 'http://sdk-patch.test', fetch: fetchImpl, maxRetries });
-}
-
 const params = { model: 'claude-test', max_tokens: 8, messages: [{ role: 'user' as const, content: 'hi' }] };
 
-describe('@anthropic-ai/sdk retry-after patch (WI-10004615)', () => {
+describe.each([
+  ['ESM', Anthropic],
+  ['CommonJS', CommonJSAnthropic],
+] as const)('@anthropic-ai/sdk %s retry-after patch (WI-10004615)', (_format, Sdk) => {
+  function client(fetchImpl: typeof fetch, maxRetries = 2) {
+    return new Sdk({ apiKey: 'test-key', baseURL: 'http://sdk-patch.test', fetch: fetchImpl, maxRetries });
+  }
+
+  it('satisfies the installed Claude Agent SDK peer requirement', () => {
+    const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..');
+    const sdkEntry = require.resolve('@anthropic-ai/sdk');
+    const agentEntry = require.resolve('@anthropic-ai/claude-agent-sdk', {
+      paths: [join(repoRoot, 'packages/operator-core')],
+    });
+    const installed = JSON.parse(readFileSync(join(dirname(sdkEntry), 'package.json'), 'utf8'));
+    const agent = JSON.parse(readFileSync(join(dirname(agentEntry), 'package.json'), 'utf8'));
+    const required = agent.peerDependencies['@anthropic-ai/sdk'];
+    expect(required).toBeTypeOf('string');
+    expect(satisfies(installed.version, required)).toBe(true);
+  });
   it('surfaces a 429 whose retry-after exceeds 60 s instead of sleeping it out', async () => {
     const { calls, fetchImpl } = stubFetch([rateLimited({ 'retry-after': '8286' })]);
     const started = Date.now();
@@ -96,7 +119,7 @@ describe('@anthropic-ai/sdk retry-after patch (WI-10004615)', () => {
     setTimeout(() => controller.abort(), 100);
     const started = Date.now();
     await expect(client(fetchImpl).messages.create(params, { signal: controller.signal })).rejects.toBeInstanceOf(
-      Anthropic.APIUserAbortError,
+      Sdk.APIUserAbortError,
     );
     expect(Date.now() - started).toBeLessThan(5_000);
     expect(calls).toHaveLength(1);
