@@ -937,6 +937,8 @@ export interface StatelessTransportDiagnostic {
   servedAccount: string | null;
   providerRequestId: string | null;
   status: number | null;
+  /** Allowlisted syscall causes only: never error messages, URLs or credentials. */
+  transportFailureCode?: string | null;
   /** Parsed SDK message events, not raw bytes or evidence of a completed response. */
   streamEventCount?: number;
   textChars?: number;
@@ -1045,13 +1047,14 @@ export function createStatelessDiagnosticFetch(
       loopback: endpointOrigin === null ? null : isLocalhostUrl(endpointOrigin),
       requestedAccount: transport.headers[ROUTE_ACCOUNT_HEADER]?.trim() || null,
     };
-    const emit = (phase: StatelessTransportDiagnostic['phase'], response?: Response) => {
+    const emit = (phase: StatelessTransportDiagnostic['phase'], response?: Response, failure?: unknown) => {
       try {
         const headers = headersToRecord(response?.headers);
         observe({ ...base, phase, observedAt: new Date().toISOString(),
           servedAccount: servedAccountFromHeaders(headers) ?? null,
           providerRequestId: (headers?.['request-id'] ?? headers?.['x-request-id'])?.trim() || null,
-          status: response?.status ?? null });
+          status: response?.status ?? null,
+          ...(phase === 'transport-error' ? { transportFailureCode: transportFailureCode(failure) } : {}) });
       } catch { /* Diagnostic bookkeeping must never change a turn's outcome. */ }
     };
     emit('request');
@@ -1076,10 +1079,30 @@ export function createStatelessDiagnosticFetch(
       emit('response', response);
       return response;
     } catch (err) {
-      emit('transport-error');
+      emit('transport-error', undefined, err);
       throw err;
     }
   };
+}
+
+/** Fetch/SDK wrappers hide syscall codes in `.cause`. Bound traversal and disclose
+ * only known codes; malformed objects/getters must never replace the original error. */
+function transportFailureCode(error: unknown): string | null {
+  const allowed = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND',
+    'EAI_AGAIN', 'EPIPE', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+    'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET', 'ABORT_ERR']);
+  const seen = new Set<unknown>();
+  let current = error;
+  for (let depth = 0; depth < 5 && current && typeof current === 'object'; depth++) {
+    if (seen.has(current)) return null;
+    seen.add(current);
+    try {
+      const code = (current as { code?: unknown }).code;
+      if (typeof code === 'string' && allowed.has(code)) return code;
+      current = (current as { cause?: unknown }).cause;
+    } catch { return null; }
+  }
+  return null;
 }
 
 /** Observe parsed message progress without reading/teeing the HTTP body or retaining

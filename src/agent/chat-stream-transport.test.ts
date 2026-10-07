@@ -394,6 +394,33 @@ describe('stateless HTTP attempt diagnostics (WI-10005738)', () => {
     expect(records[1]).toMatchObject({ requestedAccount: null, servedAccount: null, providerRequestId: null, status: 200 });
   });
 
+  it.each(['ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'UND_ERR_CONNECT_TIMEOUT'])(
+    'retains allowlisted nested fetch cause %s without changing the thrown error', async code => {
+      const records: StatelessTransportDiagnostic[] = [];
+      const failure = new TypeError('secret URL or credential', {
+        cause: new Error('secret underlying message', { cause: { code } }),
+      });
+      const observed = createStatelessDiagnosticFetch(transport, r => records.push(r), async () => { throw failure; });
+      await expect(observed('http://127.0.0.1:8788/v1/messages')).rejects.toBe(failure);
+      expect(records[1]).toMatchObject({ phase: 'transport-error', transportFailureCode: code });
+      expect(JSON.stringify(records)).not.toContain('secret');
+      expect(records[0]).not.toHaveProperty('transportFailureCode');
+    });
+
+  it('keeps arbitrary codes, cyclic causes and hostile getters undisclosed', async () => {
+    const cyclic: { cause?: unknown } = {};
+    cyclic.cause = cyclic;
+    for (const cause of [{ code: 'secret-token' }, cyclic,
+      Object.defineProperty({}, 'code', { get() { throw new Error('secret getter'); } })]) {
+      const records: StatelessTransportDiagnostic[] = [];
+      const failure = new Error('secret failure', { cause });
+      const observed = createStatelessDiagnosticFetch(transport, r => records.push(r), async () => { throw failure; });
+      await expect(observed('http://127.0.0.1:8788/v1/messages')).rejects.toBe(failure);
+      expect(records[1]).toMatchObject({ phase: 'transport-error', transportFailureCode: null });
+      expect(JSON.stringify(records)).not.toContain('secret');
+    }
+  });
+
   it.each(['0', '1'])('the real runner observes failures with governor=%s before yielding its error', async governed => {
     vi.stubEnv('PAPERCUSP_DEFAULT_ACCOUNT_ACTIVE', '1');
     vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', governed);
