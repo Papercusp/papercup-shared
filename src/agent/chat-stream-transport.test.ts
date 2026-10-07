@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { createStatelessDiagnosticFetch, runAgentChat, type RunAgentChatOptions, type StatelessRequestAttempt, type StatelessTransportDiagnostic } from './chat-stream';
+import { createStatelessDiagnosticFetch, isTransientLlmError, runAgentChat, type RunAgentChatOptions, type StatelessRequestAttempt, type StatelessTransportDiagnostic } from './chat-stream';
 
 // Negative pre-implementation cases must never launch a credentialed CLI.
 vi.mock('node:child_process', async importOriginal => ({
@@ -353,6 +353,22 @@ describe('required Anthropic output bounds (WI-10006340)', () => {
 });
 
 describe('stateless HTTP attempt diagnostics (WI-10005738)', () => {
+  it.each(['ECONNREFUSED', 'ECONNRESET', 'UND_ERR_SOCKET'])(
+    'classifies masked local gateway %s using the existing bounded retry policy', code => {
+      const failure = new Error('Connection error.', { cause: new TypeError('fetch failed', { cause: { code } }) });
+      expect(isTransientLlmError(failure, { baseURL: 'http://127.0.0.1:8788' })).toBe(true);
+      expect(isTransientLlmError(failure, { baseURL: 'https://api.anthropic.com' })).toBe(false);
+      expect(isTransientLlmError(failure)).toBe(false);
+    });
+
+  it('does not broaden retries to unknown local failures, DNS or authentication failures', () => {
+    for (const failure of [new Error('Connection error.'), new Error('401 unauthorized'),
+      new Error('Connection error.', { cause: { code: 'ENOTFOUND' } })]) {
+      expect(isTransientLlmError(failure, { baseURL: 'http://127.0.0.1:8788' })).toBe(false);
+    }
+    expect(isTransientLlmError(new Error('529 overloaded'))).toBe(true);
+  });
+
   it('records actual sends including SDK retries, without changing requests or consuming responses', async () => {
     const records: StatelessTransportDiagnostic[] = [];
     const headers = new Headers({ 'request-id': 'req_provider', 'x-papercusp-routed-account': 'served-account',

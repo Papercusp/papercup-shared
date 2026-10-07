@@ -1707,8 +1707,15 @@ export function agentExitErrorMessage(
   return failureLine ? `${base}: ${failureLine}` : base;
 }
 
-function isTransientLlmError(err: unknown): boolean {
+export function isTransientLlmError(err: unknown, transport?: Pick<StatelessTransport, 'baseURL'>): boolean {
   const msg = err instanceof Error ? err.message : String(err);
+  // A local gateway restart closes streams and briefly refuses connects. The SDK
+  // masks these as "Connection error."; retain its nested syscall evidence rather
+  // than treating every masked error (including remote/auth failures) as transient.
+  if (transport && isLocalhostUrl(transport.baseURL)) {
+    const code = transportFailureCode(err);
+    if (code === 'ECONNREFUSED' || code === 'ECONNRESET' || code === 'UND_ERR_SOCKET') return true;
+  }
   // Anthropic SDK APIError surfaces as `<status> <body>` in .message.
   // Retry on 529 overloaded, 429 rate-limit, 5xx, and network blips.
   return /(\b529\b|overloaded|rate.?limit|service unavailable|\b50[02-4]\b|ETIMEDOUT|ECONNRESET|ECONNREFUSED|socket hang up)/i.test(msg);
@@ -1718,7 +1725,7 @@ function isTransientLlmError(err: unknown): boolean {
  * Connection-level failure to reach the transport at all. The Anthropic SDK
  * masks the underlying syscall error as APIConnectionError with the bare
  * message "Connection error." — which `isTransientLlmError` deliberately does
- * NOT match (retrying an unreachable endpoint 8 times helps nobody). Kept
+ * NOT match without an evidenced local-gateway restart-class syscall cause. Kept
  * exported for consumers that classify connection-level death (EI-281), not
  * as a retry classifier.
  */
@@ -1998,7 +2005,7 @@ async function* statelessAgentChat(
           }
         }
       }
-      if (!isTransientLlmError(err) || attempt === RETRY_MAX) {
+      if (!isTransientLlmError(err, transport) || attempt === RETRY_MAX) {
         yield {
           type: 'error',
           message: `${transport.label} error: ${err instanceof Error ? err.message : String(err)}${statelessErrorContext(transport, err, { expiresAt: authExpiresAt, refreshOutcome })}`,
