@@ -18,7 +18,9 @@ assert.equal(agentSpawnTransformConfigured(), false);
 for (const key of ['PAPERCUSP_ACCOUNT_ID', 'PAPERCUSP_CODEX_GATEWAY',
   'OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL']) assert.equal(process.env[key], undefined);
 
-const manual = process.argv[2] === 'public-manual';
+const manual = process.argv[2].startsWith('public-manual');
+const names = process.argv[2] === 'public-manual-underscores'
+  ? ['docs_search', 'docs_get'] : ['docs:search', 'docs:get'];
 const marker = 'Explain the product from the public FAQ first';
 const prompt = manual
   ? 'For product questions, retrieve the public FAQ and cite the retrieved heading.'
@@ -60,7 +62,7 @@ const server = createServer(async (request, response) => {
     const result = message.method === 'initialize'
       ? { protocolVersion: message.params.protocolVersion, capabilities: { tools: {} },
           serverInfo: { name: 'public-manual-fixture', version: '1' } }
-      : { tools: ['docs:search', 'docs:get'].map(name => ({ name,
+      : { tools: names.map(name => ({ name,
           description: 'Read the public manual fixture only',
           inputSchema: { type: 'object', properties: { scope: { type: 'string', enum: ['public'] } },
             required: ['scope'], additionalProperties: false } })) };
@@ -90,14 +92,15 @@ try {
     '-c features.responses_websockets=false', '-c features.plugins=false',
     ...(process.argv[3] ? [`-c project_doc_max_bytes=${Number(process.argv[3])}`] : [])].join(' ');
   for await (const event of runAgentChat({ backend: 'codex', agentCmd: command,
-    model: manual ? 'gpt-5.6-luna:low' : 'gpt-5.5', cwd: dir,
+    model: manual ? (process.argv[4] || 'gpt-5.6-luna:low') : 'gpt-5.5', cwd: dir,
     promptText: manual ? 'Will agents stop when I close this browser tab?' : 'Inspect the configured instruction context.',
     systemPromptText: prompt, permissionMode: 'bypassPermissions',
     ...(manual ? { allowedTools: ['mcp__agentmcp__docs:search', 'mcp__agentmcp__docs:get'],
       mcpConfig: { mcpServers: { agentmcp: { type: 'http', url: `${origin}/mcp`,
         headers: { Authorization: `Bearer ${bearer}` } } } } } : {}),
     signal: AbortSignal.timeout(20000) })) {
-    if (event.type === 'error') terminalEvents.push({ type: event.type, message: event.message.slice(0, 1400) });
+    if (event.type === 'error') terminalEvents.push({ type: event.type,
+      message: event.message.slice(0, 1400), stderr: event.stderr });
     else if (event.type === 'result') terminalEvents.push({ type: event.type,
       tokensIn: event.tokensIn, tokensOut: event.tokensOut });
   }
@@ -112,7 +115,8 @@ try {
   console.log('CODEX_ISOLATED_CAPTURE ' + JSON.stringify({ isolationVerified: true,
     requestCount: requests.length, mcpMethods, httpRoutes, unauthorized, terminalEvents,
     models: requests.map(request => request.model),
-    tools: tools.map(tool => ({ name: tool.name, parameters: tool.parameters })),
+    tools: tools.map(tool => ({ type: tool.type, name: tool.name, parameters: tool.parameters,
+      tools: tool.tools, functions: tool.functions })),
     promptBytes: Buffer.byteLength(prompt), promptSha256: createHash('sha256').update(prompt).digest('hex'),
     fullPrompt: strings.some(text => text.includes(prompt)),
     lateMarkerPresent: strings.some(text => text.includes(marker)) }));

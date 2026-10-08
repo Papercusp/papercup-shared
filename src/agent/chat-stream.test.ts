@@ -262,7 +262,7 @@ test('Codex caller provider configuration survives generated reasoning settings'
   }
 });
 
-async function isolatedCodexCapture(mode: string, budget?: number) {
+async function isolatedCodexCapture(mode: string, budget?: number, model?: string) {
   assert.equal(process.platform, 'linux', 'Native capture requires Linux network namespaces');
   const { stdout } = await promisify(execFile)('bwrap', [
     '--unshare-net', '--ro-bind', '/', '/', '--tmpfs', '/tmp',
@@ -270,7 +270,7 @@ async function isolatedCodexCapture(mode: string, budget?: number) {
     '--setenv', 'HOME', '/tmp/codex-fixture-home',
     '--', process.execPath, '--import', import.meta.resolve('tsx'),
     new URL('./__fixtures__/codex-local-capture.ts', import.meta.url).pathname,
-    mode, ...(budget === undefined ? [] : [String(budget)]),
+    mode, budget === undefined ? '' : String(budget), ...(model ? [model] : []),
   ], { env: { PATH: process.env.PATH, RUST_LOG: 'error',
       PAPERCUSP_CAPTURE_PARENT_NETNS: readlinkSync('/proc/self/ns/net'),
       ...(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE_FILE
@@ -279,7 +279,11 @@ async function isolatedCodexCapture(mode: string, budget?: number) {
   const line = stdout.split('\n').find(line => line.startsWith('CODEX_ISOLATED_CAPTURE '));
   assert.ok(line, 'The isolated native fixture must produce its measured result');
   const capture = JSON.parse(line.slice('CODEX_ISOLATED_CAPTURE '.length));
-  console.info('CODEX_CONTAINED_CAPTURE ' + JSON.stringify(capture));
+  console.info('CODEX_CONTAINED_CAPTURE ' + JSON.stringify({ ...capture,
+    tools: capture.tools.map((tool: { type?: string; name?: string; tools?: unknown; functions?: unknown }) => ({
+      type: tool.type, name: tool.name, tools: tool.tools, functions: tool.functions,
+    })),
+    toolCount: capture.tools.length }));
   assert.equal(capture.isolationVerified, true);
   assert.ok(capture.requestCount > 0, 'The native CLI must submit its request locally');
   return capture;
@@ -301,7 +305,12 @@ test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
 test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
   'Codex public manual MCP schemas reach the local provider with the scoped bearer',
   async () => {
-    const capture = await isolatedCodexCapture('public-manual');
+    const captures = await Promise.all([
+      isolatedCodexCapture('public-manual'),
+      isolatedCodexCapture('public-manual-underscores'),
+      isolatedCodexCapture('public-manual', undefined, 'gpt-5.5'),
+    ]);
+    const capture = captures[0];
     assert.equal(capture.unauthorized, 0);
     assert.ok(capture.mcpMethods.includes('initialize'));
     assert.ok(capture.mcpMethods.includes('tools/list'));
