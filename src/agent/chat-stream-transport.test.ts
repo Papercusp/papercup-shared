@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { PassThrough, Writable } from 'node:stream';
 import type { AddressInfo } from 'node:net';
 import { createStatelessDiagnosticFetch, invalidateClaudeTokenCache, isTransientLlmError, runAgentChat, type RunAgentChatOptions, type StatelessRequestAttempt, type StatelessTransportDiagnostic } from './chat-stream';
 
@@ -67,6 +70,59 @@ const transport = {
   headers: { 'x-papercusp-account': 'requested-account', authorization: 'secret-header' },
   label: 'anthropic-direct' as const,
 };
+
+// WI-10007475: native pipes may split any UTF-8 code point across data events.
+// Feed one byte at a time through real Node streams, without launching a CLI.
+function nativeByteStream(stdout: string, stderr = '', exitCode = 0) {
+  const child = new EventEmitter() as ChildProcess;
+  const output = new PassThrough();
+  const errors = new PassThrough();
+  Object.assign(child, { stdout: output, stderr: errors, kill: vi.fn(),
+    stdin: new Writable({ write(_chunk, _encoding, done) { done(); }, final(done) {
+      done();
+      queueMicrotask(() => {
+        for (const byte of Buffer.from(stdout)) output.write(Buffer.from([byte]));
+        for (const byte of Buffer.from(stderr)) errors.write(Buffer.from([byte]));
+        output.end(); errors.end();
+        child.emit('exit', exitCode, null);
+      });
+    } }) });
+  vi.mocked(spawn).mockReturnValueOnce(child);
+}
+
+describe('native UTF-8 pipe decoding (WI-10007475)', () => {
+  const text = 'café 東京 🧭';
+  it.each(['claude-code', 'codex', 'omp'] as const)('preserves %s assistant and tool-result text across byte boundaries', async backend => {
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', '');
+    vi.stubEnv('PAPERCUSP_AGENT_DEBUG', '');
+    const frames = backend === 'claude-code' ? [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'utf8', name: 'docs:get' }] } },
+      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'utf8', content: text }] } },
+      { type: 'result', result: text, total_cost_usd: 0 },
+    ] : backend === 'codex' ? [
+      { type: 'item.completed', item: { id: 'utf8', type: 'mcp_tool_call', tool: 'docs:get', status: 'completed', result: text } },
+      { type: 'item.completed', item: { type: 'agent_message', text } },
+    ] : [
+      { type: 'tool_execution_end', toolCallId: 'utf8', toolName: 'docs:get', result: text },
+      { type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text }] } },
+    ];
+    nativeByteStream(frames.map(frame => JSON.stringify(frame)).join('\n') + '\n');
+    const observed = vi.fn();
+    const events = [];
+    for await (const event of runAgentChat({ backend, promptText: 'Fixture', onToolResult: observed })) events.push(event);
+    expect(events.find(event => event.type === 'result')).toMatchObject({ finalText: text });
+    expect(observed).toHaveBeenCalledExactlyOnceWith({ name: 'docs:get', output: text, isError: false, callId: 'utf8' });
+  });
+
+  it('preserves stderr diagnostics across byte boundaries', async () => {
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', '');
+    vi.stubEnv('PAPERCUSP_AGENT_DEBUG', '');
+    nativeByteStream('', text, 1);
+    const events = [];
+    for await (const event of runAgentChat({ backend: 'codex', promptText: 'Fixture' })) events.push(event);
+    expect(events.find(event => event.type === 'error')).toMatchObject({ stderr: text });
+  });
+});
 
 describe('per-request account routing', () => {
   it('never substitutes host OAuth after a pinned gateway account rejects auth', async () => {

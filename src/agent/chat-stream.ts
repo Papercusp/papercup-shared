@@ -3285,9 +3285,11 @@ export async function* runAgentChat(
         ? handleOmpEvent
         : handleClaudeEvent;
 
-  child.stdout!.on('data', (chunk: Buffer) => {
+  // Decode on the stream so a UTF-8 code point split across pipe chunks stays intact.
+  child.stdout!.setEncoding('utf8');
+  child.stdout!.on('data', (chunk: string) => {
     if (!tFirstStdout) tFirstStdout = Date.now();
-    stdoutLineBuf += chunk.toString('utf8');
+    stdoutLineBuf += chunk;
     let nl: number;
     // eslint-disable-next-line no-cond-assign
     while ((nl = stdoutLineBuf.indexOf('\n')) >= 0) {
@@ -3301,8 +3303,9 @@ export async function* runAgentChat(
     }
   });
 
-  child.stderr!.on('data', (chunk: Buffer) => {
-    stderrBuf += chunk.toString('utf8');
+  child.stderr!.setEncoding('utf8');
+  child.stderr!.on('data', (chunk: string) => {
+    stderrBuf += chunk;
   });
 
   // claude AND codex read the prompt on stdin (codex via its trailing `-`
