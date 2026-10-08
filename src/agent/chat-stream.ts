@@ -514,7 +514,7 @@ export interface RunAgentChatOptions {
   toolEventFilter?: (rawName: string) => string | null | undefined;
   /** Opt-in observation of actual native tool returns, after toolEventFilter.
       Raw output stays server-side; callers must redact before publishing it. */
-  onToolResult?: (result: { name: string; output: string; isError: boolean }) => void;
+  onToolResult?: (result: { name: string; output: string; isError: boolean; callId?: string }) => void;
   /** Permission mode flag. Default: not set (claude prompts). Most
       backends pass 'bypassPermissions' for unattended in-app tools. */
   permissionMode?: 'bypassPermissions' | 'default' | 'ask';
@@ -736,7 +736,7 @@ export interface RunAgentChatOptions {
 
 export type ChatEvent =
   | { type: 'delta'; text: string }
-  | { type: 'tool_call'; name: string; input: unknown }
+  | { type: 'tool_call'; name: string; input: unknown; callId?: string }
   | {
       type: 'result';
       costUsd: number;
@@ -2963,13 +2963,15 @@ export async function* runAgentChat(
   // (from content_block_start) with the streamed input json
   // (input_json_delta) and emit one tool_call event per call when the
   // block stops.
-  const liveTools = new Map<number, { name: string; input: string }>();
+  const liveTools = new Map<number, { name: string; input: string; callId?: string }>();
   const toolResultNames = new Map<string, string>();
-  const observeToolResult = (name: string, output: unknown, isError: boolean) => {
+  const nativeCallId = (value: unknown): { callId?: string } =>
+    typeof value === 'string' && value ? { callId: value } : {};
+  const observeToolResult = (name: string, output: unknown, isError: boolean, callId?: unknown) => {
     if (!opts.onToolResult || output === undefined) return;
     const filtered = opts.toolEventFilter ? opts.toolEventFilter(name) : name;
     if (filtered) opts.onToolResult({ name: filtered,
-      output: typeof output === 'string' ? output : JSON.stringify(output), isError });
+      output: typeof output === 'string' ? output : JSON.stringify(output), isError, ...nativeCallId(callId) });
   };
 
   let stderrBuf = '';
@@ -3017,7 +3019,7 @@ export async function* runAgentChat(
         const name = toolResultNames.get(block.tool_use_id);
         if (name) {
           toolResultNames.delete(block.tool_use_id);
-          observeToolResult(name, block.content, block.is_error === true);
+          observeToolResult(name, block.content, block.is_error === true, block.tool_use_id);
         }
       }
     }
@@ -3032,7 +3034,7 @@ export async function* runAgentChat(
       typeof inner.content_block.name === 'string' &&
       typeof inner.index === 'number'
     ) {
-      liveTools.set(inner.index, { name: inner.content_block.name, input: '' });
+      liveTools.set(inner.index, { name: inner.content_block.name, input: '', ...nativeCallId(inner.content_block.id) });
       if (opts.onToolResult && typeof inner.content_block.id === 'string') {
         toolResultNames.set(inner.content_block.id, inner.content_block.name);
       }
@@ -3056,7 +3058,7 @@ export async function* runAgentChat(
       if (filtered) {
         let parsed: unknown;
         try { parsed = entry.input ? JSON.parse(entry.input) : {}; } catch { parsed = entry.input; }
-        queue.push({ type: 'tool_call', name: filtered, input: parsed });
+        queue.push({ type: 'tool_call', name: filtered, input: parsed, ...nativeCallId(entry.callId) });
       }
     } else if (ev.type === 'result') {
       claudeTerminalUsageSeen = true;
@@ -3111,13 +3113,13 @@ export async function* runAgentChat(
         ? opts.toolEventFilter(ev.toolName)
         : ev.toolName;
       if (filtered) {
-        queue.push({ type: 'tool_call', name: filtered, input: ev.args ?? {} });
+        queue.push({ type: 'tool_call', name: filtered, input: ev.args ?? {}, ...nativeCallId(ev.toolCallId) });
       }
       return;
     }
 
     if (ev.type === 'tool_execution_end' && typeof ev.toolName === 'string') {
-      observeToolResult(ev.toolName, ev.result, ev.isError === true || ev.result?.isError === true);
+      observeToolResult(ev.toolName, ev.result, ev.isError === true || ev.result?.isError === true, ev.toolCallId);
       return;
     }
 
@@ -3232,10 +3234,10 @@ export async function* runAgentChat(
         const filterInput = codexMcpToolFilterInput(item.server, toolName);
         const filtered = opts.toolEventFilter ? opts.toolEventFilter(filterInput) : toolName;
         if (filtered) {
-          queue.push({ type: 'tool_call', name: filtered, input: item.arguments ?? {} });
+          queue.push({ type: 'tool_call', name: filtered, input: item.arguments ?? {}, ...nativeCallId(item.id) });
         }
         observeToolResult(filterInput, item.result ?? item.error,
-          item.status === 'failed' || item.result?.isError === true || item.error != null);
+          item.status === 'failed' || item.result?.isError === true || item.error != null, item.id);
         return;
       }
       if (item.type === 'command_execution') {

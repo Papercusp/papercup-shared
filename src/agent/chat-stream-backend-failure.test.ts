@@ -116,7 +116,32 @@ describe('native tool-result observation', () => {
       { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'call-1', content: output }] } },
       { type: 'result', result: 'Done', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 } },
     ], 0), promptText: 'Test fixture', onToolResult: observed });
-    expect(observed).toHaveBeenCalledExactlyOnceWith({ name: 'docs:get', output, isError: false });
+    expect(observed).toHaveBeenCalledExactlyOnceWith({ name: 'docs:get', output, isError: false, callId: 'call-1' });
+  });
+
+  it.each(['claude-code', 'codex', 'omp'] as const)('pairs repeated %s calls by native ID rather than tool name', async backend => {
+    const frames = ['call-1', 'call-2'].flatMap((id, index) => backend === 'claude-code' ? [
+      { type: 'stream_event', event: { type: 'content_block_start', index,
+        content_block: { type: 'tool_use', id, name: 'docs:get' } } },
+      { type: 'stream_event', event: { type: 'content_block_stop', index } },
+      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, content: id }] } },
+    ] : backend === 'codex' ? [
+      { type: 'item.completed', item: { id, type: 'mcp_tool_call', tool: 'docs:get', status: 'completed', result: id } },
+    ] : [
+      { type: 'tool_execution_start', toolCallId: id, toolName: 'docs:get', args: {} },
+      { type: 'tool_execution_end', toolCallId: id, toolName: 'docs:get', result: id },
+    ]);
+    const terminal = backend === 'claude-code'
+      ? { type: 'result', result: 'Done', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 } }
+      : backend === 'codex'
+        ? { type: 'item.completed', item: { type: 'agent_message', text: 'Done' } }
+        : { type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'Done' }] } };
+    const observed = vi.fn();
+    const events = await collect({ backend, agentCmd: fakeCli([...frames, terminal], 0),
+      promptText: 'Test fixture', onToolResult: observed });
+    expect(events.filter(event => event.type === 'tool_call').map(event => event.callId)).toEqual(['call-1', 'call-2']);
+    expect(observed.mock.calls.map(([result]) => ({ id: result.callId, output: result.output })))
+      .toEqual([{ id: 'call-1', output: 'call-1' }, { id: 'call-2', output: 'call-2' }]);
   });
 });
 
