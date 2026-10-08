@@ -20,7 +20,8 @@ for (const key of ['PAPERCUSP_ACCOUNT_ID', 'PAPERCUSP_CODEX_GATEWAY',
 
 const manual = process.argv[2].startsWith('public-manual');
 const codeMode = process.argv[2] === 'public-manual-code-mode';
-const names = process.argv[2] === 'public-manual-underscores'
+const toolLoop = process.argv[2].startsWith('public-manual-tool-loop');
+const names = process.argv[2].endsWith('-underscores')
   ? ['docs_search', 'docs_get'] : ['docs:search', 'docs:get'];
 const marker = 'Explain the product from the public FAQ first';
 const prompt = manual
@@ -37,6 +38,8 @@ const requests: Record<string, unknown>[] = [];
 const mcpMethods: string[] = [];
 const httpRoutes: string[] = [];
 const terminalEvents: Array<Record<string, unknown>> = [];
+const mcpCalls: Array<Record<string, unknown>> = [];
+const returnedToolItems: Array<Record<string, unknown>> = [];
 const bearer = 'local-manual-fixture-only';
 let unauthorized = 0;
 const server = createServer(async (request, response) => {
@@ -60,9 +63,13 @@ const server = createServer(async (request, response) => {
       response.writeHead(202).end();
       return;
     }
+    if (message.method === 'tools/call') mcpCalls.push(message.params);
     const result = message.method === 'initialize'
       ? { protocolVersion: message.params.protocolVersion, capabilities: { tools: {} },
           serverInfo: { name: 'public-manual-fixture', version: '1' } }
+      : message.method === 'tools/call'
+        ? { content: [{ type: 'text', text: JSON.stringify({ scope: 'public',
+            marker: 'PUBLIC_MANUAL_LOCAL_RESULT', name: message.params.name }) }] }
       : { tools: names.map(name => ({ name,
           description: 'Read the public manual fixture only',
           inputSchema: { type: 'object', properties: { scope: { type: 'string', enum: ['public'] } },
@@ -71,8 +78,40 @@ const server = createServer(async (request, response) => {
     response.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }));
     return;
   }
-  if (request.method === 'POST' && request.url === '/v1/responses') requests.push(JSON.parse(raw));
-  // Every inference request is rejected; this fixture cannot run a model.
+  if (request.method === 'POST' && request.url === '/v1/responses') {
+    const body = JSON.parse(raw);
+    requests.push(body);
+    if (toolLoop) {
+      returnedToolItems.push(...(body.input ?? []).filter((item: Record<string, unknown>) =>
+        /tool_call_output|function_call_output/.test(String(item.type))));
+      const round = requests.length;
+      const item = round === 1
+        ? { type: 'custom_tool_call', id: 'ctc_fixture_1', call_id: 'call_fixture_1',
+            namespace: 'functions', name: 'exec', status: 'completed',
+            input: 'text(ALL_TOOLS.filter(t => /tool_search|mcp__agentmcp__docs/.test(t.name)));' }
+        : round === 2
+          ? { type: 'custom_tool_call', id: 'ctc_fixture_2', call_id: 'call_fixture_2',
+              namespace: 'functions', name: 'exec', status: 'completed',
+              input: 'for (const name of ["mcp__agentmcp__docs_search", "mcp__agentmcp__docs_get"]) {'
+                + ' if (!ALL_TOOLS.some(t => t.name === name)) throw new Error("Missing public docs: " + name);'
+                + ' text(await tools[name]({scope:"public"})); }' }
+        : { type: 'message', id: 'msg_fixture', role: 'assistant', status: 'completed',
+            content: [{ type: 'output_text', text: 'Local fixture completed.', annotations: [] }] };
+      const completed = { id: `resp_fixture_${round}`, object: 'response', status: 'completed',
+        output: [item], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2,
+          input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } } };
+      const events = [
+        { type: 'response.created', response: { ...completed, status: 'in_progress', output: [] } },
+        { type: 'response.output_item.added', output_index: 0, item },
+        { type: 'response.output_item.done', output_index: 0, item },
+        { type: 'response.completed', response: completed },
+      ];
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.end(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n');
+      return;
+    }
+  }
+  // Requests are captured or answered synthetically; this fixture cannot run a model.
   response.writeHead(400, { 'content-type': 'application/json' });
   response.end(JSON.stringify({ error: { type: 'invalid_request_error',
     code: 'local_capture', message: 'Local request capture; no model was run.' } }));
@@ -104,7 +143,7 @@ try {
     if (event.type === 'error') terminalEvents.push({ type: event.type,
       message: event.message.slice(0, 1400), stderr: event.stderr });
     else if (event.type === 'result') terminalEvents.push({ type: event.type,
-      tokensIn: event.tokensIn, tokensOut: event.tokensOut });
+      tokensIn: event.tokensIn, tokensOut: event.tokensOut, finalText: event.finalText });
   }
   const strings: string[] = [];
   const walk = (value: unknown): void => {
@@ -113,7 +152,10 @@ try {
     else if (value && typeof value === 'object') Object.values(value).forEach(walk);
   };
   walk(requests[0]);
-  const tools = (requests[0]?.tools ?? []) as Array<Record<string, unknown>>;
+  // Responses Lite puts tool declarations on an input item. Top-level-only
+  // inspection incorrectly reports zero tools for code-mode-only models.
+  const input = (requests[0]?.input ?? []) as Array<Record<string, unknown>>;
+  const tools = (requests[0]?.tools ?? input.flatMap(item => item.tools ?? [])) as Array<Record<string, unknown>>;
   const schemaPaths: Array<{ path: string; keys: string[]; name?: unknown; type?: unknown }> = [];
   const namedToolTextPaths: string[] = [];
   const inspect = (value: unknown, path: string): void => {
@@ -133,7 +175,9 @@ try {
   inspect(requests[0], '$');
   console.log('CODEX_ISOLATED_CAPTURE ' + JSON.stringify({ isolationVerified: true,
     mode: process.argv[2], requestKeys: Object.keys(requests[0] ?? {}), schemaPaths, namedToolTextPaths,
-    requestCount: requests.length, mcpMethods, httpRoutes, unauthorized, terminalEvents,
+    inputShape: input.map(item => ({ keys: Object.keys(item), type: item.type, role: item.role })),
+    requestCount: requests.length, mcpMethods, mcpCalls, returnedToolItems,
+    httpRoutes, unauthorized, terminalEvents,
     models: requests.map(request => request.model),
     tools: tools.map(tool => ({ type: tool.type, name: tool.name, parameters: tool.parameters,
       tools: tool.tools, functions: tool.functions })),

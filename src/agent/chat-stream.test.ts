@@ -300,10 +300,10 @@ test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
   }, 60000,
 );
 
-// EI-25423532280490423 / WI-10007522: the installed CLI must carry the
-// native schemas and scoped bearer, with upstream access physically absent.
+// EI-25423532280490423 / WI-10007522: measure the actual native declaration
+// shapes and MCP bootstrap. This does not prove deferred docs discovery/calls.
 test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
-  'Codex public manual MCP schemas reach the local provider with the scoped bearer',
+  'Codex public manual MCP bootstrap and callable tool surfaces reach the local provider',
   async () => {
     const captures = await Promise.all([
       isolatedCodexCapture('public-manual'),
@@ -311,15 +311,46 @@ test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
       isolatedCodexCapture('public-manual', undefined, 'gpt-5.5'),
       isolatedCodexCapture('public-manual-code-mode'),
     ]);
-    const capture = captures[0];
-    assert.equal(capture.unauthorized, 0);
-    assert.ok(capture.mcpMethods.includes('initialize'));
-    assert.ok(capture.mcpMethods.includes('tools/list'));
-    assert.deepEqual(capture.models, ['gpt-5.6-luna']);
-    for (const name of ['docs_search', 'docs_get']) {
-      const tool = capture.tools.find((tool: { name: string }) => tool.name.endsWith('__' + name));
-      assert.ok(tool, name + ' must appear in the native model request');
-      assert.deepEqual(tool.parameters.properties.scope.enum, ['public']);
+    for (const capture of captures) {
+      assert.equal(capture.unauthorized, 0);
+      assert.ok(capture.mcpMethods.includes('initialize'));
+      assert.ok(capture.mcpMethods.includes('tools/list'));
+      if (capture.models[0] === 'gpt-5.6-luna') {
+        const namespace = capture.tools.find((tool: { name?: string }) => tool.name === 'functions');
+        assert.ok(namespace, 'Responses Lite must retain the functions namespace on an input item');
+        assert.ok(namespace.tools.some((tool: { name: string; type: string }) => tool.name === 'exec' && tool.type === 'custom'));
+      } else {
+        assert.ok(capture.tools.some((tool: { type: string }) => tool.type === 'tool_search'),
+          'Deferred MCP discovery must remain available on the control model');
+      }
+    }
+  }, 35000,
+);
+
+test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
+  'Codex public manual deferred catalog and MCP results reach the local native execution runtime',
+  async () => {
+    const captures = await Promise.all([
+      isolatedCodexCapture('public-manual-tool-loop'),
+      isolatedCodexCapture('public-manual-tool-loop-underscores'),
+    ]);
+    for (const capture of captures) {
+      assert.equal(capture.unauthorized, 0);
+      assert.equal(capture.requestCount, 3);
+      assert.deepEqual(capture.mcpCalls, capture.mode.endsWith('-underscores')
+        ? [{ name: 'docs_search', arguments: { scope: 'public' } },
+          { name: 'docs_get', arguments: { scope: 'public' } }]
+        : [{ name: 'docs:search', arguments: { scope: 'public' } },
+          { name: 'docs:get', arguments: { scope: 'public' } }]);
+      const output = capture.returnedToolItems.find((item: { call_id?: string }) =>
+        item.call_id === 'call_fixture_2');
+      assert.ok(output, 'Native code execution must return its MCP results to the local provider');
+      for (const call of capture.mcpCalls) {
+        assert.ok(JSON.stringify(output).includes('PUBLIC_MANUAL_LOCAL_RESULT'));
+        assert.ok(JSON.stringify(output).includes(call.name));
+      }
+      assert.ok(capture.terminalEvents.some((event: { finalText?: string }) =>
+        event.finalText === 'Local fixture completed.'));
     }
   }, 35000,
 );
