@@ -197,10 +197,12 @@ test('Codex spawn preserves a large UTF-8 global policy and configured tool rout
     + '\nExplain the product from the public FAQ first\n';
   const dir = mkdtempSync(join(tmpdir(), 'codex-prompt-stage-'));
   const cli = join(dir, 'capture.cjs');
-  writeFileSync(cli, `const fs = require('node:fs');\n`
+  const promptSha256 = createHash('sha256').update(prompt).digest('hex');
+  writeFileSync(cli, `const fs = require('node:fs');\nconst crypto = require('node:crypto');\n`
     + `process.stdin.resume();\nprocess.stdin.on('end', () => {\n`
     + ` const home = process.env.CODEX_HOME;\n`
-    + ` const text = JSON.stringify({ prompt: fs.readFileSync(home + '/AGENTS.md', 'utf8'),\n`
+    + ` const prompt = fs.readFileSync(home + '/AGENTS.md');\n`
+    + ` const text = JSON.stringify({ promptSha256: crypto.createHash('sha256').update(prompt).digest('hex'), promptBytes: prompt.length,\n`
     + ` config: fs.readFileSync(home + '/config.toml', 'utf8') });\n`
     + ` console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text } }));\n`
     + `});\n`);
@@ -219,8 +221,9 @@ test('Codex spawn preserves a large UTF-8 global policy and configured tool rout
       if (event.type === 'result') result = event.finalText;
     }
     const staged = JSON.parse(result);
-    assert.equal(staged.prompt, prompt);
-    assert.ok(Buffer.byteLength(staged.prompt) > 65536);
+    assert.equal(staged.promptSha256, promptSha256);
+    assert.equal(staged.promptBytes, Buffer.byteLength(prompt));
+    assert.ok(staged.promptBytes > 65536);
     assert.match(staged.config, /model_provider = "papercusp-codex-gateway"/);
     assert.match(staged.config, /\[mcp_servers.public\]/);
     assert.match(staged.config, /x-papercusp-priority.*interactive/);
