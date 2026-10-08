@@ -512,6 +512,9 @@ export interface RunAgentChatOptions {
       strip a prefix (e.g. `mcp__oracle__navigate` → `navigate`).
       Returning null/undefined skips that tool. Default: emit all tools. */
   toolEventFilter?: (rawName: string) => string | null | undefined;
+  /** Opt-in observation of actual native tool returns, after toolEventFilter.
+      Raw output stays server-side; callers must redact before publishing it. */
+  onToolResult?: (result: { name: string; output: string; isError: boolean }) => void;
   /** Permission mode flag. Default: not set (claude prompts). Most
       backends pass 'bypassPermissions' for unattended in-app tools. */
   permissionMode?: 'bypassPermissions' | 'default' | 'ask';
@@ -2961,6 +2964,13 @@ export async function* runAgentChat(
   // (input_json_delta) and emit one tool_call event per call when the
   // block stops.
   const liveTools = new Map<number, { name: string; input: string }>();
+  const toolResultNames = new Map<string, string>();
+  const observeToolResult = (name: string, output: unknown, isError: boolean) => {
+    if (!opts.onToolResult || output === undefined) return;
+    const filtered = opts.toolEventFilter ? opts.toolEventFilter(name) : name;
+    if (filtered) opts.onToolResult({ name: filtered,
+      output: typeof output === 'string' ? output : JSON.stringify(output), isError });
+  };
 
   let stderrBuf = '';
   let stdoutLineBuf = '';
@@ -2994,6 +3004,24 @@ export async function* runAgentChat(
   const handleClaudeEvent = (ev: any) => {
     const inner = ev.type === 'stream_event' && ev.event ? ev.event : ev;
 
+    if (opts.onToolResult && ev.type === 'assistant') {
+      for (const block of ev.message?.content ?? []) {
+        if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+          toolResultNames.set(block.id, block.name);
+        }
+      }
+    }
+    if (opts.onToolResult && ev.type === 'user') {
+      for (const block of ev.message?.content ?? []) {
+        if (block.type !== 'tool_result') continue;
+        const name = toolResultNames.get(block.tool_use_id);
+        if (name) {
+          toolResultNames.delete(block.tool_use_id);
+          observeToolResult(name, block.content, block.is_error === true);
+        }
+      }
+    }
+
     if (inner?.type === 'content_block_delta' && inner.delta?.type === 'text_delta') {
       const text = inner.delta.text ?? '';
       finalText += text;
@@ -3005,6 +3033,9 @@ export async function* runAgentChat(
       typeof inner.index === 'number'
     ) {
       liveTools.set(inner.index, { name: inner.content_block.name, input: '' });
+      if (opts.onToolResult && typeof inner.content_block.id === 'string') {
+        toolResultNames.set(inner.content_block.id, inner.content_block.name);
+      }
     } else if (
       inner?.type === 'content_block_delta' &&
       inner.delta?.type === 'input_json_delta' &&
@@ -3082,6 +3113,11 @@ export async function* runAgentChat(
       if (filtered) {
         queue.push({ type: 'tool_call', name: filtered, input: ev.args ?? {} });
       }
+      return;
+    }
+
+    if (ev.type === 'tool_execution_end' && typeof ev.toolName === 'string') {
+      observeToolResult(ev.toolName, ev.result, ev.isError === true || ev.result?.isError === true);
       return;
     }
 
@@ -3198,6 +3234,8 @@ export async function* runAgentChat(
         if (filtered) {
           queue.push({ type: 'tool_call', name: filtered, input: item.arguments ?? {} });
         }
+        observeToolResult(filterInput, item.result ?? item.error,
+          item.status === 'failed' || item.result?.isError === true || item.error != null);
         return;
       }
       if (item.type === 'command_execution') {

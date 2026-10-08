@@ -76,6 +76,50 @@ function terminalError(events: ChatEvent[]): Extract<ChatEvent, { type: 'error' 
   return errs[0]!;
 }
 
+describe('native tool-result observation', () => {
+  const output = 'PUBLIC-ORCHARD-CONTROL-7391';
+  const result = { content: [{ type: 'text', text: output }] };
+  it.each(['claude-code', 'codex', 'omp'] as const)('captures actual %s returns and respects the tool filter', async backend => {
+    const frames = backend === 'claude-code' ? [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'call-1', name: 'docs:get' }] } },
+      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'call-1', content: result, is_error: true }] } },
+      { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'call-2', name: 'private:read' }] } },
+      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'call-2', content: 'private' }] } },
+    ] : backend === 'codex' ? [
+      { type: 'item.completed', item: { type: 'mcp_tool_call', tool: 'docs:get', status: 'completed', result: { ...result, isError: true } } },
+      { type: 'item.completed', item: { type: 'mcp_tool_call', tool: 'private:read', status: 'completed', result: 'private' } },
+    ] : [
+      { type: 'tool_execution_end', toolName: 'docs:get', result, isError: true },
+      { type: 'tool_execution_end', toolName: 'private:read', result: 'private' },
+    ];
+    const terminalFrame = backend === 'claude-code'
+      ? { type: 'result', result: 'Done', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 } }
+      : backend === 'codex'
+        ? { type: 'item.completed', item: { type: 'agent_message', text: 'Done' } }
+        : { type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'Done' }] } };
+    const observed = vi.fn();
+    await collect({ backend, agentCmd: fakeCli([...frames, terminalFrame], 0), promptText: 'Test fixture',
+      toolEventFilter: name => name === 'docs:get' ? name : null, onToolResult: observed });
+    expect(observed).toHaveBeenCalledTimes(1);
+    expect(observed.mock.calls[0][0]).toMatchObject({ name: 'docs:get', isError: true });
+    expect(observed.mock.calls[0][0].output).toContain(output);
+    expect(observed.mock.calls[0][0].output).not.toContain('private');
+  });
+
+  it('pairs streamed Claude ids with returned results without duplicate observation', async () => {
+    const observed = vi.fn();
+    await collect({ backend: 'claude-code', agentCmd: fakeCli([
+      { type: 'stream_event', event: { type: 'content_block_start', index: 0,
+        content_block: { type: 'tool_use', id: 'call-1', name: 'docs:get' } } },
+      { type: 'stream_event', event: { type: 'content_block_stop', index: 0 } },
+      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'call-1', content: output }] } },
+      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'call-1', content: output }] } },
+      { type: 'result', result: 'Done', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 } },
+    ], 0), promptText: 'Test fixture', onToolResult: observed });
+    expect(observed).toHaveBeenCalledExactlyOnceWith({ name: 'docs:get', output, isError: false });
+  });
+});
+
 describe('backendFailureLine', () => {
   it('unwraps a provider error envelope serialized as a JSON string', () => {
     expect(backendFailureLine(NESTED_400)).toBe(
