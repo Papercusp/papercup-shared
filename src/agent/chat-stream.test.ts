@@ -337,7 +337,8 @@ test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
     for (const capture of captures) {
       assert.equal(capture.unauthorized, 0);
       assert.equal(capture.requestCount, 3);
-      assert.deepEqual(capture.mcpCalls, capture.mode.endsWith('-underscores')
+      assert.deepEqual(capture.mcpCalls.map((call: { name: string; arguments: unknown }) =>
+        ({ name: call.name, arguments: call.arguments })), capture.mode.endsWith('-underscores')
         ? [{ name: 'docs_search', arguments: { scope: 'public' } },
           { name: 'docs_get', arguments: { scope: 'public' } }]
         : [{ name: 'docs:search', arguments: { scope: 'public' } },
@@ -345,10 +346,11 @@ test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
       const output = capture.returnedToolItems.find((item: { call_id?: string }) =>
         item.call_id === 'call_fixture_2');
       assert.ok(output, 'Native code execution must return its MCP results to the local provider');
-      for (const call of capture.mcpCalls) {
-        assert.ok(JSON.stringify(output).includes('PUBLIC_MANUAL_LOCAL_RESULT'));
-        assert.ok(JSON.stringify(output).includes(call.name));
-      }
+      const resultBlocks = output.output.filter((block: { text?: string }) => block.text?.startsWith('{'));
+      assert.deepEqual(resultBlocks.map((block: { text: string }) =>
+        JSON.parse(JSON.parse(block.text).content[0].text)),
+      capture.mcpCalls.map((call: { name: string }) =>
+        ({ scope: 'public', marker: 'PUBLIC_MANUAL_LOCAL_RESULT', name: call.name })));
       assert.ok(capture.terminalEvents.some((event: { finalText?: string }) =>
         event.finalText === 'Local fixture completed.'));
     }
