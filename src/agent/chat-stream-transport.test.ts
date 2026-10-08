@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { createStatelessDiagnosticFetch, isTransientLlmError, runAgentChat, type RunAgentChatOptions, type StatelessRequestAttempt, type StatelessTransportDiagnostic } from './chat-stream';
+import { createStatelessDiagnosticFetch, invalidateClaudeTokenCache, isTransientLlmError, runAgentChat, type RunAgentChatOptions, type StatelessRequestAttempt, type StatelessTransportDiagnostic } from './chat-stream';
 
 // Negative pre-implementation cases must never launch a credentialed CLI.
 vi.mock('node:child_process', async importOriginal => ({
@@ -11,13 +11,23 @@ vi.mock('node:child_process', async importOriginal => ({
 }));
 
 const sdk = vi.hoisted(() => ({ fetch: undefined as typeof fetch | undefined,
+  headers: [] as Record<string, string>[],
+  credential: undefined as string | undefined,
   bodyEvents: [] as unknown[], bodyFailure: undefined as Error | undefined,
   beforeFailure: undefined as (() => void) | undefined,
   real: undefined as typeof import('@anthropic-ai/sdk').default | undefined }));
+vi.mock('node:fs', async importOriginal => {
+  const original = await importOriginal<typeof import('node:fs')>();
+  return { ...original, readFileSync: (path: Parameters<typeof original.readFileSync>[0], ...args: unknown[]) => {
+    if (String(path).endsWith('.claude/.credentials.json') && sdk.credential !== undefined) return JSON.stringify({ claudeAiOauth: { accessToken: sdk.credential } });
+    return (original.readFileSync as (...args: unknown[]) => unknown)(path, ...args);
+  } };
+});
 vi.mock('@anthropic-ai/sdk', () => ({
   default: class {
-    constructor(options: { fetch?: typeof fetch }) {
+    constructor(options: { fetch?: typeof fetch; defaultHeaders?: Record<string, string> }) {
       sdk.fetch = options.fetch;
+      sdk.headers.push(options.defaultHeaders ?? {});
       if (sdk.real) this.messages = new sdk.real(options).messages as unknown as typeof this.messages;
     }
     messages = {
@@ -48,6 +58,8 @@ vi.mock('@anthropic-ai/sdk', () => ({
 afterEach(() => {
   vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.restoreAllMocks();
   sdk.bodyEvents = []; sdk.bodyFailure = undefined; sdk.beforeFailure = undefined; sdk.real = undefined;
+  sdk.headers = [];
+  sdk.credential = undefined; invalidateClaudeTokenCache();
 });
 
 const transport = {
@@ -55,6 +67,39 @@ const transport = {
   headers: { 'x-papercusp-account': 'requested-account', authorization: 'secret-header' },
   label: 'anthropic-direct' as const,
 };
+
+describe('per-request account routing', () => {
+  it('never substitutes host OAuth after a pinned gateway account rejects auth', async () => {
+    sdk.credential = 'fixture-host-oauth'; invalidateClaudeTokenCache();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response('{}', { status: 401 })).mockResolvedValue(new Response('{}')));
+    const events = [];
+    for await (const event of runAgentChat({ backend: 'anthropic-direct', model: 'claude-haiku-4-5', promptText: 'fixture', routeAccountId: 'chosen-account', onTransportDiagnostic: () => {} })) events.push(event);
+    expect(sdk.headers).toHaveLength(1);
+    expect(sdk.headers[0]).toMatchObject({ 'x-papercusp-account': 'chosen-account' });
+    expect(events.some(event => event.type === 'error')).toBe(true);
+    expect(events.some(event => event.type === 'result')).toBe(false);
+  });
+  it('pins a stateless call and leaves ambient routing unchanged', async () => {
+    vi.stubEnv('PAPERCUSP_ROUTE_ACCOUNT', 'ambient-account');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}')));
+    for await (const _event of runAgentChat({ backend: 'anthropic-direct', model: 'claude-haiku-4-5', promptText: 'fixture', routeAccountId: 'chosen-account', onTransportDiagnostic: () => {} })) { /* drain */ }
+    expect(sdk.headers.at(-1)).toMatchObject({ 'x-papercusp-account': 'chosen-account' });
+    expect(process.env.PAPERCUSP_ROUTE_ACCOUNT).toBe('ambient-account');
+  });
+  it('auto selects from the pool without inheriting a process account pin', async () => {
+    vi.stubEnv('PAPERCUSP_ROUTE_ACCOUNT', 'ambient-account');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}')));
+    for await (const _event of runAgentChat({ backend: 'anthropic-direct', model: 'claude-haiku-4-5', promptText: 'fixture', routeAccountId: 'auto', onTransportDiagnostic: () => {} })) { /* drain */ }
+    expect(sdk.headers.at(-1)?.['x-papercusp-account']).toBeUndefined();
+    expect(process.env.PAPERCUSP_ROUTE_ACCOUNT).toBe('ambient-account');
+  });
+  it.each(['claude-code', 'omp', 'codex'] as const)('refuses account routing on %s before spawn', async backend => {
+    await expect(runAgentChat({ backend, promptText: 'fixture', routeAccountId: 'chosen-account' }).next()).rejects.toMatchObject({ costUsd: 0 });
+  });
+  it('refuses conflicting scoped-gateway and account bindings', async () => {
+    await expect(runAgentChat({ backend: 'anthropic-direct', promptText: 'fixture', routeAccountId: 'chosen-account', statelessGateway: { baseURL: 'http://localhost:32123', token: 'scoped' } }).next()).rejects.toMatchObject({ costUsd: 0 });
+  });
+});
 
 describe('trusted-host authorization at the stateless HTTP boundary (WI-10006164)', () => {
   const digest = (value: string) => createHash('sha256').update(value).digest('hex');

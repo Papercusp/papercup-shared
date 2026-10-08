@@ -642,6 +642,9 @@ export interface RunAgentChatOptions {
    * this exact route/token for retries; never falls back to local credentials.
    * Provider authorization remains the gateway controller's responsibility. */
   statelessGateway?: Pick<StatelessTransport, 'baseURL' | 'token'>;
+  /** Per-request gateway account pin; 'auto' uses pool selection without an
+   * ambient process pin. Stateless only; never mutates process credentials. */
+  routeAccountId?: string;
   /**
    * Sampling temperature (0–1). `anthropic-direct` honors when the model
    * accepts it (skipped for `opus*` per the Anthropic API constraint).
@@ -1304,7 +1307,7 @@ function anthropicDirectTransport(claudeTok: string): StatelessTransport {
  */
 function gatewayPoolTransport(accountId?: string): StatelessTransport {
   const headers: Record<string, string> = { 'anthropic-beta': 'oauth-2025-04-20' };
-  const routeAccount = accountId?.trim() || resolveRouteAccountId();
+  const routeAccount = accountId === 'auto' ? undefined : accountId?.trim() || resolveRouteAccountId();
   if (routeAccount) headers[ROUTE_ACCOUNT_HEADER] = routeAccount;
   return {
     baseURL: resolveDelegatedGatewayUrl(),
@@ -1817,7 +1820,7 @@ async function* statelessAgentChat(
   // Resolve transport: direct-to-Anthropic with the Claude OAuth session, or
   // gateway-pool delegation when no usable local session exists (EI-12940 —
   // see resolveStatelessTransport / gatewayPoolTransport).
-  let transport: StatelessTransport = resolveStatelessTransport(undefined, opts.statelessGateway);
+  let transport: StatelessTransport = resolveStatelessTransport(opts.routeAccountId, opts.statelessGateway);
 
   // Lazy-load the SDK so consumers that never use this path don't pay the import
   // cost. Dynamic `import()` (not a static top-level import) keeps it lazy, stays
@@ -1964,7 +1967,7 @@ async function* statelessAgentChat(
       // cached Claude token rotated on disk after we read it. Invalidate,
       // re-read, and retry once with the fresh token; if the re-read yields
       // the SAME token, the session is genuinely dead — fail normally.
-      if (!opts.statelessGateway && isAuthFailure(err)) {
+      if (!opts.statelessGateway && transport.label === 'anthropic-direct' && isAuthFailure(err)) {
         const staleTok = transport.token;
         authExpiresAt = readClaudeOauthExpiry();
         invalidateClaudeTokenCache();
@@ -2333,6 +2336,13 @@ async function* governedStatelessChat(
 export async function* runAgentChat(
   opts: RunAgentChatOptions,
 ): AsyncGenerator<ChatEvent, void, void> {
+  if (opts.routeAccountId !== undefined) {
+    if (!opts.routeAccountId.trim() || /[\r\n]/.test(opts.routeAccountId) ||
+        opts.statelessGateway !== undefined || resolveBackend(opts) !== 'anthropic-direct') {
+      throw Object.assign(new Error('Account routing requires a stateless pool request and a nonempty account id'), { costUsd: 0 });
+    }
+    opts = { ...opts, routeAccountId: opts.routeAccountId.trim() };
+  }
   if (opts.requireOutputTokenLimit || opts.authorizeStatelessRequest !== undefined || opts.statelessGateway !== undefined) {
     opts = { ...opts, ...(opts.messages ? { messages: opts.messages.map(message => ({ ...message })) } : {}),
       ...(opts.statelessGateway === undefined ? {} : { statelessGateway: Object.freeze({ ...opts.statelessGateway }) }) };
