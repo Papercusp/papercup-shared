@@ -309,6 +309,7 @@ test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
       isolatedCodexCapture('public-manual'),
       isolatedCodexCapture('public-manual-underscores'),
       isolatedCodexCapture('public-manual', undefined, 'gpt-5.5'),
+      isolatedCodexCapture('public-manual-code-mode'),
     ]);
     const capture = captures[0];
     assert.equal(capture.unauthorized, 0);

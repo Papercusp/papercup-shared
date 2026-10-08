@@ -19,6 +19,7 @@ for (const key of ['PAPERCUSP_ACCOUNT_ID', 'PAPERCUSP_CODEX_GATEWAY',
   'OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL']) assert.equal(process.env[key], undefined);
 
 const manual = process.argv[2].startsWith('public-manual');
+const codeMode = process.argv[2] === 'public-manual-code-mode';
 const names = process.argv[2] === 'public-manual-underscores'
   ? ['docs_search', 'docs_get'] : ['docs:search', 'docs:get'];
 const marker = 'Explain the product from the public FAQ first';
@@ -90,6 +91,7 @@ try {
     '-c model_providers.local-capture.stream_max_retries=0',
     '-c model_providers.local-capture.supports_websockets=false',
     '-c features.responses_websockets=false', '-c features.plugins=false',
+    ...(codeMode ? ['-c features.code_mode=true'] : []),
     ...(process.argv[3] ? [`-c project_doc_max_bytes=${Number(process.argv[3])}`] : [])].join(' ');
   for await (const event of runAgentChat({ backend: 'codex', agentCmd: command,
     model: manual ? (process.argv[4] || 'gpt-5.6-luna:low') : 'gpt-5.5', cwd: dir,
@@ -112,7 +114,25 @@ try {
   };
   walk(requests[0]);
   const tools = (requests[0]?.tools ?? []) as Array<Record<string, unknown>>;
+  const schemaPaths: Array<{ path: string; keys: string[]; name?: unknown; type?: unknown }> = [];
+  const namedToolTextPaths: string[] = [];
+  const inspect = (value: unknown, path: string): void => {
+    if (typeof value === 'string') {
+      if (names.some(name => value.includes(name) || value.includes(name.replaceAll(':', '_')))) {
+        namedToolTextPaths.push(path);
+      }
+    } else if (Array.isArray(value)) value.forEach((child, i) => inspect(child, `${path}[${i}]`));
+    else if (value && typeof value === 'object') {
+      const object = value as Record<string, unknown>;
+      if (/tool|function|code_mode|namespace/.test(path) || Object.keys(object).some(key => /tool|function|namespace/.test(key))) {
+        schemaPaths.push({ path, keys: Object.keys(object), name: object.name, type: object.type });
+      }
+      Object.entries(object).forEach(([key, child]) => inspect(child, `${path}.${key}`));
+    }
+  };
+  inspect(requests[0], '$');
   console.log('CODEX_ISOLATED_CAPTURE ' + JSON.stringify({ isolationVerified: true,
+    mode: process.argv[2], requestKeys: Object.keys(requests[0] ?? {}), schemaPaths, namedToolTextPaths,
     requestCount: requests.length, mcpMethods, httpRoutes, unauthorized, terminalEvents,
     models: requests.map(request => request.model),
     tools: tools.map(tool => ({ type: tool.type, name: tool.name, parameters: tool.parameters,
