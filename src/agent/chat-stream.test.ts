@@ -319,6 +319,102 @@ test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
   }, 60000,
 );
 
+// EI-25423532280490423: capture the native request, not just the generated TOML.
+// This local provider rejects every request; no inference or upstream traffic runs.
+test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
+  'Codex public manual MCP schemas reach the local provider with the scoped bearer',
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-manual-capture-'));
+    const requests: Record<string, unknown>[] = [];
+    const mcpMethods: string[] = [];
+    const bearer = 'local-manual-fixture-only';
+    let unauthorized = 0;
+    const server = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (request.url === '/mcp') {
+        if (request.headers.authorization !== `Bearer ${bearer}`) {
+          unauthorized++;
+          response.writeHead(401).end();
+          return;
+        }
+        if (request.method !== 'POST') {
+          response.writeHead(405).end();
+          return;
+        }
+        const message = JSON.parse(raw);
+        mcpMethods.push(message.method);
+        if (message.id === undefined) {
+          response.writeHead(202).end();
+          return;
+        }
+        const result = message.method === 'initialize'
+          ? { protocolVersion: message.params.protocolVersion, capabilities: { tools: {} },
+              serverInfo: { name: 'public-manual-fixture', version: '1' } }
+          : { tools: ['docs:search', 'docs:get'].map(name => ({ name,
+              description: 'Read the public manual fixture only',
+              inputSchema: { type: 'object', properties: { scope: { type: 'string', enum: ['public'] } },
+                required: ['scope'], additionalProperties: false } })) };
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }));
+        return;
+      }
+      if (request.method === 'POST' && request.url === '/v1/responses') requests.push(JSON.parse(raw));
+      response.writeHead(400, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ error: { type: 'invalid_request_error',
+        code: 'local_manual_capture', message: 'Local request capture; no model was run.' } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === 'object');
+    const origin = `http://127.0.0.1:${address.port}`;
+    for (const key of ['PAPERCUSP_ACCOUNT_ID', 'PAPERCUSP_CODEX_GATEWAY',
+      'PAPERCUSP_AGENT_GOVERNOR', 'PAPERCUSP_AGENT_DEBUG', 'OPENAI_API_KEY', 'CODEX_API_KEY']) {
+      vi.stubEnv(key, '');
+    }
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const command = ['codex', '-c model_provider="manual-capture"',
+        '-c model_providers.manual-capture.name="manual-capture"',
+        `-c model_providers.manual-capture.base_url="${origin}/v1"`,
+        '-c model_providers.manual-capture.wire_api="responses"',
+        '-c model_providers.manual-capture.requires_openai_auth=false',
+        '-c model_providers.manual-capture.request_max_retries=0',
+        '-c model_providers.manual-capture.stream_max_retries=0',
+        '-c features.responses_websockets=false'].join(' ');
+      for await (const _event of runAgentChat({ backend: 'codex', agentCmd: command,
+        model: 'gpt-5.6-luna:low', cwd: dir, promptText: 'Will agents stop when I close this browser tab?',
+        systemPromptText: 'For product questions, retrieve the public FAQ and cite the retrieved heading.',
+        permissionMode: 'bypassPermissions', allowedTools: ['mcp__agentmcp__docs:search', 'mcp__agentmcp__docs:get'],
+        mcpConfig: { mcpServers: { agentmcp: { type: 'http', url: `${origin}/mcp`,
+          headers: { Authorization: `Bearer ${bearer}` } } } }, signal: AbortSignal.timeout(20000) })) {
+        // Drain the rejected local request through the production adapter.
+      }
+      assert.equal(unauthorized, 0);
+      assert.ok(mcpMethods.includes('initialize'));
+      assert.ok(mcpMethods.includes('tools/list'));
+      assert.ok(requests.length > 0, 'The installed CLI must submit its native request locally');
+      const tools = requests[0].tools as Array<Record<string, unknown>>;
+      const names = tools.map(tool => String(tool.name));
+      console.info('CODEX_MANUAL_TOOL_CAPTURE ' + JSON.stringify({ mcpMethods, names,
+        requestCount: requests.length, unauthorized, upstreamRequests: 0 }));
+      for (const name of ['docs_search', 'docs_get']) {
+        const tool = tools.find(tool => String(tool.name).endsWith(`__${name}`));
+        assert.ok(tool, `${name} must appear in the native model request`);
+        const parameters = tool.parameters as { properties: { scope: { enum: string[] } } };
+        assert.deepEqual(parameters.properties.scope.enum, ['public']);
+      }
+    } finally {
+      errors.mockRestore();
+      vi.unstubAllEnvs();
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30000,
+);
+
 // EI-10795 (codex twin): all three backends must tier identically, or the starvation bug
 // simply moves to whichever backend happens to be configured. A codex brain with no tier
 // label admits in the gateway's lowest default band — the same band that left the owner's
