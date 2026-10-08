@@ -2534,12 +2534,30 @@ export async function* runAgentChat(
     // alias process.env when isolateConfig is off, and we must not mutate the parent's env.
     spawnEnv = { ...spawnEnv, ...claudeSpawnEnvOverrides(opts, spawnEnv.ANTHROPIC_CUSTOM_HEADERS) };
   } else if (backend === 'codex') {
+    // The native CLI has separate root and exec config collectors. An exec
+    // -c (such as the generated reasoning effort below) can discard root -c
+    // values, including an explicit provider. Keep all config selectors in
+    // the exec collector, in caller order, before generated overrides.
+    const globalArgs: string[] = [];
+    const configArgs: string[] = [];
+    for (let index = 0; index < baseArgs.length; index++) {
+      const arg = baseArgs[index];
+      if (arg === '-c' || arg === '--config') {
+        configArgs.push(arg);
+        if (index + 1 < baseArgs.length) configArgs.push(baseArgs[++index]);
+      } else if (arg.startsWith('--config=') || (arg.startsWith('-c') && arg.length > 2)) {
+        configArgs.push(arg);
+      } else {
+        globalArgs.push(arg);
+      }
+    }
+    args.splice(0, args.length, ...globalArgs, 'exec', ...configArgs);
     // codex (`codex exec`). Like claude, codex reads the prompt from
     // STDIN via the `-` positional (handled in the stdin block below).
     // `--json` emits JSONL events (one per line, NOT token-streamed);
     // `--skip-git-repo-check` allows running outside a git repo;
     // `--ephemeral` keeps no persistent session/rollout on disk.
-    args.push('exec', '--json', '--skip-git-repo-check', '--ephemeral');
+    args.push('--json', '--skip-git-repo-check', '--ephemeral');
     // Sandbox / approval mode. Default read-only; bypassPermissions
     // unlocks full access (lets MCP tool calls + shell run without an
     // interactive approval gate — verified: `read-only` cancels MCP

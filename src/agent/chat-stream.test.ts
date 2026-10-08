@@ -4,8 +4,9 @@
  */
 import { test, afterEach, vi } from 'vitest';
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { chmodSync, mkdtempSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -233,193 +234,84 @@ test('Codex spawn preserves a large UTF-8 global policy and configured tool rout
   }
 });
 
+test('Codex caller provider configuration survives generated reasoning settings', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'codex-config-argv-'));
+  const cli = join(dir, 'capture.cjs');
+  writeFileSync(cli, `process.stdin.resume();\nprocess.stdin.on('end', () => {\n`
+    + `console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:JSON.stringify(process.argv.slice(2))}}));\n});\n`);
+  vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', '');
+  try {
+    for (const flag of ['-c model_provider="local-fixture"', '--config model_provider="local-fixture"',
+      '--config=model_provider="local-fixture"', '-cmodel_provider="local-fixture"']) {
+      let finalText = '';
+      for await (const event of runAgentChat({ backend: 'codex', agentCmd: `${process.execPath} ${cli} ${flag}`,
+        model: 'gpt-5.6-luna:low', cwd: dir, promptText: 'argv fixture only' })) {
+        if (event.type === 'result') finalText = event.finalText;
+      }
+      const argv: string[] = JSON.parse(finalText);
+      const exec = argv.indexOf('exec');
+      const provider = argv.findIndex(arg => arg.includes('model_provider='));
+      const effort = argv.indexOf('model_reasoning_effort="low"');
+      assert.ok(exec >= 0 && provider > exec && effort > provider,
+        'Caller provider and generated effort must use the same exec config collector');
+      assert.deepEqual(argv.slice(argv.indexOf('-m'), argv.indexOf('-m') + 2), ['-m', 'gpt-5.6-luna']);
+    }
+  } finally {
+    vi.unstubAllEnvs();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+async function isolatedCodexCapture(mode: string, budget?: number) {
+  assert.equal(process.platform, 'linux', 'Native capture requires Linux network namespaces');
+  const { stdout } = await promisify(execFile)('bwrap', [
+    '--unshare-net', '--ro-bind', '/', '/', '--tmpfs', '/tmp',
+    '--proc', '/proc', '--dev-bind', '/dev', '/dev', '--chdir', '/tmp',
+    '--setenv', 'HOME', '/tmp/codex-fixture-home',
+    '--', process.execPath, '--import', import.meta.resolve('tsx'),
+    new URL('./__fixtures__/codex-local-capture.ts', import.meta.url).pathname,
+    mode, ...(budget === undefined ? [] : [String(budget)]),
+  ], { env: { PATH: process.env.PATH, RUST_LOG: 'error',
+      PAPERCUSP_CAPTURE_PARENT_NETNS: readlinkSync('/proc/self/ns/net'),
+      ...(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE_FILE
+        ? { PAPERCUSP_CODEX_PROMPT_CAPTURE_FILE: process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE_FILE } : {}) },
+    timeout: 30000, maxBuffer: 1024 * 1024 });
+  const line = stdout.split('\n').find(line => line.startsWith('CODEX_ISOLATED_CAPTURE '));
+  assert.ok(line, 'The isolated native fixture must produce its measured result');
+  const capture = JSON.parse(line.slice('CODEX_ISOLATED_CAPTURE '.length));
+  console.info('CODEX_CONTAINED_CAPTURE ' + JSON.stringify(capture));
+  assert.equal(capture.isolationVerified, true);
+  assert.ok(capture.requestCount > 0, 'The native CLI must submit its request locally');
+  return capture;
+}
+
 test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
   'Codex global prompt reaches the local provider beyond the project document limit',
   async () => {
-    const marker = 'Explain the product from the public FAQ first';
-    const retainedFile = process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE_FILE;
-    const prompt = retainedFile
-      ? readFileSync(retainedFile, 'utf8')
-      : '# Global instructions\n' + 'Synthetic policy context.\n'.repeat(2800) + '\n' + marker;
-    assert.ok(Buffer.byteLength(prompt) > 32768);
-    assert.ok(prompt.includes(marker), 'The captured fixture must contain the late FAQ policy control');
-    const dir = mkdtempSync(join(tmpdir(), 'codex-prompt-capture-'));
-    const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
-    const server = createServer(async (request, response) => {
-      const chunks: Buffer[] = [];
-      for await (const chunk of request) chunks.push(Buffer.from(chunk));
-      const raw = Buffer.concat(chunks).toString('utf8');
-      if (request.method === 'POST' && request.url === '/v1/responses') {
-        requests.push({ path: request.url, body: JSON.parse(raw) });
-      }
-      response.writeHead(400, { 'content-type': 'application/json' });
-      response.end(JSON.stringify({ error: {
-        type: 'invalid_request_error', code: 'local_prompt_capture',
-        message: 'Local prompt capture only; no model was run.',
-      } }));
-    });
-    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
-    const address = server.address();
-    assert.ok(address && typeof address === 'object');
-    const providerArgs = [
-      '-c model_provider="prompt-capture"',
-      '-c model_providers.prompt-capture.name="prompt-capture"',
-      `-c model_providers.prompt-capture.base_url="http://127.0.0.1:${address.port}/v1"`,
-      '-c model_providers.prompt-capture.wire_api="responses"',
-      '-c model_providers.prompt-capture.requires_openai_auth=false',
-      '-c model_providers.prompt-capture.request_max_retries=0',
-      '-c model_providers.prompt-capture.stream_max_retries=0',
-      '-c features.responses_websockets=false',
-    ];
-    // Remove inherited routing/debug settings; the command-line provider always
-    // overrides the generated config, and no MCP server is supplied to the spawn.
-    for (const key of ['PAPERCUSP_ACCOUNT_ID', 'PAPERCUSP_CODEX_GATEWAY',
-      'PAPERCUSP_AGENT_GOVERNOR', 'PAPERCUSP_AGENT_DEBUG', 'OPENAI_API_KEY', 'CODEX_API_KEY']) {
-      vi.stubEnv(key, '');
-    }
-    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      const observations: Array<Record<string, unknown>> = [];
-      for (const budget of [undefined, 131072]) {
-        const start = requests.length;
-        const events = [];
-        const command = ['codex', ...providerArgs,
-          ...(budget === undefined ? [] : [`-c project_doc_max_bytes=${budget}`])].join(' ');
-        for await (const event of runAgentChat({ backend: 'codex', agentCmd: command,
-          model: 'gpt-5.5', cwd: dir, promptText: 'Inspect the configured instruction context.',
-          systemPromptText: prompt, signal: AbortSignal.timeout(20000) })) {
-          events.push(event);
-        }
-        const captured = requests.slice(start);
-        assert.ok(captured.length > 0, 'Codex must send a request to the local capture provider');
-        const strings: string[] = [];
-        const walk = (value: unknown) => {
-          if (typeof value === 'string') strings.push(value);
-          else if (Array.isArray(value)) value.forEach(walk);
-          else if (value && typeof value === 'object') Object.values(value).forEach(walk);
-        };
-        walk(captured[0].body);
-        const fullPrompt = strings.some(text => text.includes(prompt));
-        observations.push({ budget: budget ?? 'default', requestCount: captured.length,
-          promptBytes: Buffer.byteLength(prompt), promptSha256: createHash('sha256').update(prompt).digest('hex'),
-          fullPrompt, lateMarkerPresent: strings.some(text => text.includes(marker)),
-          terminalTypes: events.filter(event => event.type === 'error' || event.type === 'result').map(event => event.type),
-          upstreamRequests: 0 });
-      }
-      console.info('CODEX_PROMPT_CAPTURE ' + JSON.stringify(observations));
-      assert.ok(observations.every(observation => observation.fullPrompt === true),
-        'The entire supplied global prompt must appear in the actual model request');
-    } finally {
-      errors.mockRestore();
-      vi.unstubAllEnvs();
-      server.closeAllConnections();
-      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-      rmSync(dir, { recursive: true, force: true });
+    for (const budget of [undefined, 131072]) {
+      const capture = await isolatedCodexCapture('global-prompt', budget);
+      assert.equal(capture.fullPrompt, true);
+      assert.equal(capture.lateMarkerPresent, true);
     }
   }, 60000,
 );
 
-// EI-25423532280490423: capture the native request, not just the generated TOML.
-// A missing local capture fails containment: a terminal runner result alone
-// cannot prove where model traffic went. Audit routing before another attempt.
+// EI-25423532280490423 / WI-10007522: the installed CLI must carry the
+// native schemas and scoped bearer, with upstream access physically absent.
 test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
   'Codex public manual MCP schemas reach the local provider with the scoped bearer',
   async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'codex-manual-capture-'));
-    const requests: Record<string, unknown>[] = [];
-    const mcpMethods: string[] = [];
-    const httpRoutes: string[] = [];
-    const terminalEvents: Array<{ type: string; message?: string }> = [];
-    const bearer = 'local-manual-fixture-only';
-    let unauthorized = 0;
-    const server = createServer(async (request, response) => {
-      httpRoutes.push(`${request.method} ${request.url}`);
-      const chunks: Buffer[] = [];
-      for await (const chunk of request) chunks.push(Buffer.from(chunk));
-      const raw = Buffer.concat(chunks).toString('utf8');
-      if (request.url === '/mcp') {
-        if (request.headers.authorization !== `Bearer ${bearer}`) {
-          unauthorized++;
-          response.writeHead(401).end();
-          return;
-        }
-        if (request.method !== 'POST') {
-          response.writeHead(405).end();
-          return;
-        }
-        const message = JSON.parse(raw);
-        mcpMethods.push(message.method);
-        if (message.id === undefined) {
-          response.writeHead(202).end();
-          return;
-        }
-        const result = message.method === 'initialize'
-          ? { protocolVersion: message.params.protocolVersion, capabilities: { tools: {} },
-              serverInfo: { name: 'public-manual-fixture', version: '1' } }
-          : { tools: ['docs:search', 'docs:get'].map(name => ({ name,
-              description: 'Read the public manual fixture only',
-              inputSchema: { type: 'object', properties: { scope: { type: 'string', enum: ['public'] } },
-                required: ['scope'], additionalProperties: false } })) };
-        response.writeHead(200, { 'content-type': 'application/json' });
-        response.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }));
-        return;
-      }
-      if (request.method === 'POST' && request.url === '/v1/responses') requests.push(JSON.parse(raw));
-      response.writeHead(400, { 'content-type': 'application/json' });
-      response.end(JSON.stringify({ error: { type: 'invalid_request_error',
-        code: 'local_manual_capture', message: 'Local request capture; no model was run.' } }));
-    });
-    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
-    const address = server.address();
-    assert.ok(address && typeof address === 'object');
-    const origin = `http://127.0.0.1:${address.port}`;
-    for (const key of ['PAPERCUSP_ACCOUNT_ID', 'PAPERCUSP_CODEX_GATEWAY',
-      'PAPERCUSP_AGENT_GOVERNOR', 'PAPERCUSP_AGENT_DEBUG', 'OPENAI_API_KEY', 'CODEX_API_KEY']) {
-      vi.stubEnv(key, '');
+    const capture = await isolatedCodexCapture('public-manual');
+    assert.equal(capture.unauthorized, 0);
+    assert.ok(capture.mcpMethods.includes('initialize'));
+    assert.ok(capture.mcpMethods.includes('tools/list'));
+    assert.deepEqual(capture.models, ['gpt-5.6-luna']);
+    for (const name of ['docs_search', 'docs_get']) {
+      const tool = capture.tools.find((tool: { name: string }) => tool.name.endsWith('__' + name));
+      assert.ok(tool, name + ' must appear in the native model request');
+      assert.deepEqual(tool.parameters.properties.scope.enum, ['public']);
     }
-    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      const command = ['codex', '-c model_provider="manual-capture"',
-        '-c model_providers.manual-capture.name="manual-capture"',
-        `-c model_providers.manual-capture.base_url="${origin}/v1"`,
-        '-c model_providers.manual-capture.wire_api="responses"',
-        '-c model_providers.manual-capture.requires_openai_auth=false',
-        '-c model_providers.manual-capture.request_max_retries=0',
-        '-c model_providers.manual-capture.stream_max_retries=0',
-        '-c features.responses_websockets=false'].join(' ');
-      for await (const event of runAgentChat({ backend: 'codex', agentCmd: command,
-        model: 'gpt-5.6-luna:low', cwd: dir, promptText: 'Will agents stop when I close this browser tab?',
-        systemPromptText: 'For product questions, retrieve the public FAQ and cite the retrieved heading.',
-        permissionMode: 'bypassPermissions', allowedTools: ['mcp__agentmcp__docs:search', 'mcp__agentmcp__docs:get'],
-        mcpConfig: { mcpServers: { agentmcp: { type: 'http', url: `${origin}/mcp`,
-          headers: { Authorization: `Bearer ${bearer}` } } } }, signal: AbortSignal.timeout(20000) })) {
-        if (event.type === 'error') terminalEvents.push({ type: event.type, message: event.message.slice(0, 1400) });
-        else if (event.type === 'result') terminalEvents.push({ type: event.type });
-      }
-      console.info('CODEX_MANUAL_TOOL_CAPTURE ' + JSON.stringify({ mcpMethods, httpRoutes,
-        localRequestCount: requests.length, unauthorized, terminalEvents, containmentVerified: requests.length > 0 }));
-      assert.equal(unauthorized, 0);
-      assert.ok(mcpMethods.includes('initialize'));
-      assert.ok(mcpMethods.includes('tools/list'));
-      assert.ok(requests.length > 0, 'The installed CLI must submit its native request locally');
-      const tools = requests[0].tools as Array<Record<string, unknown>>;
-      const names = tools.map(tool => String(tool.name));
-      console.info('CODEX_MANUAL_TOOL_NAMES ' + JSON.stringify({ names,
-        localRequestCount: requests.length, unauthorized }));
-      for (const name of ['docs_search', 'docs_get']) {
-        const tool = tools.find(tool => String(tool.name).endsWith(`__${name}`));
-        assert.ok(tool, `${name} must appear in the native model request`);
-        const parameters = tool.parameters as { properties: { scope: { enum: string[] } } };
-        assert.deepEqual(parameters.properties.scope.enum, ['public']);
-      }
-    } finally {
-      errors.mockRestore();
-      vi.unstubAllEnvs();
-      server.closeAllConnections();
-      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-      rmSync(dir, { recursive: true, force: true });
-    }
-  }, 30000,
+  }, 35000,
 );
 
 // EI-10795 (codex twin): all three backends must tier identically, or the starvation bug
