@@ -320,16 +320,20 @@ test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
 );
 
 // EI-25423532280490423: capture the native request, not just the generated TOML.
-// This local provider rejects every request; no inference or upstream traffic runs.
+// A missing local capture fails containment: a terminal runner result alone
+// cannot prove where model traffic went. Audit routing before another attempt.
 test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
   'Codex public manual MCP schemas reach the local provider with the scoped bearer',
   async () => {
     const dir = mkdtempSync(join(tmpdir(), 'codex-manual-capture-'));
     const requests: Record<string, unknown>[] = [];
     const mcpMethods: string[] = [];
+    const httpRoutes: string[] = [];
+    const terminalEvents: Array<{ type: string; message?: string }> = [];
     const bearer = 'local-manual-fixture-only';
     let unauthorized = 0;
     const server = createServer(async (request, response) => {
+      httpRoutes.push(`${request.method} ${request.url}`);
       const chunks: Buffer[] = [];
       for await (const chunk of request) chunks.push(Buffer.from(chunk));
       const raw = Buffer.concat(chunks).toString('utf8');
@@ -383,22 +387,25 @@ test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
         '-c model_providers.manual-capture.request_max_retries=0',
         '-c model_providers.manual-capture.stream_max_retries=0',
         '-c features.responses_websockets=false'].join(' ');
-      for await (const _event of runAgentChat({ backend: 'codex', agentCmd: command,
+      for await (const event of runAgentChat({ backend: 'codex', agentCmd: command,
         model: 'gpt-5.6-luna:low', cwd: dir, promptText: 'Will agents stop when I close this browser tab?',
         systemPromptText: 'For product questions, retrieve the public FAQ and cite the retrieved heading.',
         permissionMode: 'bypassPermissions', allowedTools: ['mcp__agentmcp__docs:search', 'mcp__agentmcp__docs:get'],
         mcpConfig: { mcpServers: { agentmcp: { type: 'http', url: `${origin}/mcp`,
           headers: { Authorization: `Bearer ${bearer}` } } } }, signal: AbortSignal.timeout(20000) })) {
-        // Drain the rejected local request through the production adapter.
+        if (event.type === 'error') terminalEvents.push({ type: event.type, message: event.message.slice(0, 1400) });
+        else if (event.type === 'result') terminalEvents.push({ type: event.type });
       }
+      console.info('CODEX_MANUAL_TOOL_CAPTURE ' + JSON.stringify({ mcpMethods, httpRoutes,
+        localRequestCount: requests.length, unauthorized, terminalEvents, containmentVerified: requests.length > 0 }));
       assert.equal(unauthorized, 0);
       assert.ok(mcpMethods.includes('initialize'));
       assert.ok(mcpMethods.includes('tools/list'));
       assert.ok(requests.length > 0, 'The installed CLI must submit its native request locally');
       const tools = requests[0].tools as Array<Record<string, unknown>>;
       const names = tools.map(tool => String(tool.name));
-      console.info('CODEX_MANUAL_TOOL_CAPTURE ' + JSON.stringify({ mcpMethods, names,
-        requestCount: requests.length, unauthorized, upstreamRequests: 0 }));
+      console.info('CODEX_MANUAL_TOOL_NAMES ' + JSON.stringify({ names,
+        localRequestCount: requests.length, unauthorized }));
       for (const name of ['docs_search', 'docs_get']) {
         const tool = tools.find(tool => String(tool.name).endsWith(`__${name}`));
         assert.ok(tool, `${name} must appear in the native model request`);
