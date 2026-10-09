@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AGENT_IDENTITY_SPEC_ENV,
   AgentIdentityTtyRefusedError,
@@ -202,6 +202,27 @@ describe('loopback identity TTY stage + exec (D-424)', () => {
     expect(caught?.message).toContain('exited 7');
     expect(caught?.message).toContain('denied');
     expect(readFileSync(promptFile, 'utf8')).toBe('# rendered su playbook\n');
+  });
+
+  it('preserves the transport stderr tail when the stage hop reports a spawn error', () => {
+    const spawnError = Object.assign(new Error('stage transport timed out'), { code: 'ETIMEDOUT' });
+    const run = vi.fn(() => ({
+      error: spawnError,
+      status: null,
+      signal: 'SIGTERM',
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.from('earlier diagnostic\ntransport refused the stage header\n'),
+    }));
+    let caught: AgentIdentityTtyRefusedError | undefined;
+    try {
+      stageAgentIdentityTty(spec, request(), { spawnSync: run });
+    } catch (error) {
+      caught = error as AgentIdentityTtyRefusedError;
+    }
+    expect(caught?.code).toBe('agent_identity_stage_failed');
+    expect(caught?.message).toContain('stage transport timed out');
+    expect(caught?.message).toContain('transport refused the stage header');
+    expect(run).toHaveBeenCalledTimes(1);
   });
 });
 

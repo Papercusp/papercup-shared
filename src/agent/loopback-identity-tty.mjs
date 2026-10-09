@@ -398,7 +398,10 @@ export function stageAgentIdentityTty(rawSpec, request, deps = {}) {
   });
   const stderrTail = String(result.stderr ?? '').trim().split('\n').slice(-5).join(' | ');
   if (result.error) {
-    throw refused('agent_identity_stage_failed', `staging the agent as ${plan.identity} failed: ${result.error.message}`);
+    throw refused(
+      'agent_identity_stage_failed',
+      `staging the agent as ${plan.identity} failed: ${result.error.message}${stderrTail ? `: ${stderrTail}` : ''}`,
+    );
   }
   if (result.status !== 0) {
     throw refused(
