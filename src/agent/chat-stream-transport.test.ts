@@ -104,6 +104,24 @@ describe('assignment-private Codex evidence lifecycle (WI-10007969)', () => {
     for await (const event of runAgentChat(options)) events.push(event);
     return events;
   };
+  it('enrolls the transformed native spawn and observes its actual session UUID', async () => {
+    const id = '00000000-0000-0000-0000-000000000123';
+    nativeByteStream(JSON.stringify({ type: 'thread.started', thread_id: id }) + '\n' + frames);
+    const onNativeSession = vi.fn();
+    const spawnProcess = vi.fn(async (command, args, options) => spawn(command, args, options));
+    configureAgentSpawnTransform(request => ({ command: 'identity-transport', args: [...request.args], cwd: request.cwd, env: request.env }));
+    await collect({ backend: 'codex', promptText: 'fixture', spawnProcess, onNativeSession });
+    expect(spawnProcess).toHaveBeenCalledTimes(1);
+    expect(spawnProcess.mock.calls[0][0]).toBe('identity-transport');
+    expect(onNativeSession).toHaveBeenCalledExactlyOnceWith(id);
+  });
+  it('never falls back to untracked spawn when host enrollment refuses', async () => {
+    const before = vi.mocked(spawn).mock.calls.length;
+    const events = await collect({ backend: 'codex', promptText: 'fixture',
+      spawnProcess: async () => { throw new Error('required enrollment refused'); } });
+    expect(vi.mocked(spawn).mock.calls.length).toBe(before);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'error', message: expect.stringContaining('required enrollment refused') }));
+  });
 
   it('retains full native bytes in the caller home and uses only the private provider binding', async () => {
     const home = mkdtempSync(join(tmpdir(), 'native-evidence-'));
