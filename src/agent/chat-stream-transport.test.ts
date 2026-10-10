@@ -3,9 +3,13 @@ import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 import type { AddressInfo } from 'node:net';
 import { createStatelessDiagnosticFetch, invalidateClaudeTokenCache, isTransientLlmError, runAgentChat, type RunAgentChatOptions, type StatelessRequestAttempt, type StatelessTransportDiagnostic } from './chat-stream';
+import { configureAgentSpawnTransform } from './spawn-transform';
 
 // Negative pre-implementation cases must never launch a credentialed CLI.
 vi.mock('node:child_process', async importOriginal => ({
@@ -59,6 +63,7 @@ vi.mock('@anthropic-ai/sdk', () => ({
 }));
 
 afterEach(() => {
+  configureAgentSpawnTransform(undefined);
   vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.restoreAllMocks();
   sdk.bodyEvents = []; sdk.bodyFailure = undefined; sdk.beforeFailure = undefined; sdk.real = undefined;
   sdk.headers = [];
@@ -73,7 +78,7 @@ const transport = {
 
 // WI-10007475: native pipes may split any UTF-8 code point across data events.
 // Feed one byte at a time through real Node streams, without launching a CLI.
-function nativeByteStream(stdout: string, stderr = '', exitCode = 0) {
+function nativeByteStream(stdout: string, stderr = '', exitCode = 0, beforeOutput?: () => void) {
   const child = new EventEmitter() as ChildProcess;
   const output = new PassThrough();
   const errors = new PassThrough();
@@ -81,6 +86,7 @@ function nativeByteStream(stdout: string, stderr = '', exitCode = 0) {
     stdin: new Writable({ write(_chunk, _encoding, done) { done(); }, final(done) {
       done();
       queueMicrotask(() => {
+        beforeOutput?.();
         for (const byte of Buffer.from(stdout)) output.write(Buffer.from([byte]));
         for (const byte of Buffer.from(stderr)) errors.write(Buffer.from([byte]));
         output.end(); errors.end();
@@ -89,6 +95,108 @@ function nativeByteStream(stdout: string, stderr = '', exitCode = 0) {
     } }) });
   vi.mocked(spawn).mockReturnValueOnce(child);
 }
+
+describe('assignment-private Codex evidence lifecycle (WI-10007969)', () => {
+  const gateway = { baseURL: 'http://127.0.0.1:32123', token: 'fixture_private_token_01234567890123456789' };
+  const frames = JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'fixture' } }) + '\n';
+  const collect = async (options: RunAgentChatOptions) => {
+    const events = [];
+    for await (const event of runAgentChat(options)) events.push(event);
+    return events;
+  };
+
+  it('retains full native bytes in the caller home and uses only the private provider binding', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'native-evidence-'));
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', ''); vi.stubEnv('PAPERCUSP_AGENT_DEBUG', '');
+    vi.stubEnv('PAPERCUSP_ACCOUNT_ID', 'ambient-account'); vi.stubEnv('PAPERCUSP_GATEWAY_PORT', '9999');
+    vi.stubEnv('OPENAI_API_KEY', 'ambient-secret'); vi.stubEnv('CODEX_API_KEY', 'ambient-secret');
+    vi.stubEnv('OPENAI_BASE_URL', 'https://ambient.invalid');
+    const before = vi.mocked(spawn).mock.calls.length;
+    const bytes = '{"type":"session_meta","payload":{"id":"fixture-session"}}\n';
+    nativeByteStream(frames, '', 0, () => writeFileSync(join(home, 'rollout.jsonl'), bytes));
+    try {
+      const events = await collect({ backend: 'codex', promptText: 'stock issue', model: 'gpt-5.5:high',
+        isolateConfig: true, isolateDir: home, codexGateway: gateway, ownerId: 'assignment-owner' });
+      expect(events.some(event => event.type === 'result')).toBe(true);
+      const [, args, options] = vi.mocked(spawn).mock.calls[before];
+      expect(args).not.toContain('--ephemeral');
+      expect(options?.env?.CODEX_HOME).toBe(home);
+      for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL']) expect(options?.env?.[key]).toBeUndefined();
+      expect(readFileSync(join(home, 'rollout.jsonl'), 'utf8')).toBe(bytes);
+      const config = readFileSync(join(home, 'config.toml'), 'utf8');
+      expect(config).toContain('base_url = "http://127.0.0.1:32123/v1"');
+      expect(config).toContain(`experimental_bearer_token = "${gateway.token}"`);
+      expect(config).toContain('requires_openai_auth = false');
+      expect(config).toContain('"x-papercusp-owner" = "assignment-owner"');
+      expect(config).not.toContain('ambient-account'); expect(config).not.toContain('9999');
+      expect(existsSync(join(home, 'auth.json'))).toBe(false);
+      expect(existsSync(join(home, 'AGENTS.md'))).toBe(false);
+      expect(process.env.OPENAI_API_KEY).toBe('ambient-secret');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('honors the configured identity transform and marks the evidence home persistent', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'native-identity-'));
+    const transform = vi.fn(request => ({ ...request, command: 'fixture-identity-transport', args: [...request.args] }));
+    configureAgentSpawnTransform(transform); vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', '');
+    const before = vi.mocked(spawn).mock.calls.length;
+    nativeByteStream(frames);
+    try {
+      await collect({ backend: 'codex', promptText: 'fixture', isolateConfig: true, isolateDir: home, codexGateway: gateway });
+      expect(transform).toHaveBeenCalledOnce();
+      expect(transform.mock.calls[0][0].stagedDirs).toContainEqual({ path: home, persistent: true });
+      expect(vi.mocked(spawn).mock.calls[before][0]).toBe('fixture-identity-transport');
+      expect(existsSync(home)).toBe(true);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('keeps caller-owned evidence when spawning fails', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'native-failed-evidence-'));
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', '');
+    writeFileSync(join(home, 'prior-rollout.jsonl'), 'prior evidence');
+    vi.mocked(spawn).mockImplementationOnce(() => { throw new Error('fixture spawn failure'); });
+    try {
+      const events = await collect({ backend: 'codex', promptText: 'fixture', isolateConfig: true, isolateDir: home, codexGateway: gateway });
+      expect(events.some(event => event.type === 'error')).toBe(true);
+      expect(readFileSync(join(home, 'prior-rollout.jsonl'), 'utf8')).toBe('prior evidence');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('isolates and cleans a temporary Codex home when the caller does not retain it', async () => {
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', ''); vi.stubEnv('PAPERCUSP_AGENT_DEBUG', '');
+    const before = vi.mocked(spawn).mock.calls.length;
+    nativeByteStream(frames);
+    await collect({ backend: 'codex', promptText: 'fixture', isolateConfig: true });
+    const [, args, options] = vi.mocked(spawn).mock.calls[before];
+    expect(args).toContain('--ephemeral');
+    expect(options?.env?.CODEX_HOME).toBeTruthy();
+    expect(existsSync(options!.env!.CODEX_HOME!)).toBe(false);
+  });
+
+  it.each([
+    { backend: 'omp', codexGateway: gateway },
+    { backend: 'codex', codexGateway: { ...gateway, baseURL: 'https://outside.invalid' } },
+    { backend: 'codex', codexGateway: { ...gateway, token: 'short' } },
+    { backend: 'codex', codexGateway: gateway, isolateConfig: false },
+    { backend: 'codex', isolateConfig: true, isolateDir: 'relative-home' },
+    { backend: 'codex', codexGateway: gateway, statelessGateway: gateway },
+    { backend: 'codex', codexGateway: gateway, agentCmd: 'codex -c model_provider="ambient"' },
+  ])('refuses unsupported or conflicting controls before spawn: %j', async extra => {
+    const before = vi.mocked(spawn).mock.calls.length;
+    await expect(collect({ promptText: 'fixture', isolateConfig: true, ...extra } as RunAgentChatOptions)).rejects.toMatchObject({ costUsd: 0 });
+    expect(vi.mocked(spawn).mock.calls.length).toBe(before);
+  });
+
+  it('also preserves the existing caller-owned Claude session home after completion', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'claude-retained-evidence-'));
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', ''); vi.stubEnv('PAPERCUSP_AGENT_DEBUG', '');
+    nativeByteStream(JSON.stringify({ type: 'result', result: 'fixture', total_cost_usd: 0 }) + '\n');
+    try {
+      await collect({ backend: 'claude-code', promptText: 'fixture', isolateConfig: true, isolateDir: home });
+      expect(existsSync(home)).toBe(true);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+});
 
 describe('native UTF-8 pipe decoding (WI-10007475)', () => {
   const text = 'café 東京 🧭';
