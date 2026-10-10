@@ -185,14 +185,15 @@ for (const f of h.files) { fs.mkdirSync(path.dirname(f.path), { recursive: true,
 for (const l of h.links) { let present = false; try { fs.lstatSync(l.path); present = true; } catch {} if (!present && fs.existsSync(l.target)) fs.symlinkSync(l.target, l.path); }
 const child = cp.spawn(h.argv[0], h.argv.slice(1), { cwd: h.cwd, env: h.env, stdio: ['pipe', 'inherit', 'inherit'], detached: true });
 const cleanup = () => { for (const d of h.cleanup) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} } };
-const kill = (sig) => { try { process.kill(-child.pid, sig); } catch {} };
+let killTimer;
+const kill = (sig) => { try { process.kill(-child.pid, sig); } catch {} if (sig !== 'SIGKILL' && !killTimer) killTimer = setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }, 5000); };
 child.stdin.on('error', () => {});
 process.stdin.pipe(child.stdin);
 for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => kill(sig));
 const parent = process.ppid;
 const watch = setInterval(() => { if (process.ppid !== parent) kill('SIGTERM'); }, 2000);
-child.on('error', (e) => { process.stderr.write('agent spawn failed: ' + e.message + '\n'); clearInterval(watch); cleanup(); process.exit(127); });
-child.on('exit', (code, signal) => { clearInterval(watch); cleanup(); process.exit(code == null ? 128 + (signal === 'SIGKILL' ? 9 : 15) : code); });
+child.on('error', (e) => { process.stderr.write('agent spawn failed: ' + e.message + '\n'); clearInterval(watch); clearTimeout(killTimer); cleanup(); process.exit(127); });
+child.on('exit', (code, signal) => { clearInterval(watch); clearTimeout(killTimer); cleanup(); process.exit(code == null ? 128 + (signal === 'SIGKILL' ? 9 : 15) : code); });
 `;
 
 function shellQuote(value: string): string {
