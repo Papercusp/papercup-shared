@@ -36,7 +36,7 @@
  * Cancellation: pass a signal; spawn is killed on abort.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -495,6 +495,11 @@ export function codexGatewayConfigToml(
 }
 
 export interface RunAgentChatOptions {
+  /** Host-owned enrollment after the existing identity transform. A rejected
+   * enrollment never falls back to an ordinary untracked spawn. */
+  spawnProcess?: (command: string, args: string[], options: SpawnOptions) => Promise<ChildProcess>;
+  /** Actual native CLI session observation, never a requested identity. */
+  onNativeSession?: (sessionId: string) => void;
   /** The full assembled prompt sent to claude on stdin. */
   promptText: string;
   /**
@@ -2990,11 +2995,14 @@ export async function* runAgentChat(
       stagedDirs,
     });
     spawnPrelude = plan.stdinPrelude;
-    child = spawn(plan.command, [...plan.args], {
+    const processOptions: SpawnOptions = {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: plan.cwd,
       env: plan.env,
-    });
+    };
+    child = opts.spawnProcess
+      ? await opts.spawnProcess(plan.command, [...plan.args], processOptions)
+      : spawn(plan.command, [...plan.args], processOptions);
   } catch (e) {
     if (ompAgentDir) {
       try { rmSync(ompAgentDir, { recursive: true, force: true }); } catch { /* best-effort */ }
@@ -3245,6 +3253,10 @@ export async function* runAgentChat(
    */
   const handleCodexEvent = (ev: any) => {
     if (!ev || typeof ev !== 'object') return;
+    if (ev.type === 'thread.started' && typeof ev.thread_id === 'string' &&
+        /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(ev.thread_id)) {
+      opts.onNativeSession?.(ev.thread_id);
+    }
 
     // WI-10003188 — keep codex's own failure text (usage limit, rejected model, auth) so
     // the terminal error and the turn classifier can see it; stderr is empty in --json mode.
