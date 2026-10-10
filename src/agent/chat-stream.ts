@@ -40,8 +40,9 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { basename, delimiter, join } from 'node:path';
+import { basename, delimiter, isAbsolute, join } from 'node:path';
 import { costFromTokens, type CostEstimate } from '@papercusp/model-pricing';
+import { codexGatewayConfigToml as scopedCodexGatewayConfigToml, snapshotScopedInferenceGateway, type ScopedInferenceGateway } from '@papercusp/orchestrator/codex-gateway-config';
 // Agent-turn robustness (opt-in via PAPERCUSP_AGENT_GOVERNOR=1). These modules are pure +
 // import nothing from this file, so there's no cycle and ~no load cost when the flag is off.
 import { runAgentTurn, type TurnOutcome } from './turn-runner';
@@ -459,7 +460,15 @@ export function codexGatewayConfigToml(
   accountId?: string | null,
   priority?: string,
   gatewayOn = false,
+  gateway?: ScopedInferenceGateway,
+  ownerId?: string,
 ): string {
+  if (gateway !== undefined) {
+    // Assignment-private routes use the maintained native config/validation
+    // seam. Ambient pool pins must not override their controller's selection.
+    const config = scopedCodexGatewayConfigToml(undefined, { gateway, priority, ownerId });
+    return [...config.root, ...config.tables].join('\n');
+  }
   const pinnedAccount = accountId?.trim();
   // The explicit gateway flag is the unpinned/auto-routing mode. Keep the provider
   // block when it is enabled even if no account pin was resolved, but never emit an
@@ -519,7 +528,9 @@ export interface RunAgentChatOptions {
       backends pass 'bypassPermissions' for unattended in-app tools. */
   permissionMode?: 'bypassPermissions' | 'default' | 'ask';
   /**
-   * Isolate the spawn from the host's agent config (claude-code only).
+   * Isolate the spawn from the host's agent config (claude-code or codex).
+   * Codex gets a clean CODEX_HOME even without a system prompt or MCP config;
+   * no host config, instructions or sessions are copied into that home.
    * When set, the `claude` subprocess runs against a CLEAN per-spawn
    * `CLAUDE_CONFIG_DIR` (a fresh tmpdir) instead of the developer's
    * `~/.claude`, so it loads NONE of the host environment: no
@@ -608,7 +619,7 @@ export interface RunAgentChatOptions {
    */
   sessionMode?: 'resume' | 'force';
   /**
-   * CALLER-OWNED stable isolate dir (claude-code + isolateConfig only —
+   * CALLER-OWNED stable isolate dir (claude-code or codex + isolateConfig —
    * operator-chat session reuse, WI-5071). When set, the spawn uses THIS
    * directory as its clean CLAUDE_CONFIG_DIR (created if missing) instead of
    * a fresh mkdtemp, and — critically — does NOT delete it afterwards: the
@@ -616,7 +627,9 @@ export interface RunAgentChatOptions {
    * claude keys its on-disk session store by cwd, a stable isolateDir is what
    * makes `sessionId` reuse across separate spawns actually find the prior
    * session (a per-spawn tmp dir strands every session it creates).
-   * Ignored unless `isolateConfig` is set and the backend is claude-code.
+   * For Codex, a retained home also omits --ephemeral so full native rollouts
+   * survive for source-bound usage/evidence readers. Must be absolute; the
+   * caller owns initialization, context equivalence and eventual deletion.
    */
   isolateDir?: string;
   /**
@@ -645,6 +658,11 @@ export interface RunAgentChatOptions {
    * this exact route/token for retries; never falls back to local credentials.
    * Provider authorization remains the gateway controller's responsibility. */
   statelessGateway?: Pick<StatelessTransport, 'baseURL' | 'token'>;
+  /** Trusted host's assignment-private Codex controller. Requires isolated
+   * config, uses the exact snapshotted route/credential, and never inherits
+   * an ambient account pin or local provider credentials. This config binding
+   * does not itself provide OS/network confinement or complete accounting. */
+  codexGateway?: ScopedInferenceGateway;
   /** Per-request gateway account pin; 'auto' uses pool selection without an
    * ambient process pin. Stateless only; never mutates process credentials. */
   routeAccountId?: string;
@@ -2339,6 +2357,19 @@ async function* governedStatelessChat(
 export async function* runAgentChat(
   opts: RunAgentChatOptions,
 ): AsyncGenerator<ChatEvent, void, void> {
+  if (opts.codexGateway !== undefined) {
+    if (resolveBackend(opts) !== 'codex' || opts.isolateConfig !== true || opts.statelessGateway !== undefined ||
+        opts.routeAccountId !== undefined ||
+        /(?:^|\s)(?:-c(?:\s|\S)|--config(?:=|\s))/.test(opts.agentCmd ?? '')) {
+      throw Object.assign(new Error('Private Codex routing requires isolated Codex config without conflicting route overrides'), { costUsd: 0 });
+    }
+    try { opts = { ...opts, codexGateway: snapshotScopedInferenceGateway(opts.codexGateway) }; }
+    catch { throw Object.assign(new Error('Invalid private Codex gateway binding'), { costUsd: 0 }); }
+  }
+  if (resolveBackend(opts) === 'codex' && opts.isolateDir !== undefined &&
+      (opts.isolateConfig !== true || !isAbsolute(opts.isolateDir))) {
+    throw Object.assign(new Error('Caller-owned Codex home requires isolated config and an absolute path'), { costUsd: 0 });
+  }
   if (opts.routeAccountId !== undefined) {
     if (!opts.routeAccountId.trim() || /[\r\n]/.test(opts.routeAccountId) ||
         opts.statelessGateway !== undefined || resolveBackend(opts) !== 'anthropic-direct') {
@@ -2452,6 +2483,7 @@ export async function* runAgentChat(
   // otherwise codex runs against the user's real ~/.codex. Cleaned up
   // after the child exits (alongside ompAgentDir).
   let codexHome: string | undefined;
+  let codexHomeCallerOwned = false;
 
   // Per-spawn clean CLAUDE_CONFIG_DIR (claude-code, opts.isolateConfig
   // only) — isolates the brain spawn from the developer's ~/.claude.
@@ -2557,7 +2589,8 @@ export async function* runAgentChat(
     // `--json` emits JSONL events (one per line, NOT token-streamed);
     // `--skip-git-repo-check` allows running outside a git repo;
     // `--ephemeral` keeps no persistent session/rollout on disk.
-    args.push('--json', '--skip-git-repo-check', '--ephemeral');
+    args.push('--json', '--skip-git-repo-check');
+    if (!(opts.isolateConfig && opts.isolateDir)) args.push('--ephemeral');
     // Sandbox / approval mode. Default read-only; bypassPermissions
     // unlocks full access (lets MCP tool calls + shell run without an
     // interactive approval gate — verified: `read-only` cancels MCP
@@ -2579,14 +2612,20 @@ export async function* runAgentChat(
     //   - auth.json  ← symlink to ~/.codex/auth.json (shared ChatGPT login)
     // Created only when one of those is needed; otherwise codex uses the
     // user's real ~/.codex (which already has auth + config).
-    if (opts.systemPromptText !== undefined || opts.mcpConfig) {
-      codexHome = mkdtempSync(join(tmpdir(), 'codex-chat-'));
+    if (opts.systemPromptText !== undefined || opts.mcpConfig || opts.isolateConfig) {
+      if (opts.isolateConfig && opts.isolateDir) {
+        codexHome = opts.isolateDir;
+        codexHomeCallerOwned = true;
+        mkdirSync(codexHome, { recursive: true });
+      } else {
+        codexHome = mkdtempSync(join(tmpdir(), 'codex-chat-'));
+      }
       // Share the ChatGPT OAuth login. codex resolves auth from
       // $CODEX_HOME/auth.json; symlink the user's real one in so we
       // don't need an API key (login is via ChatGPT OAuth).
       try {
         const realAuth = join(homedir(), '.codex', 'auth.json');
-        if (existsSync(realAuth)) {
+        if (!opts.codexGateway && existsSync(realAuth) && !existsSync(join(codexHome, 'auth.json'))) {
           symlinkSync(realAuth, join(codexHome, 'auth.json'));
         }
       } catch (err) {
@@ -2600,11 +2639,16 @@ export async function* runAgentChat(
       }
 
       spawnEnv = { ...process.env, CODEX_HOME: codexHome };
+      if (opts.codexGateway) {
+        delete spawnEnv.OPENAI_API_KEY;
+        delete spawnEnv.CODEX_API_KEY;
+        delete spawnEnv.OPENAI_BASE_URL;
+      }
 
       const codexGatewayAccountId = process.env.PAPERCUSP_ACCOUNT_ID?.trim();
       const codexGatewayOn = process.env.PAPERCUSP_CODEX_GATEWAY === '1';
       const configParts = [
-        codexGatewayConfigToml(codexGatewayAccountId, opts.priority, codexGatewayOn),
+        codexGatewayConfigToml(codexGatewayAccountId, opts.priority, codexGatewayOn, opts.codexGateway, opts.ownerId),
         opts.mcpConfig ? codexMcpConfigToml(opts.mcpConfig as ClaudeShapeMcpConfig) : '',
       ].filter(Boolean);
       if (configParts.length > 0) {
@@ -2616,7 +2660,7 @@ export async function* runAgentChat(
         // per-spawn 0600 config, matching writeSuCodexHome. When the spawn
         // chokepoint selected a Codex pool account, include the matching
         // model_provider so Codex model traffic routes through the gateway too.
-        writeFileSync(join(codexHome, 'config.toml'), configParts.join('\n'), 'utf8');
+        writeFileSync(join(codexHome, 'config.toml'), configParts.join('\n'), { encoding: 'utf8', mode: 0o600 });
       }
     }
 
@@ -2930,7 +2974,7 @@ export async function* runAgentChat(
     // none configured this is the staged spawn unchanged; a hosted workspace
     // host runs customer-driven agents as the customer workspace identity.
     const stagedDirs: AgentSpawnStagedDir[] = [];
-    if (codexHome) stagedDirs.push({ path: codexHome, persistent: false });
+    if (codexHome) stagedDirs.push({ path: codexHome, persistent: codexHomeCallerOwned });
     if (ompAgentDir) stagedDirs.push({ path: ompAgentDir, persistent: false });
     if (claudeConfigDir) stagedDirs.push({ path: claudeConfigDir, persistent: claudeConfigDirCallerOwned });
     if (claudeSysDir && claudeSysDir !== claudeConfigDir) stagedDirs.push({ path: claudeSysDir, persistent: false });
@@ -2955,7 +2999,7 @@ export async function* runAgentChat(
     if (ompAgentDir) {
       try { rmSync(ompAgentDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
-    if (codexHome) {
+    if (codexHome && !codexHomeCallerOwned) {
       try { rmSync(codexHome, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
     if (claudeConfigDir && !claudeConfigDirCallerOwned) {
@@ -3415,14 +3459,14 @@ export async function* runAgentChat(
       try { rmSync(ompAgentDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
   }
-  if (codexHome) {
+  if (codexHome && !codexHomeCallerOwned) {
     if (process.env.PAPERCUSP_AGENT_DEBUG) {
       console.error(`[chat-stream] PAPERCUSP_AGENT_DEBUG — preserving CODEX_HOME: ${codexHome}`);
     } else {
       try { rmSync(codexHome, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
   }
-  if (claudeConfigDir) {
+  if (claudeConfigDir && !claudeConfigDirCallerOwned) {
     if (process.env.PAPERCUSP_AGENT_DEBUG) {
       console.error(`[chat-stream] PAPERCUSP_AGENT_DEBUG — preserving CLAUDE_CONFIG_DIR: ${claudeConfigDir}`);
     } else {

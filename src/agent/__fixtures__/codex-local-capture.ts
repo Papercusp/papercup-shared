@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdtempSync, readFileSync, readlinkSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync } from 'node:fs';
 import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runAgentChat } from '../chat-stream';
@@ -19,17 +19,18 @@ for (const key of ['PAPERCUSP_ACCOUNT_ID', 'PAPERCUSP_CODEX_GATEWAY',
   'OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL']) assert.equal(process.env[key], undefined);
 
 const manual = process.argv[2].startsWith('public-manual');
+const stockNative = process.argv[2] === 'stock-native-route';
 const codeMode = process.argv[2] === 'public-manual-code-mode';
 const toolLoop = process.argv[2].startsWith('public-manual-tool-loop');
 const names = process.argv[2].endsWith('-underscores')
   ? ['docs_search', 'docs_get'] : ['docs:search', 'docs:get'];
 const marker = 'Explain the product from the public FAQ first';
-const prompt = manual
+const prompt = stockNative ? 'Inspect this fixture repository using your native coding tools.' : manual
   ? 'For product questions, retrieve the public FAQ and cite the retrieved heading.'
   : process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE_FILE
     ? readFileSync(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE_FILE, 'utf8')
     : '# Global instructions\n' + 'Synthetic policy context.\n'.repeat(2800) + '\n' + marker;
-if (!manual) {
+if (!manual && !stockNative) {
   assert.ok(Buffer.byteLength(prompt) > 32768);
   assert.ok(prompt.includes(marker));
 }
@@ -40,7 +41,7 @@ const httpRoutes: string[] = [];
 const terminalEvents: Array<Record<string, unknown>> = [];
 const mcpCalls: Array<Record<string, unknown>> = [];
 const returnedToolItems: Array<Record<string, unknown>> = [];
-const bearer = 'local-manual-fixture-only';
+const bearer = stockNative ? 'stock_native_fixture_token_01234567890123456789' : 'local-manual-fixture-only';
 let unauthorized = 0;
 const server = createServer(async (request, response) => {
   httpRoutes.push(`${request.method} ${request.url}`);
@@ -79,6 +80,11 @@ const server = createServer(async (request, response) => {
     return;
   }
   if (request.method === 'POST' && request.url === '/v1/responses') {
+    if (stockNative && request.headers.authorization !== `Bearer ${bearer}`) {
+      unauthorized++;
+      response.writeHead(401).end();
+      return;
+    }
     const body = JSON.parse(raw);
     requests.push(body);
     if (toolLoop) {
@@ -121,7 +127,7 @@ const address = server.address();
 assert.ok(address && typeof address === 'object');
 const origin = `http://127.0.0.1:${address.port}`;
 try {
-  const command = ['codex', '-c model_provider="local-capture"',
+  const command = stockNative ? 'codex' : ['codex', '-c model_provider="local-capture"',
     '-c model_providers.local-capture.name="local-capture"',
     `-c model_providers.local-capture.base_url="${origin}/v1"`,
     '-c model_providers.local-capture.wire_api="responses"',
@@ -135,7 +141,9 @@ try {
   for await (const event of runAgentChat({ backend: 'codex', agentCmd: command,
     model: manual ? (process.argv[4] || 'gpt-5.6-luna:low') : 'gpt-5.5', cwd: dir,
     promptText: manual ? 'Will agents stop when I close this browser tab?' : 'Inspect the configured instruction context.',
-    systemPromptText: prompt, permissionMode: 'bypassPermissions',
+    ...(stockNative ? { isolateConfig: true, isolateDir: join(dir, 'native-home'),
+      codexGateway: { baseURL: origin, token: bearer }, ownerId: 'stock-native-fixture' }
+      : { systemPromptText: prompt }), permissionMode: 'bypassPermissions',
     ...(manual ? { allowedTools: ['mcp__agentmcp__docs:search', 'mcp__agentmcp__docs:get'],
       mcpConfig: { mcpServers: { agentmcp: { type: 'http', url: `${origin}/mcp`,
         headers: { Authorization: `Bearer ${bearer}` } } } } } : {}),
@@ -173,7 +181,31 @@ try {
     }
   };
   inspect(requests[0], '$');
+  const nativeHome = join(dir, 'native-home');
+  const nativeFiles: string[] = [];
+  const collectNativeFiles = (path: string): void => {
+    if (!existsSync(path)) return;
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      const file = join(path, entry.name);
+      if (entry.isDirectory()) collectNativeFiles(file);
+      else if (entry.isFile() && entry.name.endsWith('.jsonl')) nativeFiles.push(file);
+    }
+  };
+  if (stockNative) collectNativeFiles(join(nativeHome, 'sessions'));
+  const nativeBytes = nativeFiles.map(file => readFileSync(file, 'utf8'));
+  const nativeRecords = nativeBytes.flatMap(bytes => bytes.split('\n').filter(Boolean).map(line => JSON.parse(line)));
+  const nativeConfig = stockNative && existsSync(join(nativeHome, 'config.toml'))
+    ? readFileSync(join(nativeHome, 'config.toml'), 'utf8') : '';
   console.log('CODEX_ISOLATED_CAPTURE ' + JSON.stringify({ isolationVerified: true,
+    ...(stockNative ? { nativeEvidence: {
+      homeRetained: existsSync(nativeHome), noHostAuth: !existsSync(join(nativeHome, 'auth.json')),
+      noPersonaFile: !existsSync(join(nativeHome, 'AGENTS.md')),
+      privateProvider: nativeConfig.includes(`base_url = "${origin}/v1"`)
+        && nativeConfig.includes(`experimental_bearer_token = "${bearer}"`),
+      nativeSourceHashes: nativeBytes.map(bytes => createHash('sha256').update(bytes).digest('hex')),
+      sessionMeta: nativeRecords.filter(record => record.type === 'session_meta').map(record => ({
+        id: record.payload.id, version: record.payload.cli_version, provider: record.payload.model_provider })),
+    } } : {}),
     mode: process.argv[2], requestKeys: Object.keys(requests[0] ?? {}), schemaPaths, namedToolTextPaths,
     inputShape: input.map(item => ({ keys: Object.keys(item), type: item.type, role: item.role })),
     requestCount: requests.length, mcpMethods, mcpCalls, returnedToolItems,

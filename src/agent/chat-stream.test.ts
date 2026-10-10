@@ -290,6 +290,24 @@ async function isolatedCodexCapture(mode: string, budget?: number, model?: strin
 }
 
 test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
+  'Stock Codex uses its private controller and preserves native source without a Papercusp persona',
+  async () => {
+    const capture = await isolatedCodexCapture('stock-native-route');
+    assert.equal(capture.unauthorized, 0);
+    assert.equal(capture.nativeEvidence.homeRetained, true);
+    assert.equal(capture.nativeEvidence.noHostAuth, true);
+    assert.equal(capture.nativeEvidence.noPersonaFile, true);
+    assert.equal(capture.nativeEvidence.privateProvider, true);
+    assert.ok(capture.nativeEvidence.nativeSourceHashes.length > 0);
+    assert.ok(capture.nativeEvidence.nativeSourceHashes.every((hash: string) => /^[a-f0-9]{64}$/.test(hash)));
+    assert.ok(capture.nativeEvidence.sessionMeta.some((meta: { id: string; version: string; provider: string }) =>
+      meta.id && meta.version && meta.provider === 'papercusp-codex-gateway'));
+    assert.ok(capture.tools.length > 0, 'The stock CLI must retain its native tool harness');
+    assert.deepEqual(capture.mcpCalls, []);
+  }, 35000,
+);
+
+test.runIf(process.env.PAPERCUSP_CODEX_PROMPT_CAPTURE === '1')(
   'Codex global prompt reaches the local provider beyond the project document limit',
   async () => {
     for (const budget of [undefined, 131072]) {
