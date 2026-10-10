@@ -120,7 +120,7 @@ describe('native tool-result observation', () => {
   });
 
   it.each(['claude-code', 'codex', 'omp'] as const)('pairs repeated %s calls by native ID rather than tool name', async backend => {
-    const frames = ['call-1', 'call-2'].flatMap((id, index) => backend === 'claude-code' ? [
+    const frames = ['call-1', 'call-2'].flatMap<Record<string, unknown>>((id, index) => backend === 'claude-code' ? [
       { type: 'stream_event', event: { type: 'content_block_start', index,
         content_block: { type: 'tool_use', id, name: 'docs:get' } } },
       { type: 'stream_event', event: { type: 'content_block_stop', index } },
