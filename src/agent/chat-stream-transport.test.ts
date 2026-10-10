@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 import type { AddressInfo } from 'node:net';
 import { createStatelessDiagnosticFetch, invalidateClaudeTokenCache, isTransientLlmError, runAgentChat, type RunAgentChatOptions, type StatelessRequestAttempt, type StatelessTransportDiagnostic } from './chat-stream';
-import { configureAgentSpawnTransform } from './spawn-transform';
+import { configureAgentSpawnTransform, type AgentSpawnRequest } from './spawn-transform';
 
 // Negative pre-implementation cases must never launch a credentialed CLI.
 vi.mock('node:child_process', async importOriginal => ({
@@ -137,7 +137,7 @@ describe('assignment-private Codex evidence lifecycle (WI-10007969)', () => {
 
   it('honors the configured identity transform and marks the evidence home persistent', async () => {
     const home = mkdtempSync(join(tmpdir(), 'native-identity-'));
-    const transform = vi.fn(request => ({ ...request, command: 'fixture-identity-transport', args: [...request.args] }));
+    const transform = vi.fn((request: AgentSpawnRequest) => ({ ...request, command: 'fixture-identity-transport', args: [...request.args] }));
     configureAgentSpawnTransform(transform); vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', '');
     const before = vi.mocked(spawn).mock.calls.length;
     nativeByteStream(frames);
