@@ -32,7 +32,8 @@
     "@anthropic-ai/sdk": "^0.93.0",
     "@papercusp/grid-core": "*",
     "@papercusp/model-pricing": "*",
-    "@papercusp/module-singleton": "*"
+    "@papercusp/module-singleton": "*",
+    "@papercusp/orchestrator": "*"
   },
   "scripts": {
     "test": "vitest run"
