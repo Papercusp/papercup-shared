@@ -105,6 +105,7 @@ export {
   resolveLimitModel,
   resolveProviderLimitModel,
   onGovernorPause,
+  onGovernorResumed,
   snapshotGovernors,
   governorKey,
   parseGovernorKey,

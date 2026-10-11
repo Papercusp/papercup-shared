@@ -627,6 +627,8 @@ export interface GovernorDeps {
   sleep?: (ms: number) => Promise<void>;
   /** Called (best-effort, synchronously) only when `pausedUntil` increases. Must not throw. */
   onPause?: (ev: GovernorPauseEvent) => void;
+  /** First real admission after a pause expired, including a pause loaded from the shared store. */
+  onResumed?: () => void;
   /** Cross-process shared-budget store (RB-007). Omit for in-memory (per-process) governance. */
   store?: GovernorStore;
   /** Bucket key for the store (e.g. "anthropic:opus"). Required when `store` is set. */
@@ -664,6 +666,8 @@ export class RateLimitGovernor {
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly onPause?: (ev: GovernorPauseEvent) => void;
+  private readonly onResumed?: () => void;
+  private lastResumedPause = 0;
   private readonly store?: GovernorStore;
   private readonly storeKey?: string;
   private readonly globalGate?: GlobalConcurrencyGate;
@@ -682,6 +686,7 @@ export class RateLimitGovernor {
     this.now = deps.now ?? (() => Date.now());
     this.sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.onPause = deps.onPause;
+    this.onResumed = deps.onResumed;
     this.store = deps.store;
     this.storeKey = deps.storeKey;
     this.globalGate = deps.globalGate;
@@ -748,6 +753,13 @@ export class RateLimitGovernor {
     }
   }
 
+  private notifyResumed(): void {
+    const pausedUntil = this.state.pausedUntil;
+    if (pausedUntil <= 0 || pausedUntil > this.now() || pausedUntil === this.lastResumedPause) return;
+    this.lastResumedPause = pausedUntil;
+    try { this.onResumed?.(); } catch { /* observability must never break admission */ }
+  }
+
   /**
    * Acquire a permit, blocking until allowed. Returns a release fn, or `null` if it GAVE
    * UP — the abort signal fired, or the cumulative wait would exceed `opts.maxWaitMs`. The
@@ -761,6 +773,7 @@ export class RateLimitGovernor {
     let waited = 0;
     let pauseTicket: number | undefined; // staggered-resume ticket for THIS waiter (D-006)
     const mkRelease = (): (() => void) => {
+      this.notifyResumed();
       const seqAtAcquire = this.penaltySeq;
       let released = false;
       return () => {

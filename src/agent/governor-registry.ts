@@ -475,6 +475,13 @@ export function parseGovernorKey(key: string): { provider: TurnProvider; modelCl
 // <reset>" to coord/telemetry — without the domain-free governor knowing about any of that.
 export type GovernorPauseListener = (ev: GovernorPauseEvent & { key: string }) => void;
 const pauseListeners = new Set<GovernorPauseListener>();
+const resumedListeners = new Set<(ev: { key: string }) => void>();
+
+/** Observed recovery: a bucket admitted real work after its pause. */
+export function onGovernorResumed(cb: (ev: { key: string }) => void): () => void {
+  resumedListeners.add(cb);
+  return () => resumedListeners.delete(cb);
+}
 
 /** Subscribe to pause transitions across ALL buckets. Returns an unsubscribe fn. */
 export function onGovernorPause(cb: GovernorPauseListener): () => void {
@@ -532,6 +539,12 @@ export function getGovernor(provider: TurnProvider, modelClass: string, deps?: G
         onPause: (ev) => {
           emitGovernorPause({ ...ev, key });
           deps?.onPause?.(ev);
+        },
+        onResumed: () => {
+          for (const cb of resumedListeners) {
+            try { cb({ key }); } catch { /* listeners must never break admission */ }
+          }
+          deps?.onResumed?.();
         },
       },
     );

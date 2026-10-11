@@ -767,6 +767,40 @@ test('RateLimitGovernor — onPause fires on a header-driven exhaustion (remaini
 
 // --- RB-007: cross-process store seam — two governors sharing ONE budget row -------------
 
+test('RateLimitGovernor — recovery requires an admitted permit and emits once per pause', async () => {
+  let clock = 1000;
+  let resumed = 0;
+  const g = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock,
+    sleep: async (ms) => { clock += ms; }, onResumed: () => { resumed++; } });
+  g.penalize({ retryAfterMs: 30_000 });
+  assert.equal(await g.acquire({}, { maxWaitMs: 0 }), null);
+  assert.equal(resumed, 0);
+  clock = g.snapshot().pausedUntil;
+  const release = await g.acquire();
+  assert.equal(resumed, 1);
+  release?.();
+  (await g.acquire())?.();
+  assert.equal(resumed, 1);
+  g.penalize({ retryAfterMs: 30_000 });
+  clock = g.snapshot().pausedUntil;
+  (await g.acquire())?.();
+  assert.equal(resumed, 2);
+});
+
+test('RateLimitGovernor — observes shared-store recovery after a fresh governor loads an expired pause', async () => {
+  let clock = 1000;
+  const store = makeMemStore();
+  const deps = { now: () => clock, store, storeKey: 'anthropic:opus' };
+  const original = new RateLimitGovernor({ maxConcurrent: 5 }, deps);
+  original.penalize({ retryAfterMs: 30_000 });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  clock = original.snapshot().pausedUntil;
+  let resumed = 0;
+  const restarted = new RateLimitGovernor({ maxConcurrent: 5 }, { ...deps, onResumed: () => { resumed++; } });
+  (await restarted.acquire())?.();
+  assert.equal(resumed, 1);
+});
+
 /** A trivial in-process GovernorStore that mimics PG: one shared state per key, mutated under a
     (synchronous, single-threaded) transact — proves the seam wires correctly. */
 function makeMemStore() {
