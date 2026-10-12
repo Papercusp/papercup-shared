@@ -97,6 +97,7 @@ export {
   type UsageReset,
   type UsageResetPrecision,
 } from './turn-error';
+export { modelCapacityLineMatch } from './model-capacity.mjs';
 export {
   governorForBackend,
   getGovernor,
