@@ -936,6 +936,21 @@ export class RateLimitGovernor {
     if (this.store) void this.store.transact(this.storeKey!, this.floor, (s) => recordHeaders(s, headers, this.now())).catch(() => {});
   }
 
+  /** Explicit operator recovery for a confirmed-live account. Preserve learned rate limits,
+   * in-flight permits and minute counters; clear the shared pause too before reporting success. */
+  async operatorReadmit(): Promise<void> {
+    const before = this.state.pausedUntil;
+    const penaltyBefore = this.penaltySeq;
+    if (this.store) {
+      await this.store.transact(this.storeKey!, this.floor, (s) => { s.pausedUntil = 0; });
+    }
+    // A new upstream penalty received during the shared write remains authoritative.
+    if (this.state.pausedUntil !== before || this.penaltySeq !== penaltyBefore) return;
+    this.state.pausedUntil = this.now();
+    if (before > 0) this.notifyResumed();
+    this.state.pausedUntil = 0;
+  }
+
   penalize(opts: { retryAfterMs?: number; resetAt?: number; maxPauseMs?: number; transport?: boolean; rateLimited?: boolean }): void {
     const before = this.state.pausedUntil;
     // ADAPTIVE rpm (2026-06-22): a RATE 429 (a transient per-minute/burst throttle) means the prediction was too
