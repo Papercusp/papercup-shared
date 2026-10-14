@@ -816,6 +816,57 @@ function makeMemStore() {
   };
 }
 
+test('operatorReadmit clears local and shared pauses while preserving learned limits and active permits', async () => {
+  const clock = 1_000_000;
+  const store = makeMemStore();
+  let resumed = 0;
+  const deps = { now: () => clock, store, storeKey: 'anthropic:opus@recovered', onResumed: () => { resumed++; } };
+  const g = new RateLimitGovernor({ maxConcurrent: 5, rpm: 40 }, deps);
+  const release = await g.acquire();
+  assert.ok(release);
+  g.penalize({ retryAfterMs: 30_000, rateLimited: true });
+  await Promise.resolve();
+  const before = g.snapshot();
+  const sharedBefore = { ...store.rows.get(deps.storeKey)! };
+  assert.ok(before.pausedUntil > clock);
+  await g.operatorReadmit();
+  assert.equal(g.state.pausedUntil, 0);
+  assert.equal(store.rows.get(deps.storeKey)!.pausedUntil, 0);
+  assert.equal(g.state.inFlight, before.inFlight);
+  assert.equal(g.state.reqInWindow, before.reqInWindow);
+  assert.equal(g.state.rpmFactor, before.rpmFactor);
+  assert.equal(g.state.lastAcquireAt, before.lastAcquireAt);
+  assert.equal(store.rows.get(deps.storeKey)!.reqInWindow, sharedBefore.reqInWindow);
+  assert.equal(store.rows.get(deps.storeKey)!.rpmFactor, sharedBefore.rpmFactor);
+  assert.equal(resumed, 1);
+  release();
+  const peer = new RateLimitGovernor({ maxConcurrent: 5, rpm: 40 }, deps);
+  const next = await peer.acquire({}, { maxWaitMs: 0 });
+  assert.ok(next, 'a peer process no longer reloads the cleared pause');
+  next();
+});
+
+test('operatorReadmit keeps a newer penalty received while shared recovery is in flight', async () => {
+  const clock = 1_000_000;
+  let finish!: () => void;
+  const blocked = new Promise<void>((resolve) => { finish = resolve; });
+  const shared = initGovernorState({ maxConcurrent: 5 });
+  const store = { async transact(_key: string, _floor: GovernorLimits, mutate: (s: GovernorState) => void) {
+    await blocked;
+    mutate(shared);
+    return shared;
+  } };
+  const g = new RateLimitGovernor({ maxConcurrent: 5 }, { now: () => clock, store, storeKey: 'anthropic:opus@recovered' });
+  g.state.pausedUntil = clock + 1000;
+  const readmit = g.operatorReadmit();
+  g.penalize({ retryAfterMs: 30_000 });
+  const newerPause = g.state.pausedUntil;
+  finish();
+  await readmit;
+  assert.equal(g.state.pausedUntil, newerPause);
+  assert.equal(shared.pausedUntil, newerPause);
+});
+
 test('RateLimitGovernor[store] — a 429 penalty on ONE governor pauses the OTHER (shared budget)', async () => {
   let clock = 1000;
   const store = makeMemStore();
