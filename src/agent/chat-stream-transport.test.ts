@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
@@ -25,7 +25,10 @@ const sdk = vi.hoisted(() => ({ fetch: undefined as typeof fetch | undefined,
   real: undefined as typeof import('@anthropic-ai/sdk').default | undefined }));
 vi.mock('node:fs', async importOriginal => {
   const original = await importOriginal<typeof import('node:fs')>();
-  return { ...original, readFileSync: (path: Parameters<typeof original.readFileSync>[0], ...args: unknown[]) => {
+  return { ...original,
+    existsSync: (path: Parameters<typeof original.existsSync>[0]) =>
+      (String(path).endsWith('.claude/.credentials.json') && sdk.credential !== undefined) || original.existsSync(path),
+    readFileSync: (path: Parameters<typeof original.readFileSync>[0], ...args: unknown[]) => {
     if (String(path).endsWith('.claude/.credentials.json') && sdk.credential !== undefined) return JSON.stringify({ claudeAiOauth: { accessToken: sdk.credential } });
     return (original.readFileSync as (...args: unknown[]) => unknown)(path, ...args);
   } };
@@ -213,6 +216,109 @@ describe('assignment-private Codex evidence lifecycle (WI-10007969)', () => {
       await collect({ backend: 'claude-code', promptText: 'fixture', isolateConfig: true, isolateDir: home });
       expect(existsSync(home)).toBe(true);
     } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+});
+
+describe('assignment-private Claude transport (WI-6554700010010004)', () => {
+  const gateway = { baseURL: 'http://127.0.0.1:32123', token: 'fixture_private_token_01234567890123456789' };
+  const id = '00000000-0000-0000-0000-000000000456';
+  const frames = [
+    { type: 'system', subtype: 'init', session_id: id },
+    { type: 'result', result: 'fixture', total_cost_usd: 0 },
+  ].map(frame => JSON.stringify(frame)).join('\n') + '\n';
+  const collect = async (extra: Partial<RunAgentChatOptions> = {}) => {
+    const events = [];
+    for await (const event of runAgentChat({ backend: 'claude-code', promptText: 'fixture',
+      isolateConfig: true, statelessGateway: gateway, ...extra })) events.push(event);
+    return events;
+  };
+
+  it('snapshots the private route, excludes ambient credentials/settings, and retains native evidence', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'claude-private-evidence-'));
+    sdk.credential = 'host-oauth';
+    for (const key of ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_CUSTOM_HEADERS',
+      'CLAUDE_CODE_OAUTH_TOKEN', 'AWS_SECRET_ACCESS_KEY', 'PAPERCUSP_ACCOUNT_ID', 'NODE_OPTIONS']) vi.stubEnv(key, 'ambient-secret');
+    vi.stubEnv('ANTHROPIC_BASE_URL', 'https://ambient.invalid');
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', ''); vi.stubEnv('PAPERCUSP_AGENT_DEBUG', '');
+    const route = { ...gateway };
+    const onNativeSession = vi.fn();
+    const spawnProcess = vi.fn(async (command, args, options) => spawn(command, args, options));
+    const before = vi.mocked(spawn).mock.calls.length;
+    nativeByteStream(frames, '', 0, () => writeFileSync(join(home, 'transcript.jsonl'), frames));
+    configureAgentSpawnTransform(request => {
+      expect(request.backend).toBe('claude-code');
+      expect(request.stagedDirs).toContainEqual({ path: home, persistent: true });
+      route.baseURL = 'http://127.0.0.1:1'; route.token = 'mutated';
+      return { ...request, command: 'private-claude-transport' };
+    });
+    try {
+      const events = await collect({ isolateDir: home, statelessGateway: route, onNativeSession, spawnProcess });
+      expect(events.some(event => event.type === 'result')).toBe(true);
+      const [command, args, options] = vi.mocked(spawn).mock.calls[before];
+      expect(command).toBe('private-claude-transport');
+      expect(spawnProcess).toHaveBeenCalledOnce();
+      expect(spawnProcess.mock.calls[0][0]).toBe(command);
+      expect(args).toEqual(expect.arrayContaining(['--setting-sources', '', '--strict-mcp-config']));
+      expect(options?.env).toMatchObject({ HOME: home, CLAUDE_CONFIG_DIR: home,
+        ANTHROPIC_BASE_URL: gateway.baseURL, ANTHROPIC_AUTH_TOKEN: gateway.token });
+      for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_CUSTOM_HEADERS', 'CLAUDE_CODE_OAUTH_TOKEN',
+        'AWS_SECRET_ACCESS_KEY', 'PAPERCUSP_ACCOUNT_ID', 'NODE_OPTIONS']) expect(options?.env?.[key]).toBeUndefined();
+      expect(lstatSync(join(home, '.credentials.json'), { throwIfNoEntry: false })).toBeUndefined();
+      expect(readFileSync(join(home, 'transcript.jsonl'), 'utf8')).toBe(frames);
+      expect(onNativeSession).toHaveBeenCalledExactlyOnceWith(id);
+      expect(process.env.ANTHROPIC_AUTH_TOKEN).toBe('ambient-secret');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('cleans temporary private config after completion', async () => {
+    vi.stubEnv('PAPERCUSP_AGENT_GOVERNOR', ''); vi.stubEnv('PAPERCUSP_AGENT_DEBUG', '');
+    const before = vi.mocked(spawn).mock.calls.length;
+    nativeByteStream(frames);
+    await collect();
+    const config = vi.mocked(spawn).mock.calls[before][2]?.env?.CLAUDE_CONFIG_DIR;
+    expect(config).toBeTruthy();
+    expect(existsSync(config!)).toBe(false);
+  });
+
+  it('observes only a valid native init UUID, independently of the requested session', async () => {
+    const onNativeSession = vi.fn();
+    nativeByteStream([
+      { type: 'system', subtype: 'init', session_id: 'invalid-id' },
+      { type: 'result', session_id: id, result: 'fixture', total_cost_usd: 0 },
+    ].map(frame => JSON.stringify(frame)).join('\n') + '\n');
+    await collect({ sessionId: id, onNativeSession });
+    expect(onNativeSession).not.toHaveBeenCalled();
+  });
+
+  it('retains caller evidence when host enrollment refuses without an untracked fallback', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'claude-private-refusal-'));
+    writeFileSync(join(home, 'prior.jsonl'), 'prior evidence');
+    const before = vi.mocked(spawn).mock.calls.length;
+    try {
+      const events = await collect({ isolateDir: home, spawnProcess: async () => { throw new Error('enrollment refused'); } });
+      expect(events).toContainEqual(expect.objectContaining({ type: 'error', message: expect.stringContaining('enrollment refused') }));
+      expect(vi.mocked(spawn).mock.calls.length).toBe(before);
+      expect(readFileSync(join(home, 'prior.jsonl'), 'utf8')).toBe('prior evidence');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    { isolateConfig: false },
+    { isolateDir: 'relative-home' },
+    { backend: 'omp' },
+    { codexGateway: gateway },
+    { routeAccountId: 'ambient-account' },
+    { statelessGateway: { ...gateway, baseURL: 'https://outside.invalid' } },
+    { statelessGateway: { ...gateway, token: 'short' } },
+    { agentCmd: 'claude --settings=/tmp/ambient.json' },
+    { agentCmd: 'claude --setting-sources user' },
+    { agentCmd: 'claude --mcp-config /tmp/ambient.json' },
+    { requireOutputTokenLimit: true, maxTokens: 1 },
+    { authorizeStatelessRequest: async () => () => {} },
+  ])('refuses unsupported policies and conflicting routes before any spawn: %j', async extra => {
+    const before = vi.mocked(spawn).mock.calls.length;
+    await expect(collect(extra as Partial<RunAgentChatOptions>)).rejects.toMatchObject({ costUsd: 0 });
+    expect(vi.mocked(spawn).mock.calls.length).toBe(before);
   });
 });
 

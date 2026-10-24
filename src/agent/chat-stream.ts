@@ -661,6 +661,8 @@ export interface RunAgentChatOptions {
   authorizeStatelessRequest?: StatelessRequestAuthorizer;
   /** Trusted host's scoped loopback gateway, copied before async work. Uses
    * this exact route/token for retries; never falls back to local credentials.
+   * Also supports an isolated Claude native CLI with a private controller;
+   * stateless policy hooks remain unsupported on native backends.
    * Provider authorization remains the gateway controller's responsibility. */
   statelessGateway?: Pick<StatelessTransport, 'baseURL' | 'token'>;
   /** Trusted host's assignment-private Codex controller. Requires isolated
@@ -2371,9 +2373,17 @@ export async function* runAgentChat(
     try { opts = { ...opts, codexGateway: snapshotScopedInferenceGateway(opts.codexGateway) }; }
     catch { throw Object.assign(new Error('Invalid private Codex gateway binding'), { costUsd: 0 }); }
   }
-  if (resolveBackend(opts) === 'codex' && opts.isolateDir !== undefined &&
+  if (['codex', 'claude-code'].includes(resolveBackend(opts)) && opts.isolateDir !== undefined &&
       (opts.isolateConfig !== true || !isAbsolute(opts.isolateDir))) {
-    throw Object.assign(new Error('Caller-owned Codex home requires isolated config and an absolute path'), { costUsd: 0 });
+    throw Object.assign(new Error('Caller-owned native home requires isolated config and an absolute path'), { costUsd: 0 });
+  }
+  if (opts.statelessGateway !== undefined && resolveBackend(opts) === 'claude-code') {
+    if (opts.isolateConfig !== true || opts.codexGateway !== undefined || opts.routeAccountId !== undefined ||
+        /(?:^|\s)--(?:settings|setting-sources|mcp-config|plugin-dir|bare)(?:=|\s|$)/.test(opts.agentCmd ?? '')) {
+      throw Object.assign(new Error('Private Claude routing requires isolated config without conflicting route overrides'), { costUsd: 0 });
+    }
+    try { opts = { ...opts, statelessGateway: snapshotScopedInferenceGateway(opts.statelessGateway) }; }
+    catch { throw Object.assign(new Error('Invalid private Claude gateway binding'), { costUsd: 0 }); }
   }
   if (opts.routeAccountId !== undefined) {
     if (!opts.routeAccountId.trim() || /[\r\n]/.test(opts.routeAccountId) ||
@@ -2382,7 +2392,8 @@ export async function* runAgentChat(
     }
     opts = { ...opts, routeAccountId: opts.routeAccountId.trim() };
   }
-  if (opts.requireOutputTokenLimit || opts.authorizeStatelessRequest !== undefined || opts.statelessGateway !== undefined) {
+  if (opts.requireOutputTokenLimit || opts.authorizeStatelessRequest !== undefined ||
+      (opts.statelessGateway !== undefined && resolveBackend(opts) !== 'claude-code')) {
     opts = { ...opts, ...(opts.messages ? { messages: opts.messages.map(message => ({ ...message })) } : {}),
       ...(opts.statelessGateway === undefined ? {} : { statelessGateway: Object.freeze({ ...opts.statelessGateway }) }) };
     if (opts.statelessGateway !== undefined) resolveStatelessTransport(undefined, opts.statelessGateway);
@@ -2511,6 +2522,7 @@ export async function* runAgentChat(
 
   if (backend === 'claude-code') {
     args.push('-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages');
+    if (opts.statelessGateway) args.push('--setting-sources', '', '--strict-mcp-config');
     if (opts.model) args.push(...claudeModelSelectionArgs(opts.model));
     if (opts.mcpConfig) {
       args.push('--mcp-config', JSON.stringify(opts.mcpConfig));
@@ -2552,16 +2564,31 @@ export async function* runAgentChat(
       } else {
         claudeConfigDir = mkdtempSync(join(tmpdir(), 'claude-chat-'));
       }
-      try {
-        const realCreds = join(homedir(), '.claude', '.credentials.json');
-        const linkPath = join(claudeConfigDir, '.credentials.json');
-        if (existsSync(realCreds) && !existsSync(linkPath)) {
-          symlinkSync(realCreds, linkPath);
+      if (!opts.statelessGateway) {
+        try {
+          const realCreds = join(homedir(), '.claude', '.credentials.json');
+          const linkPath = join(claudeConfigDir, '.credentials.json');
+          if (existsSync(realCreds) && !existsSync(linkPath)) {
+            symlinkSync(realCreds, linkPath);
+          }
+        } catch (err) {
+          console.warn('[chat-stream] claude-code: failed to symlink credentials:', err);
         }
-      } catch (err) {
-        console.warn('[chat-stream] claude-code: failed to symlink credentials:', err);
       }
       spawnEnv = { ...process.env, CLAUDE_CONFIG_DIR: claudeConfigDir };
+      if (opts.statelessGateway) {
+        // A private assignment inherits runtime essentials only. Host provider
+        // keys, alternate cloud routes, Node injection and account pins must
+        // not compete with this controller or expose unrelated credentials.
+        spawnEnv = {};
+        for (const key of ['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'SHELL', 'TMPDIR', 'TMP', 'TEMP']) {
+          if (process.env[key] !== undefined) spawnEnv[key] = process.env[key];
+        }
+        Object.assign(spawnEnv, { HOME: claudeConfigDir, CLAUDE_CONFIG_DIR: claudeConfigDir,
+          XDG_CONFIG_HOME: join(claudeConfigDir, '.config'),
+          ANTHROPIC_BASE_URL: opts.statelessGateway.baseURL, ANTHROPIC_AUTH_TOKEN: opts.statelessGateway.token,
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', DISABLE_AUTOUPDATER: '1' });
+      }
     }
     // Tool-search toggle (disableToolSearch → ENABLE_TOOL_SEARCH=false) + the gateway
     // admission-tier header (priority → ANTHROPIC_CUSTOM_HEADERS `x-papercusp-priority`,
@@ -3075,6 +3102,10 @@ export async function* runAgentChat(
 
   const handleClaudeEvent = (ev: any) => {
     const inner = ev.type === 'stream_event' && ev.event ? ev.event : ev;
+    if (ev.type === 'system' && ev.subtype === 'init' && typeof ev.session_id === 'string' &&
+        /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(ev.session_id)) {
+      opts.onNativeSession?.(ev.session_id);
+    }
 
     if (opts.onToolResult && ev.type === 'assistant') {
       for (const block of ev.message?.content ?? []) {
