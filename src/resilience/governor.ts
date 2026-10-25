@@ -664,7 +664,7 @@ export interface AcquireOpts {
 export class RateLimitGovernor {
   readonly state: GovernorState;
   private readonly now: () => number;
-  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly onPause?: (ev: GovernorPauseEvent) => void;
   private readonly onResumed?: () => void;
   private lastResumedPause = 0;
@@ -684,7 +684,16 @@ export class RateLimitGovernor {
     this.state = initGovernorState(limits);
     this.floor = { ...limits };
     this.now = deps.now ?? (() => Date.now());
-    this.sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.sleep = deps.sleep ?? ((ms, signal) => new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      signal?.addEventListener('abort', done, { once: true });
+      if (signal?.aborted) done();
+    }));
     this.onPause = deps.onPause;
     this.onResumed = deps.onResumed;
     this.store = deps.store;
@@ -935,7 +944,7 @@ export class RateLimitGovernor {
           const cleanup = () => signal.removeEventListener('abort', onAbort);
           signal.addEventListener('abort', onAbort, { once: true });
           if (signal.aborted) { onAbort(); return; }
-          Promise.resolve().then(() => this.sleep(w)).then(
+          Promise.resolve().then(() => signal.aborted ? undefined : this.sleep(w, signal)).then(
             () => { cleanup(); resolve(); },
             error => { cleanup(); reject(error); },
           );
