@@ -924,7 +924,23 @@ export class RateLimitGovernor {
         return null; // would wait too long → give up, let the caller decide
       }
       waited += w;
-      await this.sleep(w);
+      // A caller leaving during a long rate pause must release admission now,
+      // rather than retain the account's start queue until the whole pause ends.
+      const signal = opts.signal;
+      if (!signal) {
+        await this.sleep(w);
+      } else {
+        await new Promise<void>((resolve, reject) => {
+          const onAbort = () => { cleanup(); resolve(); };
+          const cleanup = () => signal.removeEventListener('abort', onAbort);
+          signal.addEventListener('abort', onAbort, { once: true });
+          if (signal.aborted) { onAbort(); return; }
+          Promise.resolve().then(() => this.sleep(w)).then(
+            () => { cleanup(); resolve(); },
+            error => { cleanup(); reject(error); },
+          );
+        });
+      }
     }
   }
 

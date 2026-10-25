@@ -27,6 +27,31 @@ import {
 
 const MIN = 60_000;
 
+test('abort interrupts a pending governor sleep without waiting for the pause to expire', async () => {
+  let enter!: () => void;
+  let finishSleep!: () => void;
+  const sleeping = new Promise<void>(resolve => { enter = resolve; });
+  const pendingSleep = new Promise<void>(resolve => { finishSleep = resolve; });
+  const governor = new RateLimitGovernor({ maxConcurrent: 1 }, {
+    now: () => 1000,
+    sleep: () => { enter(); return pendingSleep; },
+  });
+  governor.state.pausedUntil = 61_000;
+  const controller = new AbortController();
+  const pending = governor.acquire({}, { signal: controller.signal });
+  await sleeping;
+  controller.abort();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([pending, new Promise<string>(resolve => {
+      timer = setTimeout(() => resolve('still sleeping'), 100);
+    })]);
+    assert.equal(result, null);
+    assert.equal(governor.state.inFlight, 0);
+    assert.equal(governor.state.reqInWindow, 0);
+  } finally { clearTimeout(timer); finishSleep(); await pending; }
+});
+
 /** A tiny in-memory fleet-wide gate for the D-004 tests. */
 function fakeGate(cap: number): GlobalConcurrencyGate {
   let inFlight = 0;
