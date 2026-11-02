@@ -28,6 +28,8 @@ export interface GovernorLimits {
   maxConcurrent: number;
   /** Requests per minute (provider RPM); undefined = unknown/unlimited. */
   rpm?: number;
+  /** True only for a provider-reported RPM limit; otherwise rpm is a probe seed. */
+  rpmFromHeaders?: boolean;
   /** Input tokens per minute. */
   itpm?: number;
   /** Output tokens per minute. */
@@ -49,10 +51,9 @@ export interface GovernorState {
    */
   paceDelayMs: number;
   lastAcquireAt: number; // epoch ms of the last granted acquire (anchors the pace gap)
-  /** ADAPTIVE per-account RPM factor ∈ [RPM_AIMD_MIN_FACTOR, 1] (2026-06-22). Multiplies `limits.rpm` so the
-   *  governor paces to the account's LEARNED sustainable rate, not just the static floor. A rate-429 halves it;
-   *  it recovers linearly to 1 over RPM_AIMD_RECOVER_MS. Optional (undefined ⇒ 1 = the configured floor, legacy
-   *  behaviour). Paired with `rpmFactorAt` (when it was last set) to compute the time-decayed effective value. */
+  /** Learned per-account rate relative to the initial RPM seed, with no upper bound.
+   * Successful gateway responses add capacity; a rate-429 halves it. Below the seed,
+   * time also recovers the factor toward 1. Undefined means the initial seed. */
   rpmFactor?: number;
   rpmFactorAt?: number; // epoch ms the rpmFactor was last DECREASED (anchors the linear recovery)
   /**
@@ -202,9 +203,10 @@ const MAX_PACE_DELAY_MS = 5_000;
 // SUBSCRIPTION account exposes NO per-minute headroom headers, so `limits.rpm` is a STATIC conservative floor
 // the governor can never learn DOWN — an account whose real sustainable rate is below the floor (e.g. Anthropic
 // soft-throttled it) keeps getting paced at the floor and keeps 429ing. This is the per-account-RATE analog of
-// the GLOBAL concurrency AIMD: a learned `rpmFactor∈[MIN,1]` multiplies the floor. A RATE 429 (transient
+// the GLOBAL concurrency AIMD: a learned rpmFactor multiplies the seed. Successful upstream responses
+// add 1 RPM with no artificial maximum. A RATE 429 (transient
 // burst-throttle — NOT a 5h/7d usage cap, NOT a transport stall) HALVES it ("the prediction was too high"); it
-// then RECOVERS linearly back to 1 over RECOVER_MS ("probe for more headroom") so a transient throttle doesn't
+// then RECOVERS linearly toward the seed over RECOVER_MS; clean responses probe beyond it, so a transient throttle doesn't
 // permanently cap the account. decideRate paces to `floor × effectiveRpmFactor`, so the existing rpm wait-gate
 // now holds requests at each account's LEARNED rate → it stops walking into the same 429. Env-tunable.
 const RPM_AIMD_DECREASE = Number(process.env.PAPERCUSP_GATEWAY_RPM_AIMD_DECREASE) || 0.5;
@@ -262,14 +264,15 @@ function windowUsage(s: GovernorState, now: number): { req: number; inTok: numbe
   return { req: s.reqInWindow, inTok: s.inTokInWindow, outTok: s.outTokInWindow };
 }
 
-/** The time-decayed adaptive RPM factor at `now` ∈ [RPM_AIMD_MIN_FACTOR, 1] (2026-06-22). A rate-429 dropped
+/** The time-decayed adaptive RPM factor at `now`. A rate-429 dropped
  *  `rpmFactor` (multiplicative decrease, anchored at `rpmFactorAt`); here it RECOVERS linearly back to 1 over
  *  RPM_AIMD_RECOVER_MS, so a transient throttle paces the account hard right after the 429 and eases back as it
  *  proves it can sustain more. Pure (no mutation) — decideRate reads it; penalize anchors a fresh decrease.
  *  Undefined `rpmFactor` ⇒ 1 (legacy: pace to the configured floor unchanged). */
 export function effectiveRpmFactor(s: GovernorState, now: number): number {
   const base = s.rpmFactor;
-  if (base === undefined || base >= 1) return 1;
+  if (base === undefined) return 1;
+  if (base >= 1) return base;
   const since = Math.max(0, now - (s.rpmFactorAt ?? 0));
   return Math.min(1, base + since / RPM_AIMD_RECOVER_MS);
 }
@@ -280,7 +283,8 @@ export function effectiveRpmFactor(s: GovernorState, now: number): number {
  *  on it AND /stats surfaces it (hive-inference-gateway P-005). */
 export function effectiveRpm(s: GovernorState, now: number): number | null {
   if (s.limits.rpm === undefined) return null;
-  return Math.max(1, Math.floor(s.limits.rpm * effectiveRpmFactor(s, now)));
+  const learned = s.limits.rpm * effectiveRpmFactor(s, now);
+  return Math.max(1, Math.floor(s.limits.rpmFromHeaders ? Math.min(s.limits.rpm, learned) : learned));
 }
 
 /** PURE: the EFFECTIVE inter-request pace (ms) the rate gate enforces between acquisitions at `now`.
@@ -441,7 +445,16 @@ export function recordHeaders(s: GovernorState, headers: Record<string, string |
     return Number.isFinite(n) ? n : undefined;
   };
   const rpm = num(h['anthropic-ratelimit-requests-limit'] ?? h['x-ratelimit-limit-requests']);
-  if (rpm !== undefined) s.limits.rpm = rpm;
+  if (rpm !== undefined && rpm > 0) {
+    s.limits.rpm = rpm;
+    s.limits.rpmFromHeaders = true;
+    // An observed provider limit replaces the unknown seed. Preserve a learned
+    // reduction, but never carry a seed-relative multiplier above that limit.
+    if (s.rpmFactor !== undefined) {
+      s.rpmFactor = Math.min(1, effectiveRpmFactor(s, now));
+      s.rpmFactorAt = now;
+    }
+  }
   const itpm = num(h['anthropic-ratelimit-input-tokens-limit']);
   if (itpm !== undefined) s.limits.itpm = itpm;
   const otpm = num(h['anthropic-ratelimit-output-tokens-limit']);
@@ -953,12 +966,25 @@ export class RateLimitGovernor {
     }
   }
 
-  recordResponse(headers: Record<string, string | undefined>): void {
+  recordResponse(headers: Record<string, string | undefined>, status?: number): void {
     const before = this.state.pausedUntil;
-    recordHeaders(this.state, headers, this.now());
+    const now = this.now();
+    const observe = (s: GovernorState) => {
+      recordHeaders(s, headers, now);
+      // Only explicit successful upstream feedback earns growth. Releasing a
+      // cancelled/error attempt is not success. Both gateway providers use this
+      // rule; generic callers without status keep their existing behavior.
+      if (status !== undefined && status >= 200 && status < 300 &&
+          s.limits.rpm !== undefined && s.limits.rpm > 0 && !s.limits.rpmFromHeaders &&
+          s.pausedUntil <= now) {
+        s.rpmFactor = effectiveRpmFactor(s, now) + 1 / s.limits.rpm;
+        s.rpmFactorAt = now;
+      }
+    };
+    observe(this.state);
     this.notifyPauseIfExtended(before, 'headers');
     // Converge the shared budget too (best-effort; the shared row is authoritative cross-process).
-    if (this.store) void this.store.transact(this.storeKey!, this.floor, (s) => recordHeaders(s, headers, this.now())).catch(() => {});
+    if (this.store) void this.store.transact(this.storeKey!, this.floor, observe).catch(() => {});
   }
 
   /** Explicit operator recovery for a confirmed-live account. Preserve learned rate limits,

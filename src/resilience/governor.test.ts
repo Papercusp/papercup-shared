@@ -27,6 +27,68 @@ import {
 
 const MIN = 60_000;
 
+test('successful gateway traffic probes above the RPM seed without an artificial maximum', () => {
+  const g = new RateLimitGovernor({ maxConcurrent: 100, rpm: 45 }, { now: () => 1_000_000 });
+  g.state.smoothRpm = true;
+  for (let i = 0; i < 10_000; i++) g.recordResponse({}, 200);
+  assert.ok(effectiveRpm(g.state, 1_000_000)! >= 10_044);
+  const learned = effectiveRpmFactor(g.state, 1_000_000);
+  assert.ok(learned > 200, 'a seed-relative factor above 1 must survive reads');
+  assert.equal(effectiveRpmFactor(g.state, 2_000_000), learned, 'idle time does not erase learned capacity');
+  g.penalize({ rateLimited: true, retryAfterMs: 1 });
+  assert.equal(g.state.rpmFactor, learned * 0.5, 'real rate feedback halves the learned rate');
+});
+
+test('failed, cancelled and unclassified responses do not earn RPM growth', async () => {
+  const g = new RateLimitGovernor({ maxConcurrent: 10, rpm: 45 }, { now: () => 1_000_000 });
+  g.state.smoothRpm = true;
+  for (const status of [undefined, 400, 429, 499, 500, 503]) g.recordResponse({}, status);
+  const release = await g.acquire();
+  release?.();
+  assert.equal(effectiveRpmFactor(g.state, 1_000_000), 1);
+  g.recordResponse({}, 200);
+  assert.ok(effectiveRpmFactor(g.state, 1_000_000) > 1);
+});
+
+test('upward learning also works when RPM smoothing is disabled', () => {
+  const g = new RateLimitGovernor({ maxConcurrent: 10, rpm: 45 }, { now: () => 1_000_000 });
+  g.recordResponse({}, 200);
+  assert.ok(effectiveRpm(g.state, 1_000_000)! > 45);
+});
+
+test('provider-reported RPM is authoritative even when later responses omit the header', () => {
+  let clock = 1_000_000;
+  const g = new RateLimitGovernor({ maxConcurrent: 10, rpm: 45 }, { now: () => clock });
+  g.state.smoothRpm = true;
+  g.state.rpmFactor = 10;
+  g.recordResponse({ 'x-ratelimit-limit-requests': '120' }, 200);
+  for (let i = 0; i < 200; i++) g.recordResponse({}, 200);
+  assert.equal(effectiveRpm(g.state, clock), 120);
+  assert.equal(g.state.limits.rpmFromHeaders, true);
+  g.penalize({ rateLimited: true, retryAfterMs: 1 });
+  assert.equal(effectiveRpm(g.state, clock), 60);
+  clock += MIN;
+  const recovered = effectiveRpm(g.state, clock)!;
+  g.recordResponse({ 'x-ratelimit-limit-requests': '120' }, 200);
+  assert.equal(effectiveRpm(g.state, clock), recovered, 're-reading headers does not double time recovery');
+});
+
+test('shared successful feedback raises each provider account rate across governor instances', async () => {
+  for (const provider of ['openai', 'anthropic']) {
+    const store = makeMemStore();
+    const deps = { now: () => 1_000_000, store, storeKey: `${provider}:default@adaptive` };
+    const a = new RateLimitGovernor({ maxConcurrent: 10, rpm: 45 }, deps);
+    a.state.smoothRpm = true;
+    for (let i = 0; i < 100; i++) a.recordResponse({}, 200);
+    const b = new RateLimitGovernor({ maxConcurrent: 10, rpm: 45 }, deps);
+    b.state.smoothRpm = true;
+    const release = await b.acquire();
+    release?.();
+    assert.ok(effectiveRpm(b.state, 1_000_000)! >= 144, `${provider} inherits growth above the seed`);
+    assert.equal(effectiveRpmFactor(b.state, 1_000_000), effectiveRpmFactor(a.state, 1_000_000));
+  }
+});
+
 test('abort interrupts a pending governor sleep without waiting for the pause to expire', async () => {
   let enter!: () => void;
   let finishSleep!: () => void;
