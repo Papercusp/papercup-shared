@@ -205,6 +205,18 @@ describe('agentExitErrorMessage', () => {
 });
 
 describe('runAgentChat — backend failure reaches the terminal error (end to end)', () => {
+  it('reports the spawn cause instead of an opaque null exit code', async () => {
+    const missingCommand = join(dir, 'missing-agent-cli');
+    const err = terminalError(await collect({
+      backend: 'claude-code',
+      agentCmd: missingCommand,
+      promptText: 'Reply OK',
+    }));
+    expect(err.message).toContain(`failed to spawn ${missingCommand}: spawn ${missingCommand} ENOENT`);
+    expect(err.message).not.toContain('claude-code exited ?');
+    expect(err.stderr ?? '').toContain(`failed to spawn ${missingCommand}:`);
+  });
+
   it.each([0, 0.42])('retains reported Claude failure spend of $%s', async costUsd => {
     const cmd = fakeCli([{ type: 'result', is_error: true, result: 'tool failed after inference',
       total_cost_usd: costUsd, usage: { input_tokens: 12, output_tokens: 4 } }], 1);
