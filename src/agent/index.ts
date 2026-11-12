@@ -8,6 +8,8 @@
  */
 export {
   runAgentChat,
+  parseClaudeResultEvent,
+  type ClaudeResultUsage,
   setAgentConfigBootstrap,
   resolveBackend,
   resolveAgentBin,
