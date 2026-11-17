@@ -14,8 +14,8 @@ import type { AdmissionDenial } from '../resilience/governor';
 import {
   MODEL_CAPACITY_RE,
   MODEL_CAPACITY_RETRY_AFTER_MS,
-  modelCapacityRetryAfterMs,
 } from './model-capacity.mjs';
+import { classifyProviderError, MALFORMED_AUTH_HEADER_RE } from './provider-error.mjs';
 
 export { MODEL_CAPACITY_RE, MODEL_CAPACITY_RETRY_AFTER_MS };
 
@@ -205,35 +205,6 @@ function resetFromHeaders(headers: Record<string, string | undefined> | undefine
   }
   return undefined;
 }
-
-// Plan / subscription CAP — the account is capped until a reset window (often hours away), so
-// retrying is futile: pause the fleet + surface the reset, don't hammer the wall. Covers the
-// Claude Code subscription lockout ("You've hit your usage limit · resets 4:20am" / "session
-// limit" / "5-hour limit") AND OpenAI/codex hard quota ("insufficient_quota"). Kept DISTINCT
-// from a transient RPM 429 (`RATE_RE`) because the disposition is opposite (D-001, Brief 20).
-const USAGE_LIMIT_RE =
-  /(usage limit|session limit|weekly limit|monthly limit|daily limit|\d+-?hour limit|hit your (?:session|usage|weekly|monthly|daily) limit|insufficient_quota|quota exceeded|exceeded your (?:current )?quota|out of (?:credits|quota))/i;
-// Transient acceleration / requests-per-minute 429 — back off the fleet briefly + retry. The
-// usage-cap phrases were SPLIT OUT into USAGE_LIMIT_RE above (D-001).
-const RATE_RE = /(\b429\b|rate.?limit|too many requests|slow down|temporarily limiting)/i;
-// Anthropic's TRANSIENT-overload line — "Server is temporarily limiting requests (not your usage
-// limit) · Rate limited" — contains the substring "usage limit", which would otherwise trip
-// USAGE_LIMIT_RE (a plan CAP: pause-until-far-reset, no retry) — the OPPOSITE disposition to the
-// transient 429 it actually is. This guard forces such text down the rate_limited (retry) path.
-const TRANSIENT_OVERRIDE_RE = /temporarily limiting|not (?:your|a) (?:usage|session|weekly|monthly|daily) limit/i;
-const OVERLOAD_RE = /(\b529\b|overloaded|service unavailable|\b50[0234]\b)/i;
-// Codex can surface a malformed/undecodable authorization header as a Rust WebSocket
-// conversion error rather than an HTTP 401/403. Treat this exact signature as an auth
-// failure so the loop does not retry a credential that cannot be encoded.
-const MALFORMED_AUTH_HEADER_RE = /failed to convert header to a str for header name ['"]authorization['"]/i;
-const AUTH_RE = /(\b401\b|\b403\b|\bunauthorized\b|\bforbidden\b|\binvalid api key\b|\bauthentication\b|failed to convert header to a str for header name ['"]authorization['"])/i;
-const IO_RE = /(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|network|fetch failed)/i;
-const TIMEOUT_RE = /(\b408\b|timed? ?out|deadline exceeded)/i;
-// A prompt that exceeds the model window is a launch/prompt-sizing defect, not a
-// transient provider wall. Keep this ahead of the 429/usage scans because some
-// provider messages include a generic API-error prefix alongside the real cause.
-const CONTEXT_OVERFLOW_RE =
-  /autocompact(?:ion)? is thrashing|prompt is too long|input (?:length )?is too long|\bcontext[_ -]?length[_ -]?exceeded\b|maximum context length|input length and `?max_tokens`? exceed|exceeds? the (?:model'?s )?maximum (?:context|(?:number of )?(?:input )?tokens)|reduce the length of (?:the )?(?:messages|prompt|input)/i;
 
 const AUTH_HEADER_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/;
 const MALFORMED_AUTH_SAMPLE_CHARS = 32;
@@ -486,14 +457,14 @@ export function classifyHttpError(
   const retryAfterMs = parseRetryAfterMs(headers?.['retry-after'] ?? headers?.['Retry-After'], now);
   const resetAt = resetFromHeaders(headers, now);
   const st = input.status;
-
-  if (CONTEXT_OVERFLOW_RE.test(msg)) return mk('context_overflow', msg, provider);
+  const failure = classifyProviderError({ status: st, message: msg });
 
   // A plan/usage CAP (429 w/ insufficient_quota, or a no-status message naming a usage cap) →
   // pause-until-reset + surface, do NOT retry. Checked before the transient-429 branch since the
   // disposition is opposite (D-001). The header reset (if any) IS the cap's reset time.
-  if (USAGE_LIMIT_RE.test(msg) && !TRANSIENT_OVERRIDE_RE.test(msg) && (st === 429 || st === undefined)) {
+  if (failure?.class === 'usage_limit') {
     return mk('usage_limit', msg, provider, {
+      retryable: failure.retryable,
       retryAfterMs,
       resetAt,
       // A `*-reset` header is the provider's own structured field — the highest-confidence reset
@@ -503,7 +474,7 @@ export function classifyHttpError(
       ...(input.admissionDenial ? { admissionDenial: input.admissionDenial } : {}),
     });
   }
-  if (st === 429 || (st === undefined && (RATE_RE.test(msg) || TRANSIENT_OVERRIDE_RE.test(msg)))) {
+  if (failure?.class === 'rate_limited') {
     // Fail-closed mint discipline (WI-5391 Part B): only a REAL HTTP 429 status attests a
     // capacity denial (`via:'http-429'`). The prose branch (no status, message merely LOOKS
     // rate-limity) mints NOTHING — that shape is indistinguishable from an admission-path
@@ -512,7 +483,8 @@ export function classifyHttpError(
     // 'rate_limited' for retry policy but COUNT as errors unless the governor attached a
     // typed denial itself.
     return mk('rate_limited', msg, provider, {
-      retryAfterMs,
+      retryable: failure.retryable,
+      retryAfterMs: retryAfterMs ?? failure.retryAfterMs,
       resetAt,
       // Stamped honestly (it IS a header-derived instant) even though a transient RPM bucket is
       // never a candidate for a long hold — the CLASS gate for that lives at the consumer
@@ -525,13 +497,10 @@ export function classifyHttpError(
           : {}),
     });
   }
-  if (st === 529 || st === 503 || st === 502 || st === 500 || st === 504 || (st === undefined && OVERLOAD_RE.test(msg))) {
-    return mk('overloaded', msg, provider, { retryAfterMs });
-  }
-  if (st === 408 || (st === undefined && TIMEOUT_RE.test(msg))) return mk('timeout', msg, provider);
-  if (st === 401 || st === 403 || (st === undefined && AUTH_RE.test(msg))) return mk('auth', msg, provider);
-  if (st === undefined && IO_RE.test(msg)) return mk('transient_io', msg, provider);
-  if (st !== undefined && st >= 400 && st < 500) return mk('permanent', msg, provider);
+  if (failure) return mk(failure.class, msg, provider, {
+    retryable: failure.retryable,
+    ...(failure.retryable ? { retryAfterMs: retryAfterMs ?? failure.retryAfterMs } : {}),
+  });
   if (st === undefined) return mk('transient_io', msg, provider); // unknown w/ no status: treat as a retryable blip
   return mk('permanent', msg, provider);
 }
@@ -558,56 +527,16 @@ export function classifySubprocessResult(
   if (MALFORMED_AUTH_HEADER_RE.test(scan)) {
     return mk('auth', formatMalformedAuthorizationDiagnostic(scan), provider);
   }
-  // Prompt-size deaths are terminal until the launch configuration or prompt is
-  // fixed. Detect them before provider-wall patterns so a descriptive 400/429
-  // wrapper cannot turn a context failure into a retryable backoff class.
-  if (CONTEXT_OVERFLOW_RE.test(scan)) {
-    const message = errText.slice(0, 200) || 'context window exceeded';
-    return mk('context_overflow', message, provider, classifiedOnFrom(scan, CONTEXT_OVERFLOW_RE, message));
-  }
-  // Codex's native CLI emits this capacity wording on a failed subprocess without exposing the
-  // structured 429/503 response. Treat it as a transient, model-scoped rate-limit condition so
-  // runAgentTurn waits a minute before retrying instead of misclassifying it as agent_crash.
-  if (MODEL_CAPACITY_RE.test(scan)) {
-    const message = errText.slice(0, 200) || 'selected model is at capacity';
-    return mk('rate_limited', message, provider, {
-      retryAfterMs: modelCapacityRetryAfterMs(scan),
-      ...classifiedOnFrom(scan, MODEL_CAPACITY_RE, message),
+  const failure = classifyProviderError({ message: scan });
+  if (failure) {
+    const message = errText.slice(0, 200) || failure.class;
+    const reset = failure.class === 'usage_limit' ? parseUsageReset(scan, now) : undefined;
+    return mk(failure.class, message, provider, {
+      retryable: failure.retryable,
+      ...(failure.retryAfterMs !== undefined ? { retryAfterMs: failure.retryAfterMs } : {}),
+      ...(reset ? { resetAt: reset.atMs, resetPrecision: reset.precision } : {}),
+      ...(failure.pattern ? classifiedOnFrom(scan, failure.pattern, message) : {}),
     });
-  }
-  // Plan/usage CAP first (opposite disposition to a transient 429): pause-until-reset + surface,
-  // no retry. The CLI prints the reset in the message ("resets 4:20am"), so parse it best-effort.
-  if (USAGE_LIMIT_RE.test(scan) && !TRANSIENT_OVERRIDE_RE.test(scan)) {
-    const reset = parseUsageReset(scan, now);
-    const message = errText.slice(0, 200) || 'usage limit reached';
-    return mk('usage_limit', message, provider, {
-      ...(reset !== undefined ? { resetAt: reset.atMs, resetPrecision: reset.precision } : {}),
-      ...classifiedOnFrom(scan, USAGE_LIMIT_RE, message),
-    });
-  }
-  if (RATE_RE.test(scan)) {
-    // Some CLIs print "retry after 30s" / "try again in 12 seconds".
-    const m = /(?:retry after|try again in|wait)\s+(\d+(?:\.\d+)?)\s*(s|sec|seconds|m|min|minutes|ms)?/i.exec(scan);
-    let retryAfterMs: number | undefined;
-    if (m) {
-      const n = parseFloat(m[1]);
-      const unit = (m[2] ?? 's').toLowerCase();
-      retryAfterMs = unit.startsWith('ms') ? n : unit.startsWith('m') ? n * 60_000 : n * 1000;
-    }
-    const message = errText.slice(0, 200) || 'rate limited';
-    return mk('rate_limited', message, provider, { retryAfterMs, ...classifiedOnFrom(scan, RATE_RE, message) });
-  }
-  if (OVERLOAD_RE.test(scan)) {
-    const message = errText.slice(0, 200);
-    return mk('overloaded', message, provider, classifiedOnFrom(scan, OVERLOAD_RE, message));
-  }
-  if (AUTH_RE.test(scan)) {
-    const message = errText.slice(0, 200);
-    return mk('auth', message, provider, classifiedOnFrom(scan, AUTH_RE, message));
-  }
-  if (IO_RE.test(scan)) {
-    const message = errText.slice(0, 200);
-    return mk('transient_io', message, provider, classifiedOnFrom(scan, IO_RE, message));
   }
   if (input.signal) return mk('agent_crash', `killed by ${input.signal}`, provider);
   if (input.exitCode !== 0 && input.exitCode !== null) {

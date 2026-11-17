@@ -4,28 +4,31 @@ export const MODEL_CAPACITY_RETRY_AFTER_MS = 60_000;
 export const MODEL_CAPACITY_RE = /\bselected\s+model\s+is\s+at\s+capacity\b/i;
 
 const RETRY_AFTER_RE =
-  /(?:retry after|try again in|wait)\s+(\d+(?:\.\d+)?)\s*(s|sec|seconds|m|min|minutes|ms)?/i;
+  /(?:retry after|try again in|wait)\s+(\d+(?:\.\d+)?)\s*(milliseconds?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)?\b/i;
 const MODEL_CAPACITY_LINE_RE = new RegExp(
   '^[\\s\\W]{0,8}(?:API Error:\\s*)?' + MODEL_CAPACITY_RE.source,
   'i',
 );
 const DEFAULT_DETECTOR_BUFFER_CHARS = 8_192;
 
-/** Keep the shared one-minute minimum while honoring a longer CLI hint. */
-export function modelCapacityRetryAfterMs(text) {
+/** Parse the same CLI delay wording for every provider and turn transport. */
+export function parseRetryHintMs(text) {
   const retryHint = RETRY_AFTER_RE.exec(String(text ?? ''));
-  if (!retryHint) return MODEL_CAPACITY_RETRY_AFTER_MS;
+  if (!retryHint) return undefined;
 
   const value = Number.parseFloat(retryHint[1]);
   const unit = (retryHint[2] ?? 's').toLowerCase();
-  const parsedMs = unit.startsWith('ms')
+  const parsedMs = unit === 'ms' || unit.startsWith('millisecond')
     ? value
     : unit.startsWith('m')
       ? value * 60_000
-      : value * 1_000;
-  return Number.isFinite(parsedMs)
-    ? Math.max(MODEL_CAPACITY_RETRY_AFTER_MS, parsedMs)
-    : MODEL_CAPACITY_RETRY_AFTER_MS;
+      : unit.startsWith('h') ? value * 3_600_000 : value * 1_000;
+  return Number.isFinite(parsedMs) ? parsedMs : undefined;
+}
+
+/** Keep the shared one-minute minimum while honoring a longer CLI hint. */
+export function modelCapacityRetryAfterMs(text) {
+  return Math.max(MODEL_CAPACITY_RETRY_AFTER_MS, parseRetryHintMs(text) ?? 0);
 }
 
 /**

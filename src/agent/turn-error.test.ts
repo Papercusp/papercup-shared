@@ -4,7 +4,8 @@
  */
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { makeModelCapacityDetector, modelCapacityLineMatch } from './model-capacity.mjs';
+import { makeModelCapacityDetector, modelCapacityLineMatch, parseRetryHintMs } from './model-capacity.mjs';
+import { classifyProviderError } from './provider-error.mjs';
 import {
   parseRetryAfterMs,
   parseResetAt,
@@ -20,6 +21,42 @@ import {
 } from './turn-error';
 
 // --- parseRetryAfterMs ---
+test('shared policy keeps structured permanent/auth/quota causes ahead of retry-exhaustion prose', () => {
+  const message = 'exceeded retry limit, last status: 429 Too Many Requests';
+  assert.equal(classifyProviderError({ status: 429, message })?.retryable, true);
+  for (const code of ['invalid_request', 'authentication_failed', 'insufficient_quota', 'credit_balance_exhausted']) {
+    assert.equal(classifyProviderError({ code, message })?.retryable, false, code);
+  }
+});
+
+test('Claude and Codex subprocess and HTTP failures share temporary-versus-quota policy', () => {
+  for (const provider of ['anthropic', 'openai'] as const) {
+    for (const [message, cls, retryable] of [
+      ['exceeded retry limit, last status: 429 Too Many Requests', 'rate_limited', true],
+      ['429 insufficient_quota', 'usage_limit', false],
+      ['429 credit_balance_exhausted', 'usage_limit', false],
+      ['429 project_spend_limit_exceeded', 'usage_limit', false],
+      ['temporarily limiting requests (not your usage limit)', 'rate_limited', true],
+    ] as const) {
+      for (const error of [classifyHttpError({ status: 429, message }, provider),
+        classifySubprocessResult({ exitCode: 1, stdout: message }, provider)]) {
+        assert.equal(error.class, cls, `${provider}: ${message}`);
+        assert.equal(error.retryable, retryable);
+      }
+    }
+  }
+});
+
+test('transports share retry units without mistaking milliseconds for minutes', () => {
+  for (const [hint, ms] of [['1500ms', 1500], ['1500 milliseconds', 1500], ['90 seconds', 90_000],
+    ['2m', 120_000], ['2 minutes', 120_000], ['1.5 hours', 5_400_000]] as const) {
+    const text = `429 Too Many Requests; retry after ${hint}`;
+    assert.equal(parseRetryHintMs(text), ms, hint);
+    assert.equal(classifySubprocessResult({ exitCode: 1, stdout: text }).retryAfterMs, ms, hint);
+    assert.equal(classifyHttpError({ status: 429, message: text }).retryAfterMs, ms, hint);
+  }
+});
+
 test('parseRetryAfterMs — numeric seconds → ms', () => {
   assert.equal(parseRetryAfterMs('30'), 30_000);
   assert.equal(parseRetryAfterMs(45), 45_000);
