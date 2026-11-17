@@ -9,6 +9,7 @@ export interface ModelCapacityMatch {
 export const MODEL_CAPACITY_RETRY_AFTER_MS: number;
 export const MODEL_CAPACITY_RE: RegExp;
 
+export function parseRetryHintMs(text: string): number | undefined;
 export function modelCapacityRetryAfterMs(text: string): number;
 export function modelCapacityLineMatch(text: string): ModelCapacityMatch | null;
 
